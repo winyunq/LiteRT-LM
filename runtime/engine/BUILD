@@ -178,6 +178,27 @@ cc_library(
 )
 
 cc_binary(
+    name = "litert_lm_wrapper",
+    srcs = [
+        "litert_lm_wrapper.cc",
+        "litert_lm_wrapper.h",
+    ],
+    linkshared = 1,
+    deps = [
+        ":engine_factory",
+        ":engine_impl_selected",
+        ":engine_interface",
+        ":engine_settings",
+        ":io_types",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
+        "@nlohmann_json//:json",
+        "//runtime/conversation",
+        "//runtime/util:litert_status_util",
+    ],
+)
+
+cc_binary(
     name = "litert_lm_main",
     srcs = ["litert_lm_main.cc"],
     additional_linker_inputs = select({

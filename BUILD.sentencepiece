@@ -1,8 +1,26 @@
 package(default_visibility = ["//visibility:public"])
 
+# 系统化生成 config.h
+genrule(
+    name = "generate_config_h",
+    outs = ["src/config.h"],
+    cmd = """
+cat <<EOF > $@
+#ifndef CONFIG_H_
+#define CONFIG_H_
+#define PACKAGE_NAME "sentencepiece"
+#define PACKAGE_VERSION "0.2.0"
+#ifdef OS_WIN
+#define HAVE_STDLIB_H 1
+#endif
+#endif
+EOF
+""",
+)
+
 proto_library(
     name = "sentencepiece_proto",
-    srcs = ["sentencepiece.proto"],
+    srcs = ["src/sentencepiece.proto"],
 )
 
 cc_proto_library(
@@ -12,7 +30,7 @@ cc_proto_library(
 
 proto_library(
     name = "sentencepiece_model_proto",
-    srcs = ["sentencepiece_model.proto"],
+    srcs = ["src/sentencepiece_model.proto"],
 )
 
 cc_proto_library(
@@ -22,39 +40,28 @@ cc_proto_library(
 
 cc_library(
     name = "sentencepiece_processor",
-    srcs = [
-        "bpe_model.cc",
-        "char_model.cc",
-        "filesystem.cc",
-        "model_factory.cc",
-        "model_interface.cc",
-        "normalizer.cc",
-        "sentencepiece_processor.cc",
-        "unigram_model.cc",
-        "util.cc",
-        "word_model.cc",
-    ],
-    hdrs = [
-        "bpe_model.h",
-        "char_model.h",
-        "common.h",
-        "config.h",
-        "filesystem.h",
-        "freelist.h",
-        "model_factory.h",
-        "model_interface.h",
-        "normalizer.h",
-        "sentencepiece_processor.h",
-        "sentencepiece_trainer.h",
-        "trainer_interface.h",
-        "unigram_model.h",
-        "util.h",
-        "word_model.h",
-    ],
+    srcs = glob(
+        ["src/*.cc"],
+        exclude = [
+            "src/*_test.cc",
+            "src/*_main.cc",
+            "src/sentencepiece_trainer.cc",
+            "src/trainer_interface.cc",
+            "src/builder.cc",
+            "src/error.cc",
+        ],
+    ),
+    hdrs = glob(["src/*.h"]) + [":src/config.h"],
     copts = [
         "-DENABLE_NFKC_COMPILE",
         "-DSENTENCEPIECE_PG3_BUILD",
+        "/I$(GENDIR)/external/com_google_absl",
+        "/Iexternal/com_google_absl",
+        "/Iexternal/com_google_protobuf/src",
+        "/I$(GENDIR)/external/com_google_protobuf/src",
+        "/Iexternal/darts_clone",
     ],
+    includes = ["src", "."],
     deps = [
         ":sentencepiece_cc_proto",
         ":sentencepiece_model_cc_proto",
