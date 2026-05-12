@@ -1,0 +1,31 @@
+name: Export macOS Wrappers
+
+on:
+  push:
+    branches: [ gemini-wrapper-dev ]
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        arch: [macos_arm64, macos] # macos in .bazelrc refers to x86_64 or default apple platform
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Bazel
+      uses: bazel-contrib/setup-bazel@0.9.1
+      with:
+        bazelisk-version: 1.19.0
+
+    - name: Build Wrapper (${{ matrix.arch }})
+      run: |
+        bazel build --config=${{ matrix.arch }} //runtime/engine:litert_lm_wrapper
+      
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: litert-lm-wrapper-${{ matrix.arch }}
+        path: bazel-bin/runtime/engine/liblitert_lm_wrapper.dylib
