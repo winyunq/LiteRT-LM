@@ -3,6 +3,21 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <iostream>
+#include <fstream>
+#include <chrono>
+#include <iomanip>
+
+inline void LogDebug(const std::string& msg) {
+    try {
+        std::ofstream log_file("D:\\LiteRT-LM\\WinyunqDebug\\litert_lm_wrapper_debug.log", std::ios::app);
+        if (log_file.is_open()) {
+            auto now = std::chrono::system_clock::now();
+            auto time_t_now = std::chrono::system_clock::to_time_t(now);
+            log_file << "[" << std::put_time(std::localtime(&time_t_now), "%Y-%m-%d %H:%M:%S") << "] " << msg << std::endl;
+        }
+    } catch (...) {}
+}
 #include "runtime/conversation/conversation.h"
 #include "runtime/engine/engine_factory.h"
 #include "runtime/engine/engine_settings.h"
@@ -20,7 +35,13 @@ using json = nlohmann::json;
 struct LiteRtLm_ConversationContext {
     std::unique_ptr<Conversation> conversation;
     std::string last_user_text;
+    std::string pending_json_msg; // 缓存多模态 JSON 消息
     std::mutex mtx;
+
+    // 持久化回调字符串缓冲区，彻底消除跨 DLL 异步 lambda 野指针悬空崩溃 (Jun 2026)
+    std::string cb_text_buffer;
+    std::string cb_json_buffer;
+    std::string cb_error_buffer;
 };
 
 extern "C" {
@@ -121,12 +142,9 @@ DLL_EXPORT void LiteRtLm_AppendUserMessage(void* conv_ptr, const char* text) {
 DLL_EXPORT void LiteRtLm_AppendMessageJson(void* conv_ptr, const char* json_msg) {
     if (!conv_ptr || !json_msg) return;
     auto* ctx = static_cast<LiteRtLm_ConversationContext*>(conv_ptr);
-    try {
-        Message msg = json::parse(json_msg);
-        OptionalArgs args;
-        args.has_pending_message = true;
-        ctx->conversation->SendMessage(msg, std::move(args));
-    } catch (...) {}
+    std::lock_guard<std::mutex> lock(ctx->mtx);
+    ctx->pending_json_msg = json_msg;
+    LogDebug("LiteRtLm_AppendMessageJson cached pending multimodal JSON: " + std::string(json_msg));
 }
 
 DLL_EXPORT void LiteRtLm_AppendAssistantMessage(void* conv_ptr, const char* text) {
@@ -146,16 +164,34 @@ DLL_EXPORT void LiteRtLm_RunInference(void* conv_ptr, LiteRtLm_SamplingParams pa
     json msg_to_send;
     {
         std::lock_guard<std::mutex> lock(ctx->mtx);
-        if (!ctx->last_user_text.empty()) {
+        if (!ctx->pending_json_msg.empty()) {
+            // 如果有多模态缓存消息，直接解析并作为这一次 SendMessageAsync 的内容一次性发送，彻底避免 Gemma4 模板报错！
+            try {
+                msg_to_send = json::parse(ctx->pending_json_msg);
+                LogDebug("LiteRtLm_RunInference trigger multimodal JSON: " + ctx->pending_json_msg);
+            } catch (const std::exception& e) {
+                LogDebug("LiteRtLm_RunInference parse multimodal JSON error: " + std::string(e.what()));
+                msg_to_send = json::object({
+                    {"role", "user"},
+                    {"content", {{{"type", "text"}, {"text", "Please describe this image."}}}}
+                });
+            }
+            ctx->pending_json_msg.clear();
+        } else if (!ctx->last_user_text.empty()) {
             // 对齐 CLI 消息格式
             msg_to_send = json::object({
                 {"role", "user"}, 
                 {"content", {{{"type", "text"}, {"text", ctx->last_user_text}}}}
             });
+            LogDebug("LiteRtLm_RunInference trigger text: " + msg_to_send.dump());
             ctx->last_user_text.clear();
         } else {
-            // 如果没有挂起的消息，发送空对象触发生成
-            msg_to_send = json::object();
+            // 按照官方底层 tests 的触发规范，发送 {"role": "user", "content": ""} 触发挂起消息 Jun 2026
+            msg_to_send = json::object({
+                {"role", "user"},
+                {"content", ""}
+            });
+            LogDebug("LiteRtLm_RunInference trigger pending (multimodal)");
         }
     }
 
@@ -174,35 +210,42 @@ DLL_EXPORT void LiteRtLm_RunInference(void* conv_ptr, LiteRtLm_SamplingParams pa
     }
 
     // 内部 Lambda 包装回调，确保线程安全和字符串存活
-    auto internal_cb = [callback, user_ptr](absl::StatusOr<Message> chunk) {
+    auto internal_cb = [ctx, callback, user_ptr](absl::StatusOr<Message> chunk) {
         LiteRtLm_Result res = {nullptr, nullptr, nullptr, 0, 0.0f};
+        std::lock_guard<std::mutex> lock(ctx->mtx);
+
         if (!chunk.ok()) {
-            std::string err = std::string(chunk.status().message());
-            res.error_msg = err.c_str(); res.bIsDone = 1;
-            callback(res, user_ptr); return;
+            ctx->cb_error_buffer = chunk.status().message();
+            res.error_msg = ctx->cb_error_buffer.c_str(); 
+            res.bIsDone = 1;
+            callback(res, user_ptr); 
+            return;
         }
         
         if (chunk->is_null() || chunk->empty()) {
             res.bIsDone = 1;
-            callback(res, user_ptr); return;
+            callback(res, user_ptr); 
+            return;
         }
 
-        std::string full_json_str = chunk->dump();
-        res.full_json_chunk = full_json_str.c_str();
+        ctx->cb_json_buffer = chunk->dump();
+        res.full_json_chunk = ctx->cb_json_buffer.c_str();
 
-        std::string text_acc = "";
+        ctx->cb_text_buffer.clear();
         if (chunk->contains("content")) {
             auto& content = (*chunk)["content"];
             if (content.is_array()) {
                 for (const auto& part : content) {
                     if (part.is_object() && part.contains("text")) {
-                        text_acc += part["text"].get<std::string>();
+                        ctx->cb_text_buffer += part["text"].get<std::string>();
                     }
                 }
             }
         }
         
-        res.text_chunk = text_acc.empty() ? nullptr : text_acc.c_str();
+        res.text_chunk = ctx->cb_text_buffer.empty() ? nullptr : ctx->cb_text_buffer.c_str();
+        res.bIsDone = 0; // 单个 chunk 并非最终完成
+
         callback(res, user_ptr);
     };
 

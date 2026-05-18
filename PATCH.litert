@@ -1,0 +1,187 @@
+diff --git third_party/exynos_ai_litecore/workspace.bzl third_party/exynos_ai_litecore/workspace.bzl
+index 5350b68..ff41cbc 100644
+--- third_party/exynos_ai_litecore/workspace.bzl
++++ third_party/exynos_ai_litecore/workspace.bzl
+@@ -17,7 +17,7 @@ load("//litert/sdk_util:repo.bzl", "configurable_repo")
+ def exynos_ai_litecore():
+     configurable_repo(
+         name = "exynos_ai_litecore",
+-        build_file = "@//third_party/exynos_ai_litecore:exynos_ai_litecore.BUILD",
++        build_file = "@litert//third_party/exynos_ai_litecore:exynos_ai_litecore.BUILD",
+         local_path_env = "EXYNOS_AI_LITECORE_ROOT",
+         strip_prefix = "exynos-ai-litecore-v1.1.0",
+         # TODO: Internal link (Not available). Please change to official link when release.
+diff --git third_party/google_tensor/workspace.bzl third_party/google_tensor/workspace.bzl
+index b429310..f0209a8 100644
+--- third_party/google_tensor/workspace.bzl
++++ third_party/google_tensor/workspace.bzl
+@@ -19,6 +19,6 @@ load("//litert/sdk_util:repo.bzl", "configurable_repo")
+ def google_tensor():
+     configurable_repo(
+         name = "google_tensor",
+-        build_file = "@//third_party/google_tensor:google_tensor.BUILD",
++        build_file = "@litert//third_party/google_tensor:google_tensor.BUILD",
+         local_path_env = "GOOGLE_TENSOR_COMPILER_LIB",
+     )
+diff --git third_party/intel_openvino/openvino.bzl third_party/intel_openvino/openvino.bzl
+index 7e6866f..f5fde4d 100644
+--- third_party/intel_openvino/openvino.bzl
++++ third_party/intel_openvino/openvino.bzl
+@@ -24,7 +24,7 @@ def openvino_configure():
+     # On Windows hosts, only the Windows SDK is downloaded.
+     configurable_repo(
+         name = "intel_openvino",
+-        build_file = "@//third_party/intel_openvino:openvino.bazel",
++        build_file = "@litert//third_party/intel_openvino:openvino.bazel",
+         local_path_env = "OPENVINO_NATIVE_DIR",
+         packages = json.encode([
+             {
+diff --git third_party/jinja2/workspace.bzl third_party/jinja2/workspace.bzl
+index 57d344f..33f9fce 100644
+--- third_party/jinja2/workspace.bzl
++++ third_party/jinja2/workspace.bzl
+@@ -5,7 +5,7 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+ def repo():
+     http_archive(
+         name = "jinja2",
+-        build_file = "@//third_party/jinja2:jinja2.BUILD",
++        build_file = "@litert//third_party/jinja2:jinja2.BUILD",
+         url = "https://github.com/pallets/jinja/archive/3.0.1.tar.gz",
+         strip_prefix = "jinja-3.0.1/src",
+         sha256 = "1e37a6f86c29fa8ace108ea72b41d2d5c5bd67d79be14bfeca3ba6eb37d789de",
+diff --git third_party/lark/workspace.bzl third_party/lark/workspace.bzl
+index 8297618..e2f7136 100644
+--- third_party/lark/workspace.bzl
++++ third_party/lark/workspace.bzl
+@@ -5,7 +5,7 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+ def repo():
+     http_archive(
+         name = "lark",
+-        build_file = "@//third_party/lark:lark.BUILD",
++        build_file = "@litert//third_party/lark:lark.BUILD",
+         add_prefix = "lark-1.3.1/lark",
+         urls = [
+             "https://github.com/lark-parser/lark/archive/refs/tags/1.3.1.tar.gz",
+diff --git third_party/litert_gpu/workspace.bzl third_party/litert_gpu/workspace.bzl
+index ed5b471..eeec1ba 100644
+--- third_party/litert_gpu/workspace.bzl
++++ third_party/litert_gpu/workspace.bzl
+@@ -19,7 +19,7 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+ def litert_gpu():
+     http_archive(
+         name = "litert_gpu",
+-        build_file = "@//third_party/litert_gpu:litert_gpu.BUILD",
++        build_file = "@litert//third_party/litert_gpu:litert_gpu.BUILD",
+         type = "jar",
+         url = "https://dl.google.com/android/maven2/com/google/ai/edge/litert/litert/2.1.1/litert-2.1.1.aar",
+     )
+diff --git third_party/litert_prebuilts/workspace.bzl third_party/litert_prebuilts/workspace.bzl
+index 7ff9016..49bab94 100644
+--- third_party/litert_prebuilts/workspace.bzl
++++ third_party/litert_prebuilts/workspace.bzl
+@@ -19,7 +19,7 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+ def litert_prebuilts():
+     http_archive(
+         name = "litert_prebuilts",
+-        build_file = "@//third_party/litert_prebuilts:litert_prebuilts.BUILD",
++        build_file = "@litert//third_party/litert_prebuilts:litert_prebuilts.BUILD",
+         type = "zip",
+         url = "https://storage.googleapis.com/litert/binaries/latest/litert_prebuilts.zip",
+     )
+diff --git third_party/markupsafe/workspace.bzl third_party/markupsafe/workspace.bzl
+index a5c2b36..8836ade 100644
+--- third_party/markupsafe/workspace.bzl
++++ third_party/markupsafe/workspace.bzl
+@@ -5,7 +5,7 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+ def repo():
+     http_archive(
+         name = "markupsafe",
+-        build_file = "@//third_party/markupsafe:markupsafe.BUILD",
++        build_file = "@litert//third_party/markupsafe:markupsafe.BUILD",
+         sha256 = "0f83b6d1bf6fa65546221d42715034e7e654845583a84906c5936590f9a7ad8f",
+         strip_prefix = "markupsafe-2.1.1/src/markupsafe",
+         urls = [
+diff --git third_party/models/workspace.bzl third_party/models/workspace.bzl
+index 1b56bd5..ddded5d 100644
+--- third_party/models/workspace.bzl
++++ third_party/models/workspace.bzl
+@@ -19,14 +19,14 @@ load("//litert/sdk_util:repo.bzl", "configurable_repo")
+ def models():
+     configurable_repo(
+         name = "models",
+-        build_file = "@//third_party/models:models.BUILD",
++        build_file = "@litert//third_party/models:models.BUILD",
+         local_path_env = "LITERT_MODELS",
+         url = "https://storage.googleapis.com/litert/models.tar.gz",
+     )
+ 
+     configurable_repo(
+         name = "ats_models",
+-        build_file = "@//third_party/models:ats_models.BUILD",
++        build_file = "@litert//third_party/models:ats_models.BUILD",
+         local_path_env = "LITERT_ATS_MODELS",
+         url = "https://storage.googleapis.com/litert/ats_models.tar.gz",
+     )
+diff --git third_party/neuro_pilot/workspace.bzl third_party/neuro_pilot/workspace.bzl
+index f33e725..c17fa0f 100644
+--- third_party/neuro_pilot/workspace.bzl
++++ third_party/neuro_pilot/workspace.bzl
+@@ -19,7 +19,7 @@ load("//litert/sdk_util:repo.bzl", "configurable_repo")
+ def neuro_pilot():
+     configurable_repo(
+         name = "neuro_pilot",
+-        build_file = "@//third_party/neuro_pilot:neuro_pilot.BUILD",
++        build_file = "@litert//third_party/neuro_pilot:neuro_pilot.BUILD",
+         local_path_env = "LITERT_NEURO_PILOT_SDK",
+         strip_prefix = "neuro_pilot",
+         url = "https://s3.ap-southeast-1.amazonaws.com/mediatek.neuropilot.com/66f2c33a-2005-4f0b-afef-2053c8654e4f.gz",
+diff --git third_party/qairt/workspace.bzl third_party/qairt/workspace.bzl
+index 9d9d71b..ff5c1f3 100644
+--- third_party/qairt/workspace.bzl
++++ third_party/qairt/workspace.bzl
+@@ -20,7 +20,7 @@ load("//litert/sdk_util:repo.bzl", "configurable_repo")
+ def qairt():
+     configurable_repo(
+         name = "qairt",
+-        build_file = "@//third_party/qairt:qairt.BUILD",
++        build_file = "@litert//third_party/qairt:qairt.BUILD",
+         local_path_env = "LITERT_QAIRT_SDK",
+         strip_prefix = "qairt/2.44.0.260225",
+         url = "https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/2.44.0.260225/v2.44.0.260225.zip",
+diff --git third_party/stblib/workspace.bzl third_party/stblib/workspace.bzl
+index bc93371..d908819 100644
+--- third_party/stblib/workspace.bzl
++++ third_party/stblib/workspace.bzl
+@@ -7,5 +7,5 @@ def repo():
+         name = "stblib",
+         remote = "https://github.com/nothings/stb",
+         commit = "c0c982601f40183e74d84a61237e968dca08380e",
+-        build_file = "@//third_party/stblib:stblib.BUILD",
++        build_file = "@litert//third_party/stblib:stblib.BUILD",
+     )
+diff --git third_party/tqdm/workspace.bzl third_party/tqdm/workspace.bzl
+index d9544bf..a5f69bb 100644
+--- third_party/tqdm/workspace.bzl
++++ third_party/tqdm/workspace.bzl
+@@ -5,7 +5,7 @@ load("@org_tensorflow//third_party:repo.bzl", "tf_http_archive", "tf_mirror_urls
+ def repo():
+     tf_http_archive(
+         name = "tqdm",
+-        build_file = "@//third_party/tqdm:tqdm.BUILD",
++        build_file = "@litert//third_party/tqdm:tqdm.BUILD",
+         sha256 = "e089e5207c36522f28178fe121220c29317afe2995355dda9c33aed1893c5fad",
+         strip_prefix = "tqdm-4.67.1",
+         urls = tf_mirror_urls(
+diff --git third_party/xdsl/workspace.bzl third_party/xdsl/workspace.bzl
+index 6300acf..8f80174 100644
+--- third_party/xdsl/workspace.bzl
++++ third_party/xdsl/workspace.bzl
+@@ -5,7 +5,7 @@ load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+ def repo():
+     http_archive(
+         name = "xdsl",
+-        build_file = "@//third_party/xdsl:xdsl.BUILD",
++        build_file = "@litert//third_party/xdsl:xdsl.BUILD",
+         strip_prefix = "xdsl-0.28.0/xdsl",
+         urls = [
+             "https://github.com/xdslproject/xdsl/archive/refs/tags/v0.28.0.tar.gz",

@@ -1,2 +1,5 @@
 /MODULE.bazel.lock
 /bazel-*
+/libs
+/ThirdParty
+*.dll

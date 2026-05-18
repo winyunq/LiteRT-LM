@@ -53,9 +53,20 @@ if (!(Test-Path $spDir)) {
     }
 }
 
+# 复制 BUILD 文件并创建空的 WORKSPACE 文件，以作为本地 Override 库运行
+Copy-Item "BUILD.sentencepiece" "$spDir/BUILD.bazel" -Force
+if (!(Test-Path "$spDir/WORKSPACE")) {
+    New-Item -ItemType File -Path "$spDir/WORKSPACE" -Force | Out-Null
+}
+
 # 2. 编译
-echo "[2/4] 正在调用 Bazel 编译 (本地依赖模式 + GPU 优化)..."
+echo "[2/4] 正在调用 Bazel 编译 (本地依赖覆盖模式 + GPU 优化)..."
 if (!(Test-Path "C:\bzl")) { New-Item -ItemType Directory -Path "C:\bzl" }
+# 强制指定 Git Bash 短路径，规避路径中包含空格的问题，并屏蔽未安装 of Android SDK 干扰
+$env:BAZEL_SH = "C:/PROGRA~1/Git/bin/bash.exe"
+$env:ANDROID_HOME = $null
+$env:ANDROID_SDK_ROOT = $null
+$env:ANDROID_NDK_HOME = $null
 
 # 强制使用本地压缩包，规避 WSL2/sed 依赖
 # 增加 CARGO_BAZEL_REPIN=true 解决 Rust 依赖指纹变更问题
@@ -67,7 +78,9 @@ bazel --output_base=C:\bzl build //runtime/engine:litert_lm_main `
     --config=windows `
     --distdir=. `
     --define=litert_link_capi_so=true `
-    --define=resolve_symbols_in_exec=false
+    --define=resolve_symbols_in_exec=false `
+    --repo_env=BAZEL_SH=C:/PROGRA~1/Git/bin/bash.exe `
+    --override_repository=sentencepiece=libs/sentencepiece
 $env:CARGO_BAZEL_REPIN="false"
 
 # 3. 发布
