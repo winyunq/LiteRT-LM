@@ -57,7 +57,16 @@ DLL_EXPORT void* LiteRtLm_CreateEngine(LiteRtLm_Config config) {
     auto backend_or = GetBackendFromString(config.backend);
     if (!backend_or.ok()) return nullptr;
 
-    auto settings_or = EngineSettings::CreateDefault(std::move(*model_assets_or), *backend_or);
+    // 根据开关决定是否启用多模态后端
+    std::optional<Backend> vision_backend = config.bEnableVision ? std::make_optional(*backend_or) : std::nullopt;
+    std::optional<Backend> audio_backend = config.bEnableAudio ? std::make_optional(*backend_or) : std::nullopt;
+
+    auto settings_or = EngineSettings::CreateDefault(
+        std::move(*model_assets_or), 
+        *backend_or, 
+        vision_backend, 
+        audio_backend
+    );
     if (!settings_or.ok()) return nullptr;
 
     auto& main_settings = settings_or->GetMutableMainExecutorSettings();
@@ -115,7 +124,22 @@ DLL_EXPORT void* LiteRtLm_CreateConversationWithConfig(void* engine_ptr, const c
         }
     }
 
+    /// 创建默认的会话配置
     auto sess_cfg = SessionConfig::CreateDefault();
+
+    /// 探测引擎多模态支持状态，若视觉执行器就绪则自动启用视觉模态
+    if (engine->GetVisionExecutorProperties().ok()) {
+        sess_cfg.SetVisionModalityEnabled(true);
+        LogDebug("LiteRtLm_CreateConversationWithConfig: Vision modality dynamically enabled in SessionConfig.");
+    }
+
+    /// 探测引擎多模态支持状态，若音频执行器就绪则自动启用音频模态
+    if (engine->GetAudioExecutorProperties().ok()) {
+        sess_cfg.SetAudioModalityEnabled(true);
+        LogDebug("LiteRtLm_CreateConversationWithConfig: Audio modality dynamically enabled in SessionConfig.");
+    }
+
+    /// 构建并生成最终的会话配置
     auto conv_cfg_or = builder.SetSessionConfig(sess_cfg).Build(*engine);
     if (!conv_cfg_or.ok()) return nullptr;
 
@@ -165,12 +189,11 @@ DLL_EXPORT void LiteRtLm_RunInference(void* conv_ptr, LiteRtLm_SamplingParams pa
     {
         std::lock_guard<std::mutex> lock(ctx->mtx);
         if (!ctx->pending_json_msg.empty()) {
-            // 如果有多模态缓存消息，直接解析并作为这一次 SendMessageAsync 的内容一次性发送，彻底避免 Gemma4 模板报错！
             try {
                 msg_to_send = json::parse(ctx->pending_json_msg);
-                LogDebug("LiteRtLm_RunInference trigger multimodal JSON: " + ctx->pending_json_msg);
+                LogDebug("LiteRtLm_RunInference: Parsed pending multimodal JSON.");
             } catch (const std::exception& e) {
-                LogDebug("LiteRtLm_RunInference parse multimodal JSON error: " + std::string(e.what()));
+                LogDebug("LiteRtLm_RunInference: Parse multimodal JSON error: " + std::string(e.what()));
                 msg_to_send = json::object({
                     {"role", "user"},
                     {"content", {{{"type", "text"}, {"text", "Please describe this image."}}}}
@@ -178,20 +201,18 @@ DLL_EXPORT void LiteRtLm_RunInference(void* conv_ptr, LiteRtLm_SamplingParams pa
             }
             ctx->pending_json_msg.clear();
         } else if (!ctx->last_user_text.empty()) {
-            // 对齐 CLI 消息格式
             msg_to_send = json::object({
                 {"role", "user"}, 
                 {"content", {{{"type", "text"}, {"text", ctx->last_user_text}}}}
             });
-            LogDebug("LiteRtLm_RunInference trigger text: " + msg_to_send.dump());
+            LogDebug("LiteRtLm_RunInference: Using last user text.");
             ctx->last_user_text.clear();
         } else {
-            // 按照官方底层 tests 的触发规范，发送 {"role": "user", "content": ""} 触发挂起消息 Jun 2026
             msg_to_send = json::object({
                 {"role", "user"},
                 {"content", ""}
             });
-            LogDebug("LiteRtLm_RunInference trigger pending (multimodal)");
+            LogDebug("LiteRtLm_RunInference: Triggering pending message.");
         }
     }
 
@@ -207,6 +228,7 @@ DLL_EXPORT void LiteRtLm_RunInference(void* conv_ptr, LiteRtLm_SamplingParams pa
         }
         llg_arg.constraint_string = params.constraint_string;
         args.decoding_constraint = llg_arg;
+        LogDebug("LiteRtLm_RunInference: Constrained decoding enabled.");
     }
 
     // 内部 Lambda 包装回调，确保线程安全和字符串存活
@@ -216,6 +238,7 @@ DLL_EXPORT void LiteRtLm_RunInference(void* conv_ptr, LiteRtLm_SamplingParams pa
 
         if (!chunk.ok()) {
             ctx->cb_error_buffer = chunk.status().message();
+            LogDebug("LiteRtLm_RunInference Callback: Status Error - " + ctx->cb_error_buffer);
             res.error_msg = ctx->cb_error_buffer.c_str(); 
             res.bIsDone = 1;
             callback(res, user_ptr); 
@@ -223,6 +246,7 @@ DLL_EXPORT void LiteRtLm_RunInference(void* conv_ptr, LiteRtLm_SamplingParams pa
         }
         
         if (chunk->is_null() || chunk->empty()) {
+            LogDebug("LiteRtLm_RunInference Callback: Generation Done (empty chunk).");
             res.bIsDone = 1;
             callback(res, user_ptr); 
             return;
@@ -244,12 +268,18 @@ DLL_EXPORT void LiteRtLm_RunInference(void* conv_ptr, LiteRtLm_SamplingParams pa
         }
         
         res.text_chunk = ctx->cb_text_buffer.empty() ? nullptr : ctx->cb_text_buffer.c_str();
-        res.bIsDone = 0; // 单个 chunk 并非最终完成
+        res.bIsDone = 0; 
 
         callback(res, user_ptr);
     };
 
-    ctx->conversation->SendMessageAsync(msg_to_send, std::move(internal_cb), std::move(args));
+    LogDebug("LiteRtLm_RunInference: Calling SendMessageAsync...");
+    auto status = ctx->conversation->SendMessageAsync(msg_to_send, std::move(internal_cb), std::move(args));
+    if (!status.ok()) {
+        LogDebug("LiteRtLm_RunInference: SendMessageAsync FAILED: " + std::string(status.message()));
+    } else {
+        LogDebug("LiteRtLm_RunInference: SendMessageAsync accepted.");
+    }
 }
 
 DLL_EXPORT void LiteRtLm_StopMessage(void* conv_ptr) {
