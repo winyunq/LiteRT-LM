@@ -44,8 +44,7 @@ typedef void* (*PN_CreateEngine)(LiteRtLm_Config config);
 typedef void (*PN_DestroyEngine)(void* engine_ptr);
 typedef void* (*PN_CreateConversation)(void* engine_ptr);
 typedef void (*PN_DestroyConversation)(void* conv_ptr);
-typedef void (*PN_AppendUserMessage)(void* conv_ptr, const char* text);
-typedef void (*PN_AppendMessageJson)(void* conv_ptr, const char* json_msg);
+typedef void (*PN_AppendUserMessage)(void* conv_ptr, const char* json_msg);
 typedef void (*PN_RunInference)(void* conv_ptr, LiteRtLm_SamplingParams params, LiteRtLmCallback callback, void* user_ptr);
 typedef int (*PN_WaitUntilDone)(void* engine_ptr, int timeout_sec);
 
@@ -55,6 +54,19 @@ std::string EscapePath(const std::string& path) {
     std::string out;
     for (char c : path) {
         if (c == '\\') out += "\\\\";
+        else out += c;
+    }
+    return out;
+}
+
+std::string EscapeJsonString(const std::string& input) {
+    std::string out;
+    for (char c : input) {
+        if (c == '\\') out += "\\\\";
+        else if (c == '"') out += "\\\"";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\t') out += "\\t";
         else out += c;
     }
     return out;
@@ -79,18 +91,62 @@ int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
     return -1;
 }
 
-std::string ResizeImageGDI(const std::string& inputPath, int maxDim = 512) {
-    // 初始化 GDI+
-    ULONG_PTR gdiplusToken;
-    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
-    Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+std::string Trim(const std::string& str) {
+    if (str.empty()) return "";
+    size_t first = str.find_first_not_of(" \t\r\n\"");
+    if (first == std::string::npos) return "";
+    size_t last = str.find_last_not_of(" \t\r\n\"");
+    return str.substr(first, (last - first + 1));
+}
 
-    std::string outputPath = "D:\\LiteRT-LM\\WinyunqDebug\\winyunq_temp_multimodal.png";
+std::wstring AnsiToWstring(const std::string& str) {
+    if (str.empty()) return L"";
+    std::string trimmed = Trim(str);
+    // 1. 优先尝试以 UTF-8 编码进行高保真转换 (探测现代 Windows PowerShell/CMD 的输入流)
+    int len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, trimmed.c_str(), -1, NULL, 0);
+    if (len > 0) {
+        std::wstring wstrTo(len - 1, 0);
+        MultiByteToWideChar(CP_UTF8, 0, trimmed.c_str(), -1, &wstrTo[0], len);
+        return wstrTo;
+    }
+    // 2. 失败则退回到 CP_ACP (本地 ANSI 代码页，如中文 GBK)
+    len = MultiByteToWideChar(CP_ACP, 0, trimmed.c_str(), -1, NULL, 0);
+    if (len > 0) {
+        std::wstring wstrTo(len - 1, 0);
+        MultiByteToWideChar(CP_ACP, 0, trimmed.c_str(), -1, &wstrTo[0], len);
+        return wstrTo;
+    }
+    // 3. Fallback 退让逻辑，避免极端截断
+    std::wstring wstrTo(trimmed.begin(), trimmed.end());
+    return wstrTo;
+}
+
+std::string WstringToAnsi(const std::wstring& wstr) {
+    if (wstr.empty()) return "";
+    int len = WideCharToMultiByte(CP_ACP, 0, wstr.c_str(), -1, NULL, 0, NULL, NULL);
+    if (len <= 0) return "";
+    std::string strTo(len - 1, 0);
+    WideCharToMultiByte(CP_ACP, 0, wstr.c_str(), -1, &strTo[0], len, NULL, NULL);
+    return strTo;
+}
+
+std::string GetAppTempImagePath() {
+    wchar_t tempPath[MAX_PATH];
+    if (GetTempPathW(MAX_PATH, tempPath) == 0) {
+        return "winyunq_temp_multimodal.png";
+    }
+    std::wstring wOut = std::wstring(tempPath) + L"winyunq_temp_multimodal.png";
+    return WstringToAnsi(wOut);
+}
+
+std::string ResizeImageGDI(const std::string& inputPath, int maxDim = 512) {
+    std::string trimmedInput = Trim(inputPath);
+    std::string outputPath = GetAppTempImagePath();
     bool success = false;
     {
-        // 转换宽字符路径
-        std::wstring wInputPath(inputPath.begin(), inputPath.end());
-        std::wstring wOutputPath(outputPath.begin(), outputPath.end());
+        // 自动探测并高保真还原宽字符路径
+        std::wstring wInputPath = AnsiToWstring(trimmedInput);
+        std::wstring wOutputPath = AnsiToWstring(outputPath);
 
         Gdiplus::Bitmap* source = Gdiplus::Bitmap::FromFile(wInputPath.c_str());
         if (source && source->GetLastStatus() == Gdiplus::Ok) {
@@ -127,7 +183,6 @@ std::string ResizeImageGDI(const std::string& inputPath, int maxDim = 512) {
             if (source) delete source;
         }
     }
-    Gdiplus::GdiplusShutdown(gdiplusToken);
 
     if (success) {
         int retries = 0;
@@ -169,9 +224,15 @@ void MyCallback(LiteRtLm_Result result, void* user_ptr) {
 int main() {
     std::cout << "=== WinyunqDebug: Multi-modal (Path Escaping & GDI Bilinear Downsampling) ===" << std::endl;
 
+    // 全局高能初始化 GDI+ 资源 (规避反复 Startup / Shutdown 带来的高额 CPU 延迟)
+    ULONG_PTR gdiplusToken;
+    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+    Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+
     HMODULE hDll = LoadLibraryA("litert_lm_wrapper.dll");
     if (!hDll) {
         std::cerr << "Failed to load DLL. Error: " << GetLastError() << std::endl;
+        Gdiplus::GdiplusShutdown(gdiplusToken);
         return 1;
     }
 
@@ -185,11 +246,10 @@ int main() {
     auto CreateConversation = (PN_CreateConversation)GetProcAddress(hDll, "LiteRtLm_CreateConversation");
     auto DestroyConversation = (PN_DestroyConversation)GetProcAddress(hDll, "LiteRtLm_DestroyConversation");
     auto AppendUserMessage = (PN_AppendUserMessage)GetProcAddress(hDll, "LiteRtLm_AppendUserMessage");
-    auto AppendMessageJson = (PN_AppendMessageJson)GetProcAddress(hDll, "LiteRtLm_AppendMessageJson");
     auto RunInference = (PN_RunInference)GetProcAddress(hDll, "LiteRtLm_RunInference");
     auto WaitUntilDone = (PN_WaitUntilDone)GetProcAddress(hDll, "LiteRtLm_WaitUntilDone");
 
-    if (!CreateEngine || !RunInference || !WaitUntilDone || !AppendMessageJson) {
+    if (!CreateEngine || !RunInference || !WaitUntilDone || !AppendUserMessage) {
         std::cerr << "Failed to resolve symbols." << std::endl;
         return 1;
     }
@@ -198,7 +258,7 @@ int main() {
     LiteRtLm_Config config = {};
     config.model_path = "D:\\gemma-4-E4B-it.litertlm";
     config.backend = "gpu";
-    config.max_num_tokens = 2048;
+    config.max_num_tokens = 65536;
     config.bOptimizeShader = 1;
 
     std::cout << "Initializing Engine (GPU)..." << std::endl;
@@ -246,10 +306,12 @@ int main() {
                 if (prompt.empty()) prompt = "Please describe this image.";
                 
                 // 物理校验文件路径是否存在，提供顶级的鲁棒性
-                if (std::filesystem::exists(path)) {
+                std::string cleanedPath = Trim(path);
+                if (std::filesystem::exists(cleanedPath)) {
                     hasImage = true;
+                    path = cleanedPath;
                 } else {
-                    std::cout << "[Warning: Image file not found at \"" << path << "\", falling back to pure text mode]" << std::endl;
+                    std::cout << "[Warning: Image file not found at \"" << cleanedPath << "\", falling back to pure text mode]" << std::endl;
                     hasImage = false;
                 }
                 break;
@@ -267,9 +329,12 @@ int main() {
                                    "{\"type\": \"text\", \"text\": \"" + prompt + "\"}"
                                    "]}";
             
-            AppendMessageJson(conv, json_msg.c_str());
+            AppendUserMessage(conv, json_msg.c_str());
         } else {
-            AppendUserMessage(conv, input.c_str());
+            std::string json_msg = "{\"role\": \"user\", \"content\": ["
+                                   "{\"type\": \"text\", \"text\": \"" + EscapeJsonString(input) + "\"}"
+                                   "]}";
+            AppendUserMessage(conv, json_msg.c_str());
         }
 
         LiteRtLm_SamplingParams params = {};
@@ -286,5 +351,8 @@ int main() {
     DestroyConversation(conv);
     DestroyEngine(engine);
     FreeLibrary(hDll);
+    
+    // 全局销毁 GDI+ 资源
+    Gdiplus::GdiplusShutdown(gdiplusToken);
     return 0;
 }

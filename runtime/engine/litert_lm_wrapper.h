@@ -88,13 +88,9 @@ extern "C" {
 
     DLL_EXPORT void LiteRtLm_DestroyConversation(void* conv_ptr);
 
-    // 向会话追加用户消息 (纯文本)
-    DLL_EXPORT void LiteRtLm_AppendUserMessage(void* conv_ptr, const char* text);
-
-    // 向会话追加多模态或复杂消息 (JSON 格式)
-    // 允许发送包含图片、工具结果或特定角色的消息
-    // 示例: {"role": "user", "content": [{"type": "text", "text": "..."}, {"type": "image", "image": "base64..."}]}
-    DLL_EXPORT void LiteRtLm_AppendMessageJson(void* conv_ptr, const char* json_msg);
+    // 向会话追加用户消息 (支持多模态 JSON 格式)
+    // 示例: {"role": "user", "content": [{"type": "text", "text": "..."}, {"type": "image", "path": "..."}]}
+    DLL_EXPORT void LiteRtLm_AppendUserMessage(void* conv_ptr, const char* json_msg);
 
     // 向会话追加 AI 消息 (用于同步历史)
     DLL_EXPORT void LiteRtLm_AppendAssistantMessage(void* conv_ptr, const char* text);

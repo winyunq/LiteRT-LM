@@ -34,7 +34,6 @@ using json = nlohmann::json;
  */
 struct LiteRtLm_ConversationContext {
     std::unique_ptr<Conversation> conversation;
-    std::string last_user_text;
     std::string pending_json_msg; // 缓存多模态 JSON 消息
     std::mutex mtx;
 
@@ -155,20 +154,12 @@ DLL_EXPORT void LiteRtLm_DestroyConversation(void* conv_ptr) {
     if (conv_ptr) delete static_cast<LiteRtLm_ConversationContext*>(conv_ptr);
 }
 
-DLL_EXPORT void LiteRtLm_AppendUserMessage(void* conv_ptr, const char* text) {
-    if (!conv_ptr || !text) return;
-    auto* ctx = static_cast<LiteRtLm_ConversationContext*>(conv_ptr);
-    std::lock_guard<std::mutex> lock(ctx->mtx);
-    // 存入文本，由 RunInference 统一触发发送，逻辑对齐 CLI
-    ctx->last_user_text = text;
-}
-
-DLL_EXPORT void LiteRtLm_AppendMessageJson(void* conv_ptr, const char* json_msg) {
+DLL_EXPORT void LiteRtLm_AppendUserMessage(void* conv_ptr, const char* json_msg) {
     if (!conv_ptr || !json_msg) return;
     auto* ctx = static_cast<LiteRtLm_ConversationContext*>(conv_ptr);
     std::lock_guard<std::mutex> lock(ctx->mtx);
     ctx->pending_json_msg = json_msg;
-    LogDebug("LiteRtLm_AppendMessageJson cached pending multimodal JSON: " + std::string(json_msg));
+    LogDebug("LiteRtLm_AppendUserMessage cached pending JSON: " + std::string(json_msg));
 }
 
 DLL_EXPORT void LiteRtLm_AppendAssistantMessage(void* conv_ptr, const char* text) {
@@ -191,22 +182,15 @@ DLL_EXPORT void LiteRtLm_RunInference(void* conv_ptr, LiteRtLm_SamplingParams pa
         if (!ctx->pending_json_msg.empty()) {
             try {
                 msg_to_send = json::parse(ctx->pending_json_msg);
-                LogDebug("LiteRtLm_RunInference: Parsed pending multimodal JSON.");
+                LogDebug("LiteRtLm_RunInference: Parsed pending JSON.");
             } catch (const std::exception& e) {
-                LogDebug("LiteRtLm_RunInference: Parse multimodal JSON error: " + std::string(e.what()));
+                LogDebug("LiteRtLm_RunInference: Parse JSON error: " + std::string(e.what()));
                 msg_to_send = json::object({
                     {"role", "user"},
                     {"content", {{{"type", "text"}, {"text", "Please describe this image."}}}}
                 });
             }
             ctx->pending_json_msg.clear();
-        } else if (!ctx->last_user_text.empty()) {
-            msg_to_send = json::object({
-                {"role", "user"}, 
-                {"content", {{{"type", "text"}, {"text", ctx->last_user_text}}}}
-            });
-            LogDebug("LiteRtLm_RunInference: Using last user text.");
-            ctx->last_user_text.clear();
         } else {
             msg_to_send = json::object({
                 {"role", "user"},
