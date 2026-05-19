@@ -128,6 +128,14 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
     return llm_context_->processed_context().processed_tokens();
   }
 
+  // 暴露底层的 KV 缓存 TensorBuffer MAP
+  absl::flat_hash_map<absl::string_view, TensorBuffer>& GetKVCacheBuffers1() {
+    return kv_cache_buffers_1_;
+  }
+  absl::flat_hash_map<absl::string_view, TensorBuffer>& GetKVCacheBuffers2() {
+    return kv_cache_buffers_2_;
+  }
+
  protected:
   LlmLiteRtCompiledModelExecutorBase(
       LlmExecutorSettings executor_settings, Environment& env,

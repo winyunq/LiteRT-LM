@@ -533,6 +533,9 @@ class Conversation {
   absl::StatusOr<std::string> RenderMessageIntoString(
       const Message& message, OptionalArgs optional_args);
 
+  // 暴露底层 Session 指针以允许直接 KV 缓存操作
+  Engine::Session* GetSession() const { return session_.get(); }
+
  private:
   explicit Conversation(
       Engine& engine, std::unique_ptr<Engine::Session> session,

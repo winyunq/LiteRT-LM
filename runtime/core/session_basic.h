@@ -140,6 +140,8 @@ class SessionBasic : public Engine::Session {
     return session_config_;
   }
 
+  LlmExecutor* GetLlmExecutor() const override;
+
   // Util function for creating the combined ExecutorInputs from the
   // preprocessed contents.
   // TODO - b/436674053: Modularize the preprocessing logic into a separate

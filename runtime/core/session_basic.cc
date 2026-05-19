@@ -624,4 +624,8 @@ absl::StatusOr<BenchmarkInfo*> SessionBasic::GetMutableBenchmarkInfo() {
       "in the EngineSettings.");
 }
 
+LlmExecutor* SessionBasic::GetLlmExecutor() const {
+  return &executor_;
+}
+
 }  // namespace litert::lm

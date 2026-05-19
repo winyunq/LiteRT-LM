@@ -34,7 +34,7 @@ absl::StatusOr<std::pair<int, int>> GetAspectRatioPreservingSize(
   float target_px =
       patchify_config.max_num_patches *
       (patchify_config.patch_width * patchify_config.patch_height);
-  float factor = std::sqrt(target_px / total_px);
+  float factor = std::min(1.0f, std::sqrt(target_px / total_px));
   float ideal_height = factor * height;
   float ideal_width = factor * width;
   int side_mult =

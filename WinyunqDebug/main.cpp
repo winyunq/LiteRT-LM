@@ -1,3 +1,4 @@
+// Copyright (c) 2025-2026 Winyunq. All rights reserved.
 #include <iostream>
 #include <windows.h>
 #include <string>
@@ -17,6 +18,9 @@ typedef struct {
     int num_threads;
     int bEnableBenchmark;
     int bOptimizeShader;
+    int bEnableVision;
+    int bEnableAudio;
+    int prefill_chunk_size;
 } LiteRtLm_Config;
 
 typedef struct {
@@ -42,11 +46,15 @@ typedef void (*LiteRtLmCallback)(LiteRtLm_Result result, void* user_ptr);
 typedef const char* (*PN_GetAvailableBackends)();
 typedef void* (*PN_CreateEngine)(LiteRtLm_Config config);
 typedef void (*PN_DestroyEngine)(void* engine_ptr);
-typedef void* (*PN_CreateConversation)(void* engine_ptr);
-typedef void (*PN_DestroyConversation)(void* conv_ptr);
-typedef void (*PN_AppendUserMessage)(void* conv_ptr, const char* json_msg);
-typedef void (*PN_RunInference)(void* conv_ptr, LiteRtLm_SamplingParams params, LiteRtLmCallback callback, void* user_ptr);
+typedef void (*PN_AppendUserMessage)(const char* json_msg);
+typedef void (*PN_AppendAssistantMessage)(const char* text);
+typedef void (*PN_RunInference)(LiteRtLm_SamplingParams params, LiteRtLmCallback callback, void* user_ptr);
+typedef void (*PN_StopMessage)();
 typedef int (*PN_WaitUntilDone)(void* engine_ptr, int timeout_sec);
+
+// 新增物理 KV 缓存接口
+typedef int (*PN_GetKVCache)(void* data_ptr, size_t* out_size);
+typedef int (*PN_SetKVCache)(const void* data_ptr, size_t size);
 
 // --- Helpers ---
 
@@ -102,21 +110,18 @@ std::string Trim(const std::string& str) {
 std::wstring AnsiToWstring(const std::string& str) {
     if (str.empty()) return L"";
     std::string trimmed = Trim(str);
-    // 1. 优先尝试以 UTF-8 编码进行高保真转换 (探测现代 Windows PowerShell/CMD 的输入流)
     int len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, trimmed.c_str(), -1, NULL, 0);
     if (len > 0) {
         std::wstring wstrTo(len - 1, 0);
         MultiByteToWideChar(CP_UTF8, 0, trimmed.c_str(), -1, &wstrTo[0], len);
         return wstrTo;
     }
-    // 2. 失败则退回到 CP_ACP (本地 ANSI 代码页，如中文 GBK)
     len = MultiByteToWideChar(CP_ACP, 0, trimmed.c_str(), -1, NULL, 0);
     if (len > 0) {
         std::wstring wstrTo(len - 1, 0);
         MultiByteToWideChar(CP_ACP, 0, trimmed.c_str(), -1, &wstrTo[0], len);
         return wstrTo;
     }
-    // 3. Fallback 退让逻辑，避免极端截断
     std::wstring wstrTo(trimmed.begin(), trimmed.end());
     return wstrTo;
 }
@@ -144,7 +149,6 @@ std::string ResizeImageGDI(const std::string& inputPath, int maxDim = 512) {
     std::string outputPath = GetAppTempImagePath();
     bool success = false;
     {
-        // 自动探测并高保真还原宽字符路径
         std::wstring wInputPath = AnsiToWstring(trimmedInput);
         std::wstring wOutputPath = AnsiToWstring(outputPath);
 
@@ -192,7 +196,7 @@ std::string ResizeImageGDI(const std::string& inputPath, int maxDim = 512) {
                     std::ifstream file(outputPath, std::ios::binary);
                     if (file.is_open()) {
                         file.close();
-                        break; // 100% OK
+                        break; 
                     }
                 }
             } catch (...) {}
@@ -221,10 +225,96 @@ void MyCallback(LiteRtLm_Result result, void* user_ptr) {
     }
 }
 
-int main() {
-    std::cout << "=== WinyunqDebug: Multi-modal (Path Escaping & GDI Bilinear Downsampling) ===" << std::endl;
+void RunKVCachePhysicalTest(void* engine, 
+                            PN_GetKVCache GetKVCache, 
+                            PN_SetKVCache SetKVCache, 
+                            PN_AppendUserMessage AppendUserMessage, 
+                            PN_RunInference RunInference, 
+                            PN_WaitUntilDone WaitUntilDone) {
+    std::cout << "\n==============================================" << std::endl;
+    std::cout << "[KV Cache Test] Phase 1: Injection Memory..." << std::endl;
+    std::cout << "==============================================" << std::endl;
 
-    // 全局高能初始化 GDI+ 资源 (规避反复 Startup / Shutdown 带来的高额 CPU 延迟)
+    std::string secret_msg = "{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"Please remember this secret number: 5201314. Do not forget it!\"}]}";
+    AppendUserMessage(secret_msg.c_str());
+
+    LiteRtLm_SamplingParams test_params = {};
+    test_params.max_tokens = 64;
+    test_params.temperature = 0.0f; // 贪婪采样确保一致性
+
+    std::cout << "AI >> " << std::flush;
+    g_IsDone = false;
+    RunInference(test_params, MyCallback, nullptr);
+    WaitUntilDone(engine, 600);
+
+    // 开始物理导出备份
+    std::cout << "\n\n[KV Cache Test] Phase 2: Backing up physical KV Cache from VRAM..." << std::endl;
+    size_t kv_size = 0;
+    int r1 = GetKVCache(nullptr, &kv_size);
+    if (r1 != 0 || kv_size == 0) {
+        std::cerr << "Failed to query physical KV cache size, code: " << r1 << std::endl;
+        return;
+    }
+
+    std::vector<char> kv_backup(kv_size);
+    int r2 = GetKVCache(kv_backup.data(), &kv_size);
+    if (r2 != 0) {
+        std::cerr << "Failed to export physical KV cache, code: " << r2 << std::endl;
+        return;
+    }
+    std::cout << "[KV Cache Test] Successfully backed up " << kv_size << " bytes of physical attention key-value tensors." << std::endl;
+
+    // 强行清空/擦除 KV 缓存
+    std::cout << "\n[KV Cache Test] Phase 3: Erasing current active KV cache..." << std::endl;
+    int r3 = SetKVCache(nullptr, 0);
+    if (r3 != 0) {
+        std::cerr << "Failed to clear active KV cache, code: " << r3 << std::endl;
+    } else {
+        std::cout << "[KV Cache Test] Active KV cache has been completely cleared (Memory Reset)." << std::endl;
+    }
+
+    // 提问验证模型是否忘记
+    std::cout << "\n[KV Cache Test] Phase 4: Verification without KV Cache..." << std::endl;
+    std::string ask_msg1 = "{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"What was the secret number I just asked you to remember?\"}]}";
+    AppendUserMessage(ask_msg1.c_str());
+
+    std::cout << "AI >> " << std::flush;
+    g_IsDone = false;
+    RunInference(test_params, MyCallback, nullptr);
+    WaitUntilDone(engine, 600);
+
+    // 物理还原先前的显存大包
+    std::cout << "\n\n[KV Cache Test] Phase 5: Restoring physical KV Cache to VRAM..." << std::endl;
+    int r4 = SetKVCache(kv_backup.data(), kv_backup.size());
+    if (r4 != 0) {
+        std::cerr << "Failed to restore physical KV cache, code: " << r4 << std::endl;
+    } else {
+        std::cout << "[KV Cache Test] Successfully restored " << kv_backup.size() << " bytes of physical attention state into GPU memory!" << std::endl;
+    }
+
+    // 再次提问验证模型是否瞬间回忆起来
+    std::cout << "\n[KV Cache Test] Phase 6: Verification WITH Restored KV Cache..." << std::endl;
+    std::string ask_msg2 = "{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"What was the secret number I just asked you to remember? Answer it directly.\"}]}";
+    AppendUserMessage(ask_msg2.c_str());
+
+    std::cout << "AI >> " << std::flush;
+    g_IsDone = false;
+    RunInference(test_params, MyCallback, nullptr);
+    WaitUntilDone(engine, 600);
+    std::cout << "\n==============================================" << std::endl;
+    std::cout << "[KV Cache Test] Verification complete." << std::endl;
+    std::cout << "==============================================\n" << std::endl;
+}
+
+int main(int argc, char* argv[]) {
+    std::cout << "=== WinyunqDebug: Global Single-Session & Direct VRAM Lock KV Cache Testing ===" << std::endl;
+
+    bool bTestKVCache = false;
+    if (argc > 1 && std::string(argv[1]) == "--test-kv") {
+        bTestKVCache = true;
+    }
+
+    // 全局高能初始化 GDI+ 资源
     ULONG_PTR gdiplusToken;
     Gdiplus::GdiplusStartupInput gdiplusStartupInput;
     Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
@@ -243,116 +333,130 @@ int main() {
 
     auto CreateEngine = (PN_CreateEngine)GetProcAddress(hDll, "LiteRtLm_CreateEngine");
     auto DestroyEngine = (PN_DestroyEngine)GetProcAddress(hDll, "LiteRtLm_DestroyEngine");
-    auto CreateConversation = (PN_CreateConversation)GetProcAddress(hDll, "LiteRtLm_CreateConversation");
-    auto DestroyConversation = (PN_DestroyConversation)GetProcAddress(hDll, "LiteRtLm_DestroyConversation");
     auto AppendUserMessage = (PN_AppendUserMessage)GetProcAddress(hDll, "LiteRtLm_AppendUserMessage");
     auto RunInference = (PN_RunInference)GetProcAddress(hDll, "LiteRtLm_RunInference");
     auto WaitUntilDone = (PN_WaitUntilDone)GetProcAddress(hDll, "LiteRtLm_WaitUntilDone");
+    
+    // 动态获取 KV Cache 函数指针
+    auto GetKVCache = (PN_GetKVCache)GetProcAddress(hDll, "LiteRtLm_GetKVCache");
+    auto SetKVCache = (PN_SetKVCache)GetProcAddress(hDll, "LiteRtLm_SetKVCache");
 
-    if (!CreateEngine || !RunInference || !WaitUntilDone || !AppendUserMessage) {
-        std::cerr << "Failed to resolve symbols." << std::endl;
+    if (!CreateEngine || !RunInference || !WaitUntilDone || !AppendUserMessage || !GetKVCache || !SetKVCache) {
+        std::cerr << "Failed to resolve symbols in wrapper DLL." << std::endl;
+        if (!CreateEngine) std::cerr << "-> LiteRtLm_CreateEngine not found!" << std::endl;
+        if (!RunInference) std::cerr << "-> LiteRtLm_RunInference not found!" << std::endl;
+        if (!WaitUntilDone) std::cerr << "-> LiteRtLm_WaitUntilDone not found!" << std::endl;
+        if (!AppendUserMessage) std::cerr << "-> LiteRtLm_AppendUserMessage not found!" << std::endl;
+        if (!GetKVCache) std::cerr << "-> LiteRtLm_GetKVCache not found!" << std::endl;
+        if (!SetKVCache) std::cerr << "-> LiteRtLm_SetKVCache not found!" << std::endl;
+        FreeLibrary(hDll);
+        Gdiplus::GdiplusShutdown(gdiplusToken);
         return 1;
     }
 
-    // 1. Initialize Engine
+    // 1. Initialize Engine (GPU)
     LiteRtLm_Config config = {};
     config.model_path = "D:\\gemma-4-E4B-it.litertlm";
     config.backend = "gpu";
     config.max_num_tokens = 65536;
     config.bOptimizeShader = 1;
+    /// 启用多模态视觉（Vision）引擎以支持图像推理，防止拖入图片时发生空指针崩溃
+    config.bEnableVision = 1;
+    config.prefill_chunk_size = 32768; // 单次处理的最长上下文，作为初始化参数传入！
 
-    std::cout << "Initializing Engine (GPU)..." << std::endl;
+    std::cout << "Initializing Engine (GPU) & Global Single Conversation..." << std::endl;
     void* engine = CreateEngine(config);
     if (!engine) {
         std::cerr << "Failed to create engine." << std::endl;
+        FreeLibrary(hDll);
+        Gdiplus::GdiplusShutdown(gdiplusToken);
         return 1;
     }
 
-    void* conv = CreateConversation(engine);
+    // 2. 根据命令行参数决定是执行物理 KV 缓存回忆测试，还是直接开启 Chat Loop
+    if (bTestKVCache) {
+        RunKVCachePhysicalTest(engine, GetKVCache, SetKVCache, AppendUserMessage, RunInference, WaitUntilDone);
+    } else {
+        // 3. Chat Loop
+        std::string input;
+        std::cout << "Starting normal Chat Loop. Type 'exit' to exit." << std::endl;
+        std::cout << "Hint: Drag an image or type 'Path, Prompt' to test multi-modal." << std::endl;
+        while (true) {
+            std::cout << "\nUser >> ";
+            if (!std::getline(std::cin, input) || input == "exit") break;
+            if (input.empty()) continue;
 
-    // 3. Chat Loop
-    std::string input;
-    std::cout << "\nHint: Drag an image or type 'Path, Prompt' to test multi-modal." << std::endl;
-    while (true) {
-        std::cout << "\nUser >> ";
-        if (!std::getline(std::cin, input) || input == "exit") break;
-        if (input.empty()) continue;
+            bool hasImage = false;
+            std::string path, prompt;
 
-        bool hasImage = false;
-        std::string path, prompt;
+            const char* exts[] = {".png", ".jpg", ".jpeg", ".bmp"};
+            for (const char* ext : exts) {
+                size_t pos = input.find(ext);
+                if (pos != std::string::npos) {
+                    size_t endPos = pos + strlen(ext);
+                    path = input.substr(0, endPos);
+                    if (path.front() == '"') path = path.substr(1);
+                    if (path.back() == '"') path.pop_back();
 
-        const char* exts[] = {".png", ".jpg", ".jpeg", ".bmp"};
-        for (const char* ext : exts) {
-            size_t pos = input.find(ext);
-            if (pos != std::string::npos) {
-                size_t endPos = pos + strlen(ext);
-                path = input.substr(0, endPos);
-                if (path.front() == '"') path = path.substr(1);
-                if (path.back() == '"') path.pop_back();
-
-                if (endPos < input.size()) {
-                    prompt = input.substr(endPos);
-                    // 仅跳过空格、英文逗号、分号，绝不跳过中文字符
-                    while (!prompt.empty()) {
-                        if (prompt[0] == ' ' || prompt[0] == ',' || prompt[0] == ';' || prompt[0] == ':') {
-                            prompt = prompt.substr(1);
-                        } else if (prompt.size() >= 3 && prompt.substr(0, 3) == "，") {
-                            prompt = prompt.substr(3); // 过滤中文逗号
-                        } else {
-                            break;
+                    if (endPos < input.size()) {
+                        prompt = input.substr(endPos);
+                        while (!prompt.empty()) {
+                            if (prompt[0] == ' ' || prompt[0] == ',' || prompt[0] == ';' || prompt[0] == ':') {
+                                prompt = prompt.substr(1);
+                            } else if (prompt.size() >= 3 && prompt.substr(0, 3) == "，") {
+                                prompt = prompt.substr(3); 
+                            } else {
+                                break;
+                            }
                         }
                     }
+                    if (prompt.empty()) prompt = "Please describe this image.";
+                    
+                    std::string cleanedPath = Trim(path);
+                    if (std::filesystem::exists(cleanedPath)) {
+                        hasImage = true;
+                        path = cleanedPath;
+                    } else {
+                        std::cout << "[Warning: Image file not found at \"" << cleanedPath << "\", falling back to pure text mode]" << std::endl;
+                        hasImage = false;
+                    }
+                    break;
                 }
-                if (prompt.empty()) prompt = "Please describe this image.";
-                
-                // 物理校验文件路径是否存在，提供顶级的鲁棒性
-                std::string cleanedPath = Trim(path);
-                if (std::filesystem::exists(cleanedPath)) {
-                    hasImage = true;
-                    path = cleanedPath;
-                } else {
-                    std::cout << "[Warning: Image file not found at \"" << cleanedPath << "\", falling back to pure text mode]" << std::endl;
-                    hasImage = false;
-                }
-                break;
             }
+
+            if (hasImage) {
+                std::string resizedPath = ResizeImageGDI(path, 256);
+                std::string escapedPath = EscapePath(resizedPath);
+                std::cout << "[Image Found: " << path << "]" << std::endl;
+                
+                std::string json_msg = "{\"role\": \"user\", \"content\": ["
+                                       "{\"type\": \"image\", \"path\": \"" + escapedPath + "\"},"
+                                       "{\"type\": \"text\", \"text\": \"" + prompt + "\"}"
+                                       "]}";
+                
+                AppendUserMessage(json_msg.c_str());
+            } else {
+                std::string json_msg = "{\"role\": \"user\", \"content\": ["
+                                       "{\"type\": \"text\", \"text\": \"" + EscapeJsonString(input) + "\"}"
+                                       "]}";
+                AppendUserMessage(json_msg.c_str());
+            }
+
+            LiteRtLm_SamplingParams params = {};
+            params.max_tokens = 512;
+            params.temperature = 0.7f;
+
+            std::cout << "AI >> " << std::flush;
+            g_IsDone = false;
+            RunInference(params, MyCallback, nullptr);
+
+            WaitUntilDone(engine, 600);
         }
-
-        if (hasImage) {
-            // 用 Windows GDI+ 双线性缩放高分辨率大图片，规避 VRAM/Prefill 极端 OOM 闪退！
-            std::string resizedPath = ResizeImageGDI(path, 256);
-            std::string escapedPath = EscapePath(resizedPath);
-            std::cout << "[Image Found: " << path << "]" << std::endl;
-            
-            std::string json_msg = "{\"role\": \"user\", \"content\": ["
-                                   "{\"type\": \"image\", \"path\": \"" + escapedPath + "\"},"
-                                   "{\"type\": \"text\", \"text\": \"" + prompt + "\"}"
-                                   "]}";
-            
-            AppendUserMessage(conv, json_msg.c_str());
-        } else {
-            std::string json_msg = "{\"role\": \"user\", \"content\": ["
-                                   "{\"type\": \"text\", \"text\": \"" + EscapeJsonString(input) + "\"}"
-                                   "]}";
-            AppendUserMessage(conv, json_msg.c_str());
-        }
-
-        LiteRtLm_SamplingParams params = {};
-        params.max_tokens = 512;
-        params.temperature = 0.7f;
-
-        std::cout << "AI >> " << std::flush;
-        g_IsDone = false;
-        RunInference(conv, params, MyCallback, nullptr);
-
-        WaitUntilDone(engine, 600);
     }
 
-    DestroyConversation(conv);
     DestroyEngine(engine);
     FreeLibrary(hDll);
     
-    // 全局销毁 GDI+ 资源
     Gdiplus::GdiplusShutdown(gdiplusToken);
     return 0;
 }

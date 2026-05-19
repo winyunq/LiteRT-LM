@@ -30,6 +30,9 @@
 
 namespace litert::lm {
 
+class LlmExecutorBase;
+using LlmExecutor = LlmExecutorBase;
+
 // Engine is the interface for the LLM runtime. It is responsible for
 // - Initializing the LLM model and related resources, e.g. tokenizer,
 //   embedder, etc.
@@ -286,6 +289,9 @@ class Engine {
 
     // Get the reference to the session config for the session.
     virtual const SessionConfig& GetSessionConfig() const = 0;
+
+    // 获取底层的 LlmExecutor 实例，用于物理层面上直接锁显存读写 KV Cache
+    virtual LlmExecutor* GetLlmExecutor() const { return nullptr; }
   };
 
   // Method to create the Session.
