@@ -75,6 +75,15 @@ struct GpuArtisanConfig {
 
   // Whether the submodel should be used if available.
   bool use_submodel = false;
+
+  // Whether to prefer texture weights over buffers.
+  bool prefer_texture_weights = true;
+
+  // Whether the backend should directly map host memory to the GPU if possible.
+  bool set_enable_host_mapped_pointer = true;
+
+  // Performs f32 convolutions instead of any 8 bit convolutions.
+  bool disallow_8bit_convs = true;
 };
 
 std::ostream& operator<<(std::ostream& os, const GpuArtisanConfig& config);
@@ -110,6 +119,24 @@ struct CpuConfig {
   uint32_t number_of_threads = 4;
 };
 std::ostream& operator<<(std::ostream& os, const CpuConfig& config);
+
+struct NpuConfig {
+  // Whether to use NEON optimizations for greedy sampling on NPU.
+  bool enable_neon_for_npu_greedy_sampling = true;
+
+  // Whether to use manual mask update logic on NPU.
+  bool use_hw_masking_for_npu = true;
+
+  // Whether to use manual KV-cache update logic on NPU.
+  bool use_hw_cache_update_for_npu = true;
+
+  // Whether to use manual per-layer embedding lookup on NPU.
+  bool use_hw_ple_for_npu = true;
+
+  // Whether enable debug logging for NPU.
+  bool enable_npu_debug_logging = false;
+};
+std::ostream& operator<<(std::ostream& os, const NpuConfig& config);
 
 // Optional advanced settings for the LLM executor.
 struct AdvancedSettings {
@@ -321,8 +348,8 @@ class LlmExecutorSettings : public ExecutorSettingsBase {
     return absl::InvalidArgumentError("Backend config is not valid.");
   }
 
-  void SetBackendConfig(
-      const std::variant<GpuArtisanConfig, GpuConfig, CpuConfig>& config) {
+  void SetBackendConfig(const std::variant<GpuArtisanConfig, GpuConfig,
+                                           CpuConfig, NpuConfig>& config) {
     backend_config_ = config;
   }
 
@@ -368,7 +395,8 @@ class LlmExecutorSettings : public ExecutorSettingsBase {
   uint32_t lora_rank_ = 0;
 
   // Backend specific config.
-  std::variant<GpuArtisanConfig, GpuConfig, CpuConfig> backend_config_;
+  std::variant<GpuArtisanConfig, GpuConfig, CpuConfig, NpuConfig>
+      backend_config_;
 
   // Backend to use for sampling.
   Backend sampler_backend_ = Backend::UNSPECIFIED;

@@ -224,13 +224,18 @@ internal object LiteRtLmJni {
    *
    * @param conversationPointer A pointer to the native conversation instance.
    * @param messageJsonString The message to be processed by the native conversation instance.
+   * @param extraContextJsonString The extra context to be used in the template in JSON string
+   *   format.
    * @param callback The callback to receive the streaming responses.
+   * @param visualTokenBudget The visual token budget. Only supported by Gemma4 currently. Null for
+   *   default.
    */
   external fun nativeSendMessageAsync(
     conversationPointer: Long,
     messageJsonString: String,
     extraContextJsonString: String,
     callback: JniMessageCallback,
+    visualTokenBudget: Int?,
   )
 
   /**
@@ -238,12 +243,17 @@ internal object LiteRtLmJni {
    *
    * @param conversationPointer A pointer to the native conversation instance.
    * @param messageJsonString The message to be processed by the native conversation instance.
+   * @param extraContextJsonString The extra context to be used in the template in JSON string
+   *   format.
+   * @param visualTokenBudget The visual token budget. Only supported by Gemma4 currently. Null for
+   *   default.
    * @return The response message in JSON string format.
    */
   external fun nativeSendMessage(
     conversationPointer: Long,
     messageJsonString: String,
     extraContextJsonString: String,
+    visualTokenBudget: Int?,
   ): String
 
   /**
@@ -307,4 +317,13 @@ internal object LiteRtLmJni {
    * @param logSeverity The minimum log level to set. See [LogSeverity].
    */
   external fun nativeSetMinLogSeverity(logSeverity: Int)
+
+  /** Loads a LiteRT-LM file from the given path for capability queries. */
+  external fun nativeCreateCapabilities(modelPath: String): Long
+
+  /** Deletes a loaded LiteRT-LM file. */
+  external fun nativeDeleteCapabilities(capabilitiesPointer: Long)
+
+  /** Returns true if the loaded LiteRT-LM file supports speculative decoding. */
+  external fun nativeHasSpeculativeDecodingSupport(capabilitiesPointer: Long): Boolean
 }

@@ -34,6 +34,8 @@
 #include "runtime/components/prompt_template.h"
 #include "runtime/conversation/conversation.h"
 #include "runtime/conversation/io_types.h"
+#include "runtime/conversation/model_data_processor/config_registry.h"
+#include "runtime/conversation/model_data_processor/gemma4_data_processor_config.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_factory.h"
 #include "runtime/engine/engine_settings.h"
@@ -41,7 +43,9 @@
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/llm_executor_settings.h"
 #include "runtime/proto/sampler_params.pb.h"
+#include "runtime/util/file_util.h"
 #include "runtime/util/logging.h"
+#include "schema/capabilities/capabilities_c.h"
 #include "tflite/logger.h"  // from @litert
 #include "tflite/minimal_logging.h"  // from @litert
 
@@ -68,6 +72,7 @@ using litert::lm::ConversationConfig;
 using litert::lm::Engine;
 using litert::lm::EngineFactory;
 using litert::lm::EngineSettings;
+using litert::lm::FileExists;
 using litert::lm::InputAudio;
 using litert::lm::InputData;
 using litert::lm::InputImage;
@@ -326,6 +331,31 @@ nlohmann::ordered_json GetExtraContextJson(JNIEnv* env,
   return extra_context_json;
 }
 
+std::optional<int> GetOptionalInt(JNIEnv* env, jobject integer_obj) {
+  if (integer_obj == nullptr) return std::nullopt;
+  jclass integer_class = env->FindClass("java/lang/Integer");
+  jmethodID int_value_mid = env->GetMethodID(integer_class, "intValue", "()I");
+  jint value = env->CallIntMethod(integer_obj, int_value_mid);
+  env->DeleteLocalRef(integer_class);
+  return value;
+}
+
+std::optional<litert::lm::DataProcessorArguments> GetDataProcessorArguments(
+    JNIEnv* env, Conversation* conversation, jobject visual_token_budget_obj) {
+  std::optional<int> budget = GetOptionalInt(env, visual_token_budget_obj);
+  if (budget.has_value()) {
+    bool is_gemma4 = conversation->GetConfig()
+                         .GetSessionConfig()
+                         .GetLlmModelType()
+                         .has_gemma4();
+    if (is_gemma4) {
+      return litert::lm::Gemma4DataProcessorArguments{.visual_token_budget =
+                                                          budget};
+    }
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 extern "C" {
@@ -351,9 +381,7 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateEngine)(
   std::string model_path_str(model_path_chars);
   env->ReleaseStringUTFChars(model_path, model_path_chars);
 
-  // Check if the file exists.
-  struct stat buffer;
-  if (stat(model_path_str.c_str(), &buffer) != 0) {
+  if (!FileExists(model_path_str)) {
     ThrowLiteRtLmJniException(env, "Model file not found: " + model_path_str);
     return 0;
   }
@@ -508,7 +536,7 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateEngine)(
         advanced_settings);
   }
 
-  auto engine = EngineFactory::CreateAny(*settings);
+  auto engine = EngineFactory::CreateDefault(*settings);
   if (!engine.ok()) {
     ThrowLiteRtLmJniException(
         env, "Failed to create engine: " + engine.status().ToString());
@@ -526,9 +554,7 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateBenchmark)(
   std::string model_path_str(model_path_chars);
   env->ReleaseStringUTFChars(model_path, model_path_chars);
 
-  // Check if the file exists.
-  struct stat buffer;
-  if (stat(model_path_str.c_str(), &buffer) != 0) {
+  if (!FileExists(model_path_str)) {
     ThrowLiteRtLmJniException(env, "Model file not found: " + model_path_str);
     return 0;
   }
@@ -579,7 +605,7 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateBenchmark)(
   benchmark_params.set_num_prefill_tokens(prefill_tokens);
   benchmark_params.set_num_decode_tokens(decode_tokens);
 
-  auto engine = EngineFactory::CreateAny(*settings);
+  auto engine = EngineFactory::CreateDefault(*settings);
   if (!engine.ok()) {
     ThrowLiteRtLmJniException(
         env, "Failed to create engine: " + engine.status().ToString());
@@ -751,7 +777,14 @@ LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeGenerateContentStream)(
                                 (jint)absl::StatusCode::kInternal, message);
             env->DeleteLocalRef(message);
             cleanup_callback_ref();
-          } else {
+          } else if (responses->GetTaskState() ==
+                     litert::lm::TaskState::kCancelled) {
+            jstring message = NewStringStandardUTF(env, "Process cancelled.");
+            env->CallVoidMethod(callback_global, on_error_mid, (jint)1,
+                                message);
+            env->DeleteLocalRef(message);
+            cleanup_callback_ref();
+          } else if (!responses->GetTexts().empty()) {
             jstring response_jstr =
                 NewStringStandardUTF(env, responses->GetTexts()[0]);
             env->CallVoidMethod(callback_global, on_response_mid,
@@ -928,8 +961,8 @@ LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeDeleteConversation)(
 
 LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeSendMessageAsync)(
     JNIEnv* env, jclass thiz, jlong conversation_pointer,
-    jstring messageJSONString, jstring extraContextJsonString,
-    jobject callback) {
+    jstring messageJSONString, jstring extraContextJsonString, jobject callback,
+    jobject visual_token_budget) {
   JavaVM* jvm = nullptr;
   if (env->GetJavaVM(&jvm) != JNI_OK) {
     ThrowLiteRtLmJniException(env, "Failed to get JavaVM");
@@ -948,6 +981,11 @@ LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeSendMessageAsync)(
       GetExtraContextJson(env, extraContextJsonString);
   if (!extra_context.is_null() && !extra_context.empty()) {
     optional_args.extra_context = extra_context;
+  }
+
+  auto args = GetDataProcessorArguments(env, conversation, visual_token_budget);
+  if (args.has_value()) {
+    optional_args.args = std::move(args);
   }
 
   jobject callback_global = env->NewGlobalRef(callback);
@@ -1032,7 +1070,8 @@ LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeSendMessageAsync)(
 
 LITERTLM_JNIEXPORT jstring JNICALL JNI_METHOD(nativeSendMessage)(
     JNIEnv* env, jclass thiz, jlong conversation_pointer,
-    jstring messageJSONString, jstring extraContextJsonString) {
+    jstring messageJSONString, jstring extraContextJsonString,
+    jobject visual_token_budget) {
   Conversation* conversation =
       reinterpret_cast<Conversation*>(conversation_pointer);
 
@@ -1045,6 +1084,11 @@ LITERTLM_JNIEXPORT jstring JNICALL JNI_METHOD(nativeSendMessage)(
       GetExtraContextJson(env, extraContextJsonString);
   if (!extra_context.is_null() && !extra_context.empty()) {
     optional_args.extra_context = extra_context;
+  }
+
+  auto args = GetDataProcessorArguments(env, conversation, visual_token_budget);
+  if (args.has_value()) {
+    optional_args.args = std::move(args);
   }
 
   auto response =
@@ -1094,6 +1138,35 @@ LITERTLM_JNIEXPORT jstring JNICALL JNI_METHOD(
   }
 
   return NewStringStandardUTF(env, *response);
+}
+
+LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateCapabilities)(
+    JNIEnv* env, jclass thiz, jstring model_path) {
+  const char* model_path_chars = env->GetStringUTFChars(model_path, nullptr);
+  std::string model_path_str(model_path_chars);
+  env->ReleaseStringUTFChars(model_path, model_path_chars);
+
+  auto loaded_file = litert_lm_loaded_file_create(model_path_str.c_str());
+  if (loaded_file == nullptr) {
+    ThrowLiteRtLmJniException(
+        env, "Failed to open LiteRT-LM file: " + model_path_str);
+    return 0;
+  }
+
+  return reinterpret_cast<jlong>(loaded_file);
+}
+
+LITERTLM_JNIEXPORT void JNICALL JNI_METHOD(nativeDeleteCapabilities)(
+    JNIEnv* env, jclass thiz, jlong capabilities_pointer) {
+  litert_lm_loaded_file_delete(
+      reinterpret_cast<LiteRtLmLoadedFile*>(capabilities_pointer));
+}
+
+LITERTLM_JNIEXPORT jboolean JNICALL
+JNI_METHOD(nativeHasSpeculativeDecodingSupport)(JNIEnv* env, jclass thiz,
+                                                jlong capabilities_pointer) {
+  return litert_lm_loaded_file_has_speculative_decoding_support(
+      reinterpret_cast<LiteRtLmLoadedFile*>(capabilities_pointer));
 }
 
 }  // extern "C"

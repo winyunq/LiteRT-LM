@@ -91,7 +91,12 @@ class EngineSettings {
       const std::optional<std::string>& text_backend_constraint = std::nullopt,
       const std::optional<std::string>& vision_backend_constraint =
           std::nullopt,
-      const std::optional<std::string>& audio_backend_constraint =
+      const std::optional<std::string>& audio_backend_constraint = std::nullopt,
+      const std::optional<std::string>& text_prefer_activation_type =
+          std::nullopt,
+      const std::optional<std::string>& vision_prefer_activation_type =
+          std::nullopt,
+      const std::optional<std::string>& audio_prefer_activation_type =
           std::nullopt);
 
   // Returns the LlmExecutorSettings.

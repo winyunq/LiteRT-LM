@@ -63,11 +63,11 @@ absl::StatusOr<std::unique_ptr<MemoryMappedFile>> CreateMemoryMapFromScopedFile(
 
 }  // namespace
 
-absl::StatusOr<std::pair<BufferKey, std::optional<std::string>>>
-ExtractBufferKeyAndBackendConstraint(const schema::SectionObject* section) {
+absl::StatusOr<std::pair<BufferKey, TfLiteSectionHint>>
+ExtractBufferKeyAndTfLiteSectionHint(const schema::SectionObject* section) {
   auto items = section->items();
   BufferKey buffer_key(section->data_type());
-  std::optional<std::string> backend_constraint;
+  TfLiteSectionHint section_hint;
   // Extract the specific model type from the section items KeyValuePairs.
   if ((section->data_type() == schema::AnySectionDataType_TFLiteModel ||
        section->data_type() == schema::AnySectionDataType_TFLiteWeights) &&
@@ -85,7 +85,15 @@ ExtractBufferKeyAndBackendConstraint(const schema::SectionObject* section) {
       if (item->key() &&
           absl::AsciiStrToLower(item->key()->str()) == "backend_constraint" &&
           item->value()) {
-        backend_constraint = *(item->value_as_StringValue()->value());
+        section_hint.backend_constraint =
+            *(item->value_as_StringValue()->value());
+      }
+      if (item->key() &&
+          absl::AsciiStrToLower(item->key()->str()) ==
+              "prefer_activation_type" &&
+          item->value()) {
+        section_hint.prefer_activation_type =
+            *(item->value_as_StringValue()->value());
       }
     }
     if (found_model_type) {
@@ -101,7 +109,7 @@ ExtractBufferKeyAndBackendConstraint(const schema::SectionObject* section) {
           BufferKey(section->data_type(), ModelType::kTfLitePrefillDecode);
     }
   }
-  return std::make_pair(buffer_key, backend_constraint);
+  return std::make_pair(buffer_key, section_hint);
 }
 
 absl::Status LitertLmLoader::MapSection(BufferKey buffer_key,
@@ -124,7 +132,7 @@ absl::Status LitertLmLoader::MapSection(BufferKey buffer_key,
     // If the begin offset is not aligned to the required platform alignment, we
     // need to map the section starting a bit earlier so that the data is
     // aligned.
-    auto& model_file = std::get<ScopedFile>(model_source_);
+    auto& model_file = *std::get<std::shared_ptr<ScopedFile>>(model_source_);
     size_t alignment = MemoryMappedFile::GetOffsetAlignment();
     uint64_t alignment_gap = begin_offset % alignment;
     uint64_t aligned_begin_offset = begin_offset - alignment_gap;
@@ -149,8 +157,17 @@ absl::Status LitertLmLoader::MapSection(BufferKey buffer_key,
 
 absl::StatusOr<std::reference_wrapper<ScopedFile>>
 LitertLmLoader::GetScopedFile() {
-  if (std::holds_alternative<ScopedFile>(model_source_)) {
-    return std::get<ScopedFile>(model_source_);
+  if (std::holds_alternative<std::shared_ptr<ScopedFile>>(model_source_)) {
+    return *std::get<std::shared_ptr<ScopedFile>>(model_source_);
+  }
+  return absl::InvalidArgumentError(
+      "Model source is not a ScopedFile, cannot get ScopedFile.");
+}
+
+absl::StatusOr<std::shared_ptr<ScopedFile>>
+LitertLmLoader::GetSharedScopedFile() {
+  if (std::holds_alternative<std::shared_ptr<ScopedFile>>(model_source_)) {
+    return std::get<std::shared_ptr<ScopedFile>>(model_source_);
   }
   return absl::InvalidArgumentError(
       "Model source is not a ScopedFile, cannot get ScopedFile.");
@@ -187,7 +204,7 @@ absl::Status LitertLmLoader::Initialize() {
     header_size = std::min(kLitertLmHeaderMaxSize, model_file_size);
     header_data = memory_mapped_model_file->data();
   } else {
-    auto& model_file = std::get<ScopedFile>(model_source_);
+    auto& model_file = *std::get<std::shared_ptr<ScopedFile>>(model_source_);
     ASSIGN_OR_RETURN(model_file_size, model_file.GetSize());
     header_size = std::min(kLitertLmHeaderMaxSize, model_file_size);
     ASSIGN_OR_RETURN(header_memory_mapped_file,
@@ -212,15 +229,21 @@ absl::Status LitertLmLoader::Initialize() {
   auto sections = header_.metadata->section_metadata()->objects();
   for (size_t i = 0; i < sections->size(); ++i) {
     const schema::SectionObject* section = sections->Get(i);
-    ASSIGN_OR_RETURN(auto key_and_constraint,
-                     ExtractBufferKeyAndBackendConstraint(section));
-    BufferKey buffer_key = key_and_constraint.first;
-    if (key_and_constraint.second.has_value() &&
-        !key_and_constraint.second->empty()) {
-      section_backend_constraint_[buffer_key] = *key_and_constraint.second;
+    ASSIGN_OR_RETURN(auto key_and_section_hint,
+                     ExtractBufferKeyAndTfLiteSectionHint(section));
+    BufferKey buffer_key = key_and_section_hint.first;
+    const auto& section_hint = key_and_section_hint.second;
+    section_hints_map_[buffer_key] = section_hint;
+
+    if (section_hint.backend_constraint.has_value()) {
       ABSL_LOG(INFO) << "section_backend_constraint: "
-                     << *key_and_constraint.second;
+                     << *section_hint.backend_constraint;
     }
+    if (section_hint.prefer_activation_type.has_value()) {
+      ABSL_LOG(INFO) << "section_prefer_activation_type: "
+                     << *section_hint.prefer_activation_type;
+    }
+
     if (section->begin_offset() > section->end_offset()) {
       return absl::InvalidArgumentError(
           absl::StrFormat("Section %d has invalid offsets: begin_offset (%d) > "
@@ -274,7 +297,7 @@ std::optional<litert::BufferRef<uint8_t>> LitertLmLoader::GetSectionBuffer(
 }
 
 absl::StatusOr<std::pair<size_t, size_t>> LitertLmLoader::GetSectionLocation(
-    BufferKey buffer_key) const{
+    BufferKey buffer_key) const {
   auto section_location_it = section_locations_.find(buffer_key);
   if (section_location_it == section_locations_.end()) {
     return absl::NotFoundError("Section not found.");

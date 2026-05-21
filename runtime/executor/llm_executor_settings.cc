@@ -43,6 +43,10 @@ std::ostream& operator<<(std::ostream& os, const GpuArtisanConfig& config) {
   os << "enable_external_embeddings: " << config.enable_external_embeddings
      << "\n";
   os << "use_submodel: " << config.use_submodel << "\n";
+  os << "prefer_texture_weights: " << config.prefer_texture_weights << "\n";
+  os << "set_enable_host_mapped_pointer: "
+     << config.set_enable_host_mapped_pointer << "\n";
+  os << "disallow_8bit_convs: " << config.disallow_8bit_convs << "\n";
   return os;
 }
 
@@ -55,6 +59,16 @@ std::ostream& operator<<(std::ostream& os, const CpuConfig& config) {
   os << "kv_increment_size: " << config.kv_increment_size << "\n";
   os << "prefill_chunk_size: " << config.prefill_chunk_size << "\n";
   os << "number_of_threads: " << config.number_of_threads << "\n";
+  return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const NpuConfig& config) {
+  os << "enable_neon_for_npu_greedy_sampling: "
+     << config.enable_neon_for_npu_greedy_sampling << "\n";
+  os << "use_hw_masking_for_npu: " << config.use_hw_masking_for_npu << "\n";
+  os << "use_hw_cache_update_for_npu: " << config.use_hw_cache_update_for_npu
+     << "\n";
+  os << "enable_npu_debug_logging: " << config.enable_npu_debug_logging << "\n";
   return os;
 }
 
@@ -163,6 +177,7 @@ absl::StatusOr<LlmExecutorSettings> LlmExecutorSettings::CreateDefault(
     config.max_top_k = 1;
     settings.SetBackendConfig(config);
   } else if (backend == Backend::NPU) {
+    settings.SetBackendConfig(NpuConfig());
   } else if (backend == Backend::GPU_ARTISAN) {
     settings.SetBackendConfig(GpuArtisanConfig());
   } else {

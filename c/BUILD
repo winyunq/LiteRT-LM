@@ -24,6 +24,11 @@ package(
 
 licenses(["notice"])
 
+exports_files([
+    "engine.cc",
+    "engine.h",
+])
+
 ENGINE_COMMON_DEPS = [
     "@com_google_absl//absl/base:core_headers",
     "@com_google_absl//absl/base:log_severity",
@@ -39,6 +44,8 @@ ENGINE_COMMON_DEPS = [
     "@nlohmann_json//:json",
     "//runtime/conversation",
     "//runtime/conversation:io_types",
+    "//runtime/conversation/model_data_processor:config_registry",
+    "//runtime/conversation/model_data_processor:gemma4_data_processor_config",
     "//runtime/engine:engine_factory",
     "//runtime/engine:engine_interface",
     "//runtime/engine:engine_settings",
@@ -64,6 +71,7 @@ cc_library(
     deps = ENGINE_COMMON_DEPS + [
         "//runtime/core:engine_impl",
     ],
+    alwayslink = True,
 )
 
 cc_library(
@@ -76,7 +84,7 @@ cc_library(
     ],
     visibility = ["//visibility:public"],
     deps = ENGINE_COMMON_DEPS + [
-        "//runtime/core:engine_impl_cpu_only",
+        "//runtime/core:engine_advanced_impl_cpu_only",
     ],
 )
 

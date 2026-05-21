@@ -367,6 +367,63 @@ absl::StatusOr<std::string> GetDefaultJinjaPromptTemplate(
 {%- if add_generation_prompt -%}
     {{'<start_of_turn>model\n'}}
 {%- endif -%})tmpl";
+    case proto::LlmModelType::kFastVlm:
+      // absl::Substitute takes up to 10 arguments, so we have to split the
+      // template into two parts.
+      return absl::StrCat(
+          absl::Substitute("{%- for message in messages -%}"
+                           "{%- if message.content is string -%}"
+                           "{%- if message.role == 'user' %}"
+                           "$0{{ message.content }}$1"
+                           "{% endif -%}"
+                           "{%- if message.role == 'model' %}"
+                           "$2{{ message.content }}$3"
+                           "{% endif -%}"
+                           "{%- if message.role == 'system' %}"
+                           "$4{{ message.content }}$5"
+                           "{% endif -%}"
+                           "{%- else -%}",
+                           prompt_templates.user().prefix(),
+                           prompt_templates.user().suffix(),
+                           prompt_templates.model().prefix(),
+                           prompt_templates.model().suffix(),
+                           prompt_templates.system().prefix(),
+                           prompt_templates.system().suffix()),
+          absl::Substitute("{%- if message.role == 'user' %}"
+                           "$0"
+                           "{% elif message.role == 'model' %}"
+                           "$1"
+                           "{% elif message.role == 'system' %}"
+                           "$2"
+                           "{% endif -%}"
+                           "{%- for item in message['content'] %}"
+                           "{%- if item['type'] == 'text' %}"
+                           "{{ item['text'] }}"
+                           "{% elif item['type'] == 'image' -%}"
+                           "<image_soft_token>"
+                           "{%- elif item['type'] == 'audio' -%}"
+                           ""
+                           "{%- endif -%}"
+                           "{%- endfor -%}"
+                           "{%- if message.role == 'user' %}"
+                           "$3"
+                           "{% elif message.role == 'model' %}"
+                           "$4"
+                           "{% elif message.role == 'system' %}"
+                           "$5"
+                           "{% endif -%}"
+                           "{%- endif -%}"
+                           "{%- endfor -%}"
+                           "{%- if add_generation_prompt %}"
+                           "$6"
+                           "{% endif -%}",
+                           prompt_templates.user().prefix(),
+                           prompt_templates.model().prefix(),
+                           prompt_templates.system().prefix(),
+                           prompt_templates.user().suffix(),
+                           prompt_templates.model().suffix(),
+                           prompt_templates.system().suffix(),
+                           prompt_templates.model().prefix()));
     case proto::LlmModelType::kQwen3:
     case proto::LlmModelType::kQwen2P5:
     case proto::LlmModelType::kGenericModel:
@@ -429,6 +486,8 @@ absl::StatusOr<std::string> GetDefaultJinjaPromptTemplate(
                            prompt_templates.model().prefix()));
     case proto::LlmModelType::MODEL_TYPE_NOT_SET:
       return absl::InvalidArgumentError("LlmModelType is not set.");
+    default:
+      return absl::InvalidArgumentError("Unsupported model type for template.");
   }
 }
 

@@ -18,17 +18,21 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>  // NOLINT: Required for std::filesystem::path.
 #include <iterator>
 #include <limits>
 #include <memory>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "absl/algorithm/container.h"  // from @com_google_absl
+#include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/match.h"  // from @com_google_absl
+#include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "litert/cc/litert_element_type.h"  // from @litert
@@ -37,6 +41,8 @@
 #include "litert/cc/litert_model.h"  // from @litert
 #include "litert/cc/litert_ranked_tensor_type.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
+#include "litert/cc/options/litert_cpu_options.h"  // from @litert
+#include "litert/cc/options/litert_gpu_options.h"  // from @litert
 #include "runtime/components/embedding_lookup/embedding_lookup_manager.h"
 #include "runtime/components/embedding_lookup/embedding_lookup_text.h"
 #include "runtime/components/model_resources.h"
@@ -47,6 +53,7 @@
 #include "runtime/util/file_format_util.h"
 #include "runtime/util/litert_lm_loader.h"
 #include "runtime/util/model_asset_bundle_resources.h"
+#include "runtime/util/scoped_file.h"
 #include "runtime/util/status_macros.h"  //NOLINT
 #include "runtime/util/tensor_buffer_util.h"
 #include "tflite/types/half.h"  // from @litert
@@ -313,10 +320,9 @@ absl::Status FillSingleBufferCacheParamTensor(
   // TODO(sulemanshahid): Local attention optimization is not supported in the
   // OpenCL implementation, enable for WebGPU.
   LITERT_ASSIGN_OR_RETURN(auto packed_size, param_tensor.PackedSize());
-  LITERT_ASSIGN_OR_RETURN(
-      auto param_tensor_lock_and_addr,
-      TensorBufferScopedLock::Create(param_tensor,
-                                     TensorBuffer::LockMode::kWrite));
+  LITERT_ASSIGN_OR_RETURN(auto param_tensor_lock_and_addr,
+                          TensorBufferScopedLock::Create(
+                              param_tensor, TensorBuffer::LockMode::kWrite));
   std::memset(param_tensor_lock_and_addr.second, 0, packed_size);
 
   // See parameter definition in ml_drift::LlmRuntimeParams.
@@ -447,6 +453,103 @@ absl::Status GenericComputeTokenEmbeddings(
     RETURN_IF_ERROR(per_layer_embedding_lookup_manager->LookupPrefill(
         input_tokens_span, &wrapped_ple_embeddings.buffer,
         0 /*token_offset=*/));
+  }
+  return absl::OkStatus();
+}
+
+absl::Status SetCpuCacheOptions(
+    const absl::StatusOr<
+        std::variant<std::string, std::shared_ptr<litert::lm::ScopedFile>>>&
+        weight_cache_file,
+    absl::string_view logging_prefix, litert::CpuOptions& cpu_options) {
+  if (!weight_cache_file.ok()) {
+    ABSL_LOG(INFO) << logging_prefix << " does not use cache.";
+    return absl::OkStatus();
+  }
+
+  if (std::holds_alternative<std::shared_ptr<litert::lm::ScopedFile>>(
+          *weight_cache_file)) {
+    auto scoped_cache_file =
+        std::get<std::shared_ptr<litert::lm::ScopedFile>>(*weight_cache_file);
+    if (scoped_cache_file != nullptr) {
+      ASSIGN_OR_RETURN(auto duplicated, scoped_cache_file->Duplicate());
+      ASSIGN_OR_RETURN(int fd, duplicated.Release());
+      cpu_options.SetXNNPackWeightCacheFileDescriptor(fd);
+      ABSL_LOG(INFO) << logging_prefix
+                     << " use provided cache file descriptor: " << fd;
+    }
+  } else if (std::holds_alternative<std::string>(*weight_cache_file)) {
+    const std::string& weight_cache_path =
+        std::get<std::string>(*weight_cache_file);
+    cpu_options.SetXNNPackWeightCachePath(weight_cache_path.c_str());
+    ABSL_LOG(INFO) << logging_prefix
+                   << " use cache path: " << weight_cache_path;
+  }
+  return absl::OkStatus();
+}
+
+absl::Status SetGpuCacheOptions(
+    const absl::StatusOr<
+        std::variant<std::string, std::shared_ptr<litert::lm::ScopedFile>>>&
+        weight_cache_file,
+    const absl::StatusOr<
+        std::variant<std::string, std::shared_ptr<litert::lm::ScopedFile>>>&
+        program_cache_file,
+    absl::string_view cache_key, absl::string_view logging_prefix,
+    bool cache_compiled_shaders_only, litert::GpuOptions& gpu_options) {
+  if (!cache_key.empty()) {
+    gpu_options.SetModelCacheKey(cache_key.data());
+  }
+  bool serialization_dir_set = false;
+  std::string cache_path;
+  if (weight_cache_file.ok()) {
+    if (std::holds_alternative<std::string>(*weight_cache_file)) {
+      cache_path =
+          std::filesystem::path(std::get<std::string>(*weight_cache_file))
+              .parent_path()
+              .string();
+      ABSL_LOG(INFO) << (logging_prefix.empty()
+                             ? ""
+                             : absl::StrCat(logging_prefix, ": "))
+                     << "Setting serialization dir: " << cache_path;
+      gpu_options.SetSerializationDir(cache_path.c_str());
+      serialization_dir_set = true;
+    } else {
+      auto scoped_cache_file =
+          std::get<std::shared_ptr<lm::ScopedFile>>(*weight_cache_file);
+      ASSIGN_OR_RETURN(auto duplicated, scoped_cache_file->Duplicate());
+      ASSIGN_OR_RETURN(int fd, duplicated.Release());
+      gpu_options.SetWeightCacheFd(fd);
+    }
+    gpu_options.SetSerializeExternalTensors(true);
+  } else {
+    gpu_options.SetSerializeExternalTensors(false);
+  }
+
+  if (program_cache_file.ok()) {
+    if (std::holds_alternative<std::string>(*program_cache_file)) {
+      if (!serialization_dir_set) {
+        cache_path =
+            std::filesystem::path(std::get<std::string>(*program_cache_file))
+                .parent_path()
+                .string();
+        ABSL_LOG(INFO) << (logging_prefix.empty()
+                               ? ""
+                               : absl::StrCat(logging_prefix, ": "))
+                       << "Setting program cache dir: " << cache_path;
+        gpu_options.SetSerializationDir(cache_path.c_str());
+      }
+    } else {
+      auto scoped_cache_file =
+          std::get<std::shared_ptr<lm::ScopedFile>>(*program_cache_file);
+      ASSIGN_OR_RETURN(auto duplicated, scoped_cache_file->Duplicate());
+      ASSIGN_OR_RETURN(int fd, duplicated.Release());
+      gpu_options.SetProgramCacheFd(fd);
+    }
+    gpu_options.CacheCompiledProgramsOnly(cache_compiled_shaders_only);
+    gpu_options.SetSerializeProgramCache(true);
+  } else {
+    gpu_options.SetSerializeProgramCache(false);
   }
   return absl::OkStatus();
 }

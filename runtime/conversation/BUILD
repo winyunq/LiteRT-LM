@@ -36,6 +36,7 @@ cc_library(
     deps = [
         ":io_types",
         "@com_google_absl//absl/status",
+        "@com_google_absl//absl/status:statusor",
         "@nlohmann_json//:json",
         "//runtime/components:prompt_template",
         "//runtime/conversation/model_data_processor",
@@ -181,7 +182,6 @@ cc_test(
         "//runtime/components/constrained_decoding:bitmap",
         "//runtime/components/constrained_decoding:constraint",
         "//runtime/components/constrained_decoding:external_constraint_config",
-        "//runtime/core:session_factory",  # buildcleaner: keep
         "//runtime/engine:engine_factory",
         "//runtime/engine:engine_interface",
         "//runtime/engine:engine_settings",

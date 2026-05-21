@@ -83,7 +83,13 @@ absl::Status MainHelper(int argc, char** argv) {
   ASSIGN_OR_RETURN(EngineSettings engine_settings, EngineSettings::CreateDefault(std::move(model_assets), backend));
   engine_settings.GetMutableBenchmarkParams() = litert::lm::proto::BenchmarkParams();
 
+<<<<<<< HEAD
   ASSIGN_OR_RETURN(auto engine, litert::lm::EngineFactory::CreateAny(std::move(engine_settings)));
+=======
+  // Create the engine.
+  ASSIGN_OR_RETURN(auto engine, litert::lm::EngineFactory::CreateDefault(
+                                    std::move(engine_settings)));
+>>>>>>> upstream/main
 
   auto session_config = litert::lm::SessionConfig::CreateDefault();
   ASSIGN_OR_RETURN(auto conversation_config, ConversationConfig::Builder().SetSessionConfig(session_config).Build(*engine));

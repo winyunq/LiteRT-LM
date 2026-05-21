@@ -86,6 +86,16 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   absl::StatusOr<TensorBuffer> DecodeLogits(
       const ExecutorInputs& inputs, const ExecutorDecodeParams& decode_params);
 
+  // State/context management APIs:
+  absl::StatusOr<std::unique_ptr<LlmContext>> CreateNewContext(
+      std::optional<uint32_t> lora_id,
+      RuntimeConfig runtime_config) const override;
+
+  absl::StatusOr<std::unique_ptr<LlmContext>> CloneContext() const override;
+
+  absl::Status RestoreContext(
+      std::unique_ptr<LlmContext> context_data) override;
+
   absl::string_view ExecutorBackendName() const override {
     return "LiteRT Compiled Model";
   }
@@ -107,8 +117,36 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
     return llm_context_->runtime_state().current_step;
   }
 
+  // ------------Getter and setter APIs------------:
+  // Gets the runtime configuration.
+  absl::StatusOr<RuntimeConfig> GetRuntimeConfig() const override {
+    return llm_context_->runtime_config();
+  }
+
+  // Updates the runtime configuration.
+  absl::Status UpdateRuntimeConfig(
+      const RuntimeConfig& runtime_config) override {
+    llm_context_->runtime_config() = runtime_config;
+    return absl::OkStatus();
+  }
+
+  // Gets the runtime state.
+  absl::StatusOr<RuntimeState> GetRuntimeState() const override {
+    return llm_context_->runtime_state();
+  }
+
+  // Updates the runtime state.
+  absl::Status UpdateRuntimeState(const RuntimeState& runtime_state) override {
+    llm_context_->runtime_state() = runtime_state;
+    return absl::OkStatus();
+  }
+
   // Sets the current step of the executor.
   absl::Status SetCurrentStep(int new_step) override;
+
+  absl::StatusOr<const ProcessedTokens*> GetProcessedTokens() const override {
+    return &llm_context_->processed_context().processed_tokens();
+  }
 
   // Resets all of the internal states.
   absl::Status Reset() override;
@@ -139,7 +177,8 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
  protected:
   LlmLiteRtCompiledModelExecutorBase(
       LlmExecutorSettings executor_settings, Environment& env,
-      const Model* absl_nonnull model, CompiledModel compiled_model,
+      const Model* absl_nonnull model,
+      std::unique_ptr<CompiledModel> compiled_model,
       absl::flat_hash_map<absl::string_view, TensorBuffer> decode_input_buffers,
       absl::flat_hash_map<absl::string_view, TensorBuffer>
           decode_output_buffers,
@@ -275,10 +314,21 @@ class LlmLiteRtCompiledModelExecutorBase : public LlmExecutor {
   absl::Status ConsumePendingOrAddProcessedToken(
       const std::vector<std::shared_ptr<TokenData>>& token);
 
+  // Gets the prefill signature key from the compiled model.
+  absl::StatusOr<std::string> GetPrefillSignatureKey() const;
+
+  // Clones the KV cache buffers from the compiled model.
+  absl::StatusOr<absl::flat_hash_map<absl::string_view, TensorBuffer>>
+  CloneKVCacheBuffers() const;
+
+  absl::Status RestoreKVCacheBuffers(
+      const absl::flat_hash_map<absl::string_view, TensorBuffer>&
+          kv_cache_buffers);
+
   LlmExecutorSettings executor_settings_;
   Environment& env_;
   const Model& model_;
-  CompiledModel compiled_model_;
+  std::unique_ptr<CompiledModel> compiled_model_;
 
   absl::flat_hash_map<absl::string_view, TensorBuffer> decode_input_buffers_;
   absl::flat_hash_map<absl::string_view, TensorBuffer> decode_output_buffers_;
@@ -356,7 +406,8 @@ class LlmLiteRtCompiledModelExecutorStatic
  private:
   LlmLiteRtCompiledModelExecutorStatic(
       LlmExecutorSettings executor_settings, Environment& env,
-      const Model* absl_nonnull model, CompiledModel compiled_model,
+      const Model* absl_nonnull model,
+      std::unique_ptr<CompiledModel> compiled_model,
       absl::flat_hash_map<absl::string_view, TensorBuffer> decode_input_buffers,
       absl::flat_hash_map<absl::string_view, TensorBuffer>
           decode_output_buffers,
@@ -417,7 +468,8 @@ class LlmLiteRtCompiledModelExecutorDynamic
  private:
   LlmLiteRtCompiledModelExecutorDynamic(
       LlmExecutorSettings executor_settings, Environment& env,
-      const Model* absl_nonnull model, CompiledModel compiled_model,
+      const Model* absl_nonnull model,
+      std::unique_ptr<CompiledModel> compiled_model,
       absl::flat_hash_map<absl::string_view, TensorBuffer> decode_input_buffers,
       absl::flat_hash_map<absl::string_view, TensorBuffer>
           decode_output_buffers,

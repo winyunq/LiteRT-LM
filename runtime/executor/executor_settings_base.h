@@ -183,6 +183,7 @@ class ExecutorSettingsBase {
   static constexpr absl::string_view kXnnpackCacheSuffix = ".xnnpack_cache";
   static constexpr absl::string_view kMlDriftCacheSuffix =
       "_mldrift_program_cache.bin";
+  static constexpr absl::string_view kMtpDrafterCacheSuffix = ".mtp_drafter";
 
   // Dynamically generates cache suffix and keys systematically.
   // Args:
@@ -219,6 +220,14 @@ class ExecutorSettingsBase {
   }
   void SetActivationDataType(const ActivationDataType& activation_data_type) {
     activation_data_type_ = activation_data_type;
+  }
+
+  // Mixed precision APIs.
+  bool IsMixedPrecisionEnabled() const {
+    return enable_mixed_precision_;
+  }
+  void SetEnableMixedPrecision(bool enable) {
+    enable_mixed_precision_ = enable;
   }
 
   // Should be used by consumers who want to write to a single weight cache
@@ -301,6 +310,10 @@ class ExecutorSettingsBase {
   // this field will override the default activation data type, for example,
   // OpenCL backend only support fp32 on Linux.
   std::optional<ActivationDataType> activation_data_type_;
+
+  // Optional setting to enable mixed precision. If true, it will override
+  // activation data type to FP32 which underlying for mix precision.
+  bool enable_mixed_precision_ = false;
 
   // Optional LoRA model assets.
   std::optional<ModelAssets> lora_model_assets_;

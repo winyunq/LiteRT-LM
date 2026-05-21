@@ -79,6 +79,7 @@ struct LiteRtLmSettings {
   int max_num_tokens = 0;
   int max_output_tokens = -1;
   int max_num_images = 0;
+  int visual_token_budget = -1;
   absl::LogSeverity min_log_level = absl::LogSeverity::kInfo;
   std::set<int> prefill_batch_sizes;
   int num_output_candidates = 1;
@@ -121,6 +122,11 @@ struct LiteRtLmSettings {
   std::string constraint_regex = "";
   bool use_submodel = false;
   bool enable_speculative_decoding = false;
+  bool enable_neon_for_npu_greedy_sampling = true;
+  bool use_hw_masking_for_npu = true;
+  bool use_hw_cache_update_for_npu = true;
+  bool use_hw_ple_for_npu = true;
+  bool enable_npu_debug_logging = false;
 };
 
 struct LitertLmMetrics {
@@ -129,11 +135,9 @@ struct LitertLmMetrics {
   float peak_private_mb = 0.0f;
 };
 
-// Builds the content list from the given prompt view and images.
-// TODO(b/453071109): Add support for audio.
-absl::Status BuildContentList(const std::vector<InputData>& input_data,
-                              const LiteRtLmSettings& settings,
-                              nlohmann::json& content_list);
+// Builds the content list from the input data.
+absl::StatusOr<nlohmann::json> BuildContentList(
+    const std::vector<InputData>& input_data, const LiteRtLmSettings& settings);
 
 // Creates the EngineSettings from the LiteRtLmSettings.
 absl::StatusOr<EngineSettings> CreateEngineSettings(

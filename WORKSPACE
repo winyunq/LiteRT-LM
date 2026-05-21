@@ -2,14 +2,14 @@
 
 workspace(name = "litert_lm")
 
-# UPDATED = 2026-04-14
-LITERT_REF = "472d1c0f6cc0cc89ac968b2d5394ebb66195e1d4"
+# UPDATED = 2026-05-14
+LITERT_REF = "d865fd82cd7fe6752908b3a0836895461c305679"
 
-LITERT_SHA256 = "52b9041d0b0840360e3a4ad6212f454be58822ccd5f9fc384d1ff7841928e685"
+LITERT_SHA256 = "5c1568c2374aad0e334abd57c41e3974ec0877c0902eb470d694ef0018e01918"
 
-TENSORFLOW_REF = "5cdb51d9c84e3194235e49a0b8e72da2df75bf1e"
+TENSORFLOW_REF = "49e7f1937d1509dd7fea41bff9ccc994baa97258"
 
-TENSORFLOW_SHA256 = "8c1a4fe0a49e5dd0e94ff406b9be91ce8c865a298dab25a7b637f7af39bea323"
+TENSORFLOW_SHA256 = "977114079cda0d6aa9d05bc73ae2c2e3d36705fbb041e631a564e4d42e1e1dd9"
 
 # buildifier: disable=load-on-top
 
@@ -251,9 +251,11 @@ http_archive(
 )
 
 load("@rules_kotlin//kotlin:repositories.bzl", "kotlin_repositories")
+
 kotlin_repositories()  # if you want the default. Otherwise see custom kotlinc distribution below
 
 load("@rules_kotlin//kotlin:core.bzl", "kt_register_toolchains")
+
 kt_register_toolchains()  # to use the default toolchain, otherwise see toolchains below
 
 # Rust (for HuggingFace Tokenizers)
@@ -475,6 +477,11 @@ load("@litert//third_party/google_tensor:workspace.bzl", "google_tensor")
 
 google_tensor()
 
+# INTEL OPENVINO ---------------------------------------------------------------------------------
+load("@litert//third_party/intel_openvino:openvino.bzl", "openvino_configure")
+
+openvino_configure()
+
 http_archive(
     name = "nanobind_json",
     build_file = "@//:BUILD.nanobind_json",
@@ -488,9 +495,45 @@ load("@rules_python//python:pip.bzl", "pip_parse")
 
 pip_parse(
     name = "custom_pip_deps",
+    extra_pip_args = ["--index-url=https://pypi.org/simple"],
     requirements_lock = "//:requirements.txt",
 )
 
 load("@custom_pip_deps//:requirements.bzl", install_custom_deps = "install_deps")
 
 install_custom_deps()
+
+# DirectX Shader Compiler DLLs for Windows
+http_archive(
+    name = "directx_shader_compiler",
+    build_file = "@//:BUILD.directx_shader_compiler",
+    sha256 = "a1e89031421cf3c1fca6627766ab3020ca4f962ac7e2caa7fab2b33a8436151e",
+    url = "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2602/dxc_2026_02_20.zip",
+)
+
+http_archive(
+    name = "patchelf_linux_x86_64",
+    build_file_content = """
+filegroup(
+    name = "patchelf",
+    srcs = ["bin/patchelf"],
+    visibility = ["//visibility:public"],
+)
+""",
+    sha256 = "ce84f2447fb7a8679e58bc54a20dc2b01b37b5802e12c57eece772a6f14bf3f0",
+    url = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-x86_64.tar.gz",
+)
+
+http_archive(
+    name = "patchelf_linux_arm64",
+    build_file_content = """
+filegroup(
+    name = "patchelf",
+    srcs = ["bin/patchelf"],
+    visibility = ["//visibility:public"],
+)
+""",
+    sha256 = "ae13e2effe077e829be759182396b931d8f85cfb9cfe9d49385516ea367ef7b2",
+    url = "https://github.com/NixOS/patchelf/releases/download/0.18.0/patchelf-0.18.0-aarch64.tar.gz",
+)
+

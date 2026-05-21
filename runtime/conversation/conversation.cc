@@ -552,6 +552,9 @@ absl::Status Conversation::SendMessageAsync(
                 // If prefill failed, invoke the callback with the error
                 // status and do not proceed to decode.
                 (*callback)(responses.status());
+              } else if (responses.ok() &&
+                         responses->GetTaskState() == TaskState::kCancelled) {
+                (*callback)(responses);
               } else if (IsEmptyInputError(responses.status()) ||
                          responses->GetTaskState() == TaskState::kDone) {
                 // Scenario 2: Prefill was skipped due to empty input, or

@@ -64,14 +64,6 @@
 
 namespace litert::lm {
 
-// Helper macro to check if the task has been cancelled.
-#define RETURN_IF_CANCELLED(cancelled, task_id, callback)             \
-  if (cancelled != nullptr && cancelled->load()) {                    \
-    FinishTaskAndLogErrors(task_id, Responses(TaskState::kCancelled), \
-                           std::move(callback));                      \
-    return;                                                           \
-  }
-
 ThreadedExecutionManager::ThreadedExecutionManager(
     Tokenizer* absl_nonnull tokenizer,
     std::unique_ptr<ResourceManager> absl_nonnull resource_manager,
@@ -736,7 +728,11 @@ absl::Status ThreadedExecutionManager::AddPrefillTask(
       return;
     }
 
-    RETURN_IF_CANCELLED(cancelled, task_id, callback);
+    if (cancelled != nullptr && cancelled->load()) {
+      FinishTaskAndLogErrors(task_id, Responses(TaskState::kCancelled),
+                             std::move(callback));
+      return;
+    }
 
     // Note AcquireExecutorWithContextHandler include context switching logic,
     // so it should be called before any executor running.
@@ -748,23 +744,35 @@ absl::Status ThreadedExecutionManager::AddPrefillTask(
       return;
     }
 
-    RETURN_IF_CANCELLED(cancelled, task_id, callback);
+    if (cancelled != nullptr && cancelled->load()) {
+      llm_executor.value().reset();
+      FinishTaskAndLogErrors(task_id, Responses(TaskState::kCancelled),
+                             std::move(callback));
+      return;
+    }
 
     auto executor_inputs =
         ProcessAndCombineContents(inputs, session_info->benchmark_info);
     if (!executor_inputs.ok()) {
+      llm_executor.value().reset();
       FinishTaskAndLogErrors(task_id, executor_inputs.status(),
                              std::move(callback));
       return;
     }
 
-    RETURN_IF_CANCELLED(cancelled, task_id, callback);
+    if (cancelled != nullptr && cancelled->load()) {
+      llm_executor.value().reset();
+      FinishTaskAndLogErrors(task_id, Responses(TaskState::kCancelled),
+                             std::move(callback));
+      return;
+    }
 
     auto responses =
         Tasks::Prefill(*llm_executor.value(), *executor_inputs,
                        /*wait_for_completion=*/true,
                        /*benchmark_info=*/session_info->benchmark_info);
     if (!responses.ok()) {
+      llm_executor.value().reset();
       FinishTaskAndLogErrors(task_id, responses.status(), std::move(callback));
       return;
     }
@@ -791,6 +799,7 @@ absl::Status ThreadedExecutionManager::AddPrefillTask(
               .at(0);
     }
 
+    llm_executor.value().reset();
     FinishTaskAndLogErrors(task_id, std::move(responses), std::move(callback));
     return;
   };
@@ -824,7 +833,11 @@ absl::Status ThreadedExecutionManager::AddDecodeTask(
       return;
     }
 
-    RETURN_IF_CANCELLED(cancelled, task_id, callback);
+    if (cancelled != nullptr && cancelled->load()) {
+      FinishTaskAndLogErrors(task_id, Responses(TaskState::kCancelled),
+                             std::move(callback));
+      return;
+    }
 
     auto llm_executor = resource_manager_->AcquireExecutorWithContextHandler(
         session_info->context_handler);
@@ -834,7 +847,12 @@ absl::Status ThreadedExecutionManager::AddDecodeTask(
       return;
     }
 
-    RETURN_IF_CANCELLED(cancelled, task_id, callback);
+    if (cancelled != nullptr && cancelled->load()) {
+      llm_executor.value().reset();
+      FinishTaskAndLogErrors(task_id, Responses(TaskState::kCancelled),
+                             std::move(callback));
+      return;
+    }
 
     auto num_output_candidates =
         session_info->session_config.GetNumOutputCandidates();
@@ -848,6 +866,7 @@ absl::Status ThreadedExecutionManager::AddDecodeTask(
       auto decoded_ids_buffer_or =
           CopyToTensorBuffer<int>(decoded_ids, {num_output_candidates, 1});
       if (!decoded_ids_buffer_or.HasValue()) {
+        llm_executor.value().reset();
         callback(absl::InternalError(decoded_ids_buffer_or.Error().Message()));
         return;
       }
@@ -867,6 +886,7 @@ absl::Status ThreadedExecutionManager::AddDecodeTask(
       responses = Responses(TaskState::kCancelled);
     }
 
+    llm_executor.value().reset();
     FinishTaskAndLogErrors(task_id, std::move(responses), std::move(callback));
     return;
   };
@@ -898,7 +918,11 @@ absl::Status ThreadedExecutionManager::AddCloneSessionTask(
       return;
     }
 
-    RETURN_IF_CANCELLED(cancelled, task_id, callback);
+    if (cancelled != nullptr && cancelled->load()) {
+      FinishTaskAndLogErrors(task_id, Responses(TaskState::kCancelled),
+                             std::move(callback));
+      return;
+    }
 
     absl::StatusOr<Responses> result = Responses(TaskState::kDone);
     [&] {
@@ -1003,7 +1027,11 @@ absl::Status ThreadedExecutionManager::AddTextScoringTask(
       return;
     }
 
-    RETURN_IF_CANCELLED(cancelled, task_id, callback);
+    if (cancelled != nullptr && cancelled->load()) {
+      FinishTaskAndLogErrors(task_id, Responses(TaskState::kCancelled),
+                             std::move(callback));
+      return;
+    }
 
     auto llm_executor = resource_manager_->AcquireExecutorWithContextHandler(
         session_info->context_handler);
@@ -1013,7 +1041,12 @@ absl::Status ThreadedExecutionManager::AddTextScoringTask(
       return;
     }
 
-    RETURN_IF_CANCELLED(cancelled, task_id, callback);
+    if (cancelled != nullptr && cancelled->load()) {
+      llm_executor.value().reset();
+      FinishTaskAndLogErrors(task_id, Responses(TaskState::kCancelled),
+                             std::move(callback));
+      return;
+    }
 
     const int num_output_candidates =
         session_info->session_config.GetNumOutputCandidates();
@@ -1022,6 +1055,7 @@ absl::Status ThreadedExecutionManager::AddTextScoringTask(
     auto decoded_ids_buffer =
         CopyToTensorBuffer<int>(decoded_ids, {num_output_candidates, 1});
     if (!decoded_ids_buffer.HasValue()) {
+      llm_executor.value().reset();
       FinishTaskAndLogErrors(
           task_id, absl::InternalError(decoded_ids_buffer.Error().Message()),
           std::move(callback));
@@ -1040,6 +1074,7 @@ absl::Status ThreadedExecutionManager::AddTextScoringTask(
       responses = Responses(TaskState::kCancelled);
     }
 
+    llm_executor.value().reset();
     FinishTaskAndLogErrors(task_id, std::move(responses), std::move(callback));
     return;
   };

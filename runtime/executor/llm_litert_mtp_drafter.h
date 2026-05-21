@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
+#include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "litert/cc/litert_compiled_model.h"  // from @litert
@@ -47,7 +48,7 @@ class LlmLiteRtMtpDrafter {
   // "verify" signature and be invokable when Draft is called (i.e., not busy).
   static absl::StatusOr<std::unique_ptr<LlmLiteRtMtpDrafter>> Create(
       Environment& env, ModelResources& resources,
-      const LlmExecutorSettings& executor_settings, CompiledModel base_model,
+      const LlmExecutorSettings& executor_settings, CompiledModel& base_model,
       EmbeddingLookupManager& embedding_manager,
       EmbeddingLookupManager& ple_manager);
 
@@ -73,8 +74,9 @@ class LlmLiteRtMtpDrafter {
           output_kv_cache_buffers);
 
  private:
-  LlmLiteRtMtpDrafter(CompiledModel mtp_drafter_model, CompiledModel base_model,
+  LlmLiteRtMtpDrafter(CompiledModel mtp_drafter_model,
                       SimpleSignature drafter_signature,
+                      CompiledModel& base_model,
                       SimpleSignature verify_signature,
                       EmbeddingLookupManager& embedding_manager,
                       EmbeddingLookupManager& ple_manager,
@@ -91,8 +93,8 @@ class LlmLiteRtMtpDrafter {
                           verifier_output_buffers,
                       int num_draft_steps)
       : mtp_drafter_model_(std::move(mtp_drafter_model)),
-        base_model_(std::move(base_model)),
         drafter_signature_(std::move(drafter_signature)),
+        base_model_(base_model),
         verify_signature_(std::move(verify_signature)),
         embedding_manager_(embedding_manager),
         ple_manager_(ple_manager),
@@ -144,10 +146,11 @@ class LlmLiteRtMtpDrafter {
 
   // The MTP drafter model.
   CompiledModel mtp_drafter_model_;
-
-  // The base model, used for verification.
-  CompiledModel base_model_;
   SimpleSignature drafter_signature_;
+
+  // The base model, used for verification. The model is owned by the base
+  // LiteRtCompiledModelExecutor.
+  CompiledModel& base_model_;
   SimpleSignature verify_signature_;
 
   EmbeddingLookupManager& embedding_manager_;
