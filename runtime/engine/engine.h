@@ -103,52 +103,6 @@ class SessionInterface {
     virtual absl::Status Cancel() {
       return absl::UnimplementedError("Not implemented.");
     };
-<<<<<<< HEAD
-
-    // Clones the session asynchronously.
-    // The cloned session have all the settings and context
-    // of the original session up to the point that the clone function is
-    // called.
-    // - callback: Callback to when the streamed results.
-    //
-    // Example usage:
-    //   Session session1 = engine->CreateSession(...);
-    //   session1->RunPrefillAsync("What is the tallest building ", ...);
-    //   Session session2 = session1->CloneAsync(...);
-    //   session1->RunPrefillAsync("in the world?", ...);
-    //   session1->RunDecodeAsync(...);
-    //   session2->RunPrefillAsync("in France?", ...);
-    //   session2->RunDecodeAsync(...);
-    virtual absl::StatusOr<std::unique_ptr<Session>> CloneAsync(
-        absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) {
-      return absl::UnimplementedError("Not implemented.");
-    };
-    // Save the current step with the name `label`. You can later rewind to this
-    // checkpoint using `RewindToCheckpoint(label)`. If the checkpoint name
-    // already exists, the step number will be overwritten.
-    virtual absl::Status SaveCheckpoint(absl::string_view label) {
-      return absl::UnimplementedError("SaveCheckpoint not implemented.");
-    }
-
-    // Rewinds the session to the given checkpoint. Checkpoints after the
-    // restored step will be removed. Returns an error if the checkpoint name
-    // does not exist.
-    virtual absl::Status RewindToCheckpoint(absl::string_view label) {
-      return absl::UnimplementedError("RewindToCheckpoint not implemented.");
-    }
-
-    // Get the current step of the session.
-    virtual absl::StatusOr<int> GetCurrentStep() const {
-      return absl::UnimplementedError("GetCurrentStep not implemented.");
-    }
-
-    // Get the reference to the session config for the session.
-    virtual const SessionConfig& GetSessionConfig() const = 0;
-
-    // 获取底层的 LlmExecutor 实例，用于物理层面上直接锁显存读写 KV Cache
-    virtual LlmExecutor* GetLlmExecutor() const { return nullptr; }
-=======
->>>>>>> upstream/main
   };
 
   virtual ~SessionInterface() = default;
@@ -334,6 +288,9 @@ class SessionInterface {
 
   // Get the reference to the session config for the session.
   virtual const SessionConfig& GetSessionConfig() const = 0;
+
+  // 获取底层的 LlmExecutor 实例，用于物理层面上直接锁显存读写 KV Cache
+  virtual LlmExecutor* GetLlmExecutor() const { return nullptr; }
 };
 
 // EngineT is the templated interface for the LLM runtime.
