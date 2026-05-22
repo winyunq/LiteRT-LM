@@ -5,38 +5,7 @@
 #include <atomic>
 #include <vector>
 
-// --- Wrapper Types (Aligned with litert_lm_wrapper.h after modification) ---
-typedef struct {
-    const char* model_path;      // 模型路径
-    const char* backend;         // 推理后端 ("cpu", "gpu")
-    int max_num_tokens;          // 最大上下文长度
-    int num_threads;             // CPU 线程数
-    int bEnableBenchmark;        // 是否开启性能日志
-    int bOptimizeShader;         // 是否优化着色器
-    int bEnableVision;           // 是否启用视觉引擎
-    int bEnableAudio;            // 是否启用音频引擎
-    int prefill_chunk_size;      // 分块 prefill 限制
-    const char* tools_json;      // [新增] 动态传入的注册工具 JSON 字符串
-} LiteRtLm_Config;
-
-typedef struct {
-    float temperature;           // 采样温度
-    float top_p;                 // Top-P 采样
-    int top_k;                   // Top-K 采样
-    int max_tokens;              // 本次生成最大 Token 数
-    int constraint_type;         // 强制约束类型 (0:无, 1:Regex, 2:JSON Schema, 3:Lark)
-    const char* constraint_string; // 约束字符串内容
-} LiteRtLm_SamplingParams;
-
-typedef struct {
-    const char* text_chunk;      // 实时文本片段
-    const char* full_json_chunk; // 完整的 OpenAI 兼容 JSON 片段 (包含 tool_calls 等)
-    const char* error_msg;       // 错误消息
-    int bIsDone;                 // 是否推理完成
-    float tokens_per_sec;        // 推理速度
-} LiteRtLm_Result;
-
-typedef void (*LiteRtLmCallback)(LiteRtLm_Result result, void* user_ptr);
+#include "../runtime/engine/litert_lm_wrapper.h"
 
 // --- Function Pointers ---
 typedef void* (*PN_CreateEngine)(LiteRtLm_Config config);
@@ -176,6 +145,8 @@ int main(int argc, char* argv[]) {
     config.bEnableVision = 0;
     config.prefill_chunk_size = 2048;
     config.tools_json = tools_definition_json.c_str(); // [物理传入] 声明模型拥有的原生 MCP 工具集
+
+
 
     std::cout << "[Step 2] Initializing GPU Engine with tools preface..." << std::endl;
     void* engine = CreateEngine(config);
