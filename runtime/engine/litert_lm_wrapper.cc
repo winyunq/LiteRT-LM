@@ -91,6 +91,7 @@ static bool SafeExecuteWithSehGuard(SafeFunc func, void* arg) {
 #include "litert_lm_wrapper.h"
 
 #include "runtime/components/constrained_decoding/llg_constraint_config.h"
+#include "runtime/util/litert_util.h"
 
 using namespace litert::lm;
 using json = nlohmann::json;
@@ -353,13 +354,18 @@ DLL_EXPORT void LiteRtLm_DestroyEngine(void* engine_ptr) {
     std::lock_guard<std::mutex> global_lock(g_GlobalContextMutex);
     LogDebug("LiteRtLm_DestroyEngine: Destroying active engine and conversation...");
     
-    g_GlobalConversationContext.reset(); // 自动隐式销毁全局会话
+    g_GlobalConversationContext.reset(); // 1. 自动隐式销毁全局会话
+    
     if (engine_ptr) {
-        delete static_cast<Engine*>(engine_ptr);
+        delete static_cast<Engine*>(engine_ptr); // 2. 销毁引擎实例
     }
     if (g_ActiveEnginePtr == engine_ptr) {
         g_ActiveEnginePtr = nullptr;
     }
+    
+    // 3. 在引擎和会话彻底安全销毁后，物理强力清空 LiteRT 全局运行环境缓存，强制触发底层 WebGPU 析构并彻底退还显存！
+    litert::lm::ClearCachedEnvironments();
+    
     LogDebug("LiteRtLm_DestroyEngine: Destroy complete.");
 }
 

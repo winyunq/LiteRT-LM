@@ -29,6 +29,8 @@ namespace litert::lm {
 absl::StatusOr<Environment&> GetEnvironment(EngineSettings& engine_settings,
                                             ModelResources* model_resources);
 
+void ClearCachedEnvironments();
+
 }  // namespace litert::lm
 
 #endif  // THIRD_PARTY_ODML_LITERT_LM_RUNTIME_UTIL_LITERT_UTIL_H_

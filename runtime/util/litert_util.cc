@@ -38,22 +38,31 @@
 #include "runtime/util/logging.h"
 
 namespace litert::lm {
+namespace {
+
+struct CachedEnvironment {
+  Environment env;
+  std::unique_ptr<MagicNumberConfigsHelper> helper;
+};
+
+static absl::Mutex environments_mu(absl::kConstInit);
+static absl::NoDestructor<
+    std::unordered_map<Backend, absl::StatusOr<CachedEnvironment>>>
+    kEnvironments;
+
+}  // namespace
+
+void ClearCachedEnvironments() {
+  absl::MutexLock lock(&environments_mu);
+  kEnvironments->clear();
+  ABSL_LOG(INFO) << "[Winyunq] Successfully cleared cached LiteRT environments and released device memory!";
+}
 
 absl::StatusOr<Environment&> GetEnvironment(EngineSettings& engine_settings,
                                             ModelResources* model_resources) {
   const auto& main_executor_settings =
       engine_settings.GetMainExecutorSettings();
   Backend backend = main_executor_settings.GetBackend();
-
-  struct CachedEnvironment {
-    Environment env;
-    std::unique_ptr<MagicNumberConfigsHelper> helper;
-  };
-
-  static absl::Mutex environments_mu(absl::kConstInit);
-  static absl::NoDestructor<
-      std::unordered_map<Backend, absl::StatusOr<CachedEnvironment>>>
-      kEnvironments;
 
   absl::MutexLock lock(&environments_mu);
 
