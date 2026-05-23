@@ -10,6 +10,7 @@
 #include <algorithm>
 
 #ifdef _MSC_VER
+#include <windows.h>
 #pragma comment(linker, "/EXPORT:LiteRtLm_CreateEngine")
 #pragma comment(linker, "/EXPORT:LiteRtLm_DestroyEngine")
 #pragma comment(linker, "/EXPORT:LiteRtLm_AppendUserMessage")
@@ -32,11 +33,59 @@ inline void LogDebug(const std::string& msg) {
     } catch (...) {}
 }
 
+#ifdef _MSC_VER
+#include <sstream>
+inline int FilterException(DWORD code, struct _EXCEPTION_POINTERS* ep) {
+    std::stringstream ss;
+    ss << "==================================================\n";
+    ss << "[FATAL CRASHED] Captured SEH Exception 0x" << std::hex << code;
+    if (ep && ep->ExceptionRecord) {
+        ss << "\n  Exception Address (RIP): 0x" << ep->ExceptionRecord->ExceptionAddress;
+        if (code == EXCEPTION_ACCESS_VIOLATION) {
+            ss << "\n  Access Violation Detail:";
+            ss << "\n    Access Operation: " << (ep->ExceptionRecord->ExceptionInformation[0] ? "WRITE" : "READ");
+            ss << "\n    Target Address: 0x" << std::hex << ep->ExceptionRecord->ExceptionInformation[1];
+        }
+    }
+    if (ep && ep->ContextRecord) {
+        ss << "\n  CPU Register Context (x64):";
+        ss << "\n    RIP: 0x" << std::hex << ep->ContextRecord->Rip;
+        ss << "\n    RSP: 0x" << std::hex << ep->ContextRecord->Rsp;
+        ss << "\n    RBP: 0x" << std::hex << ep->ContextRecord->Rbp;
+        ss << "\n    RAX: 0x" << std::hex << ep->ContextRecord->Rax;
+        ss << "\n    RBX: 0x" << std::hex << ep->ContextRecord->Rbx;
+        ss << "\n    RCX: 0x" << std::hex << ep->ContextRecord->Rcx;
+        ss << "\n    RDX: 0x" << std::hex << ep->ContextRecord->Rdx;
+        ss << "\n    R8:  0x" << std::hex << ep->ContextRecord->R8;
+        ss << "\n    R9:  0x" << std::hex << ep->ContextRecord->R9;
+        ss << "\n    R10: 0x" << std::hex << ep->ContextRecord->R10;
+        ss << "\n    R11: 0x" << std::hex << ep->ContextRecord->R11;
+        ss << "\n    R12: 0x" << std::hex << ep->ContextRecord->R12;
+    }
+    ss << "\n==================================================";
+    LogDebug(ss.str());
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// 声明一个函数指针，用于在 SEH 保护下执行
+typedef void (*SafeFunc)(void* arg);
+
+// 纯 C 风格的物理防护层，没有任何 C++ 局部非平凡对象展开需求，彻底规避 C2712/C2713
+static bool SafeExecuteWithSehGuard(SafeFunc func, void* arg) {
+    __try {
+        func(arg);
+        return true;
+    } __except (FilterException(GetExceptionCode(), GetExceptionInformation())) {
+        return false;
+    }
+}
+#endif
+
 #include "runtime/conversation/conversation.h"
 #include "runtime/engine/engine_factory.h"
 #include "runtime/engine/engine_settings.h"
-#include "runtime/core/session_basic.h"
 #include "runtime/executor/llm_litert_compiled_model_executor.h"
+#include "runtime/executor/llm_executor_settings.h"
 #include "absl/types/span.h"
 #include "nlohmann/json.hpp"
 #include "litert_lm_wrapper.h"
@@ -71,26 +120,33 @@ DLL_EXPORT const char* LiteRtLm_GetAvailableBackends() {
     return "cpu,gpu"; 
 }
 
-DLL_EXPORT void* LiteRtLm_CreateEngine(LiteRtLm_Config config) {
-    std::lock_guard<std::mutex> global_lock(g_GlobalContextMutex);
-    LogDebug("LiteRtLm_CreateEngine: Starting engine creation...");
-
+static Engine* CreateEngineAndConversationInternal(LiteRtLm_Config config, std::string& out_err) {
+    LogDebug("[Trace] CreateEngineAndConversationInternal: Initiating core creation flow...");
+    
+    LogDebug("[Trace] Step 1: Parsing ModelAssets from path: " + (config.model_path ? std::string(config.model_path) : "NULL"));
     auto model_assets_or = ModelAssets::Create(config.model_path);
     if (!model_assets_or.ok()) {
-        LogDebug("LiteRtLm_CreateEngine: ModelAssets::Create failed: " + std::string(model_assets_or.status().message()));
+        out_err = "ModelAssets::Create failed: " + std::string(model_assets_or.status().message());
+        LogDebug("[Trace] Step 1 FAILED: " + out_err);
         return nullptr;
     }
+    LogDebug("[Trace] Step 1 SUCCESS: ModelAssets created successfully.");
     
+    LogDebug("[Trace] Step 2: Resolving backend from string: " + (config.backend ? std::string(config.backend) : "NULL"));
     auto backend_or = GetBackendFromString(config.backend);
     if (!backend_or.ok()) {
-        LogDebug("LiteRtLm_CreateEngine: GetBackendFromString failed: " + std::string(backend_or.status().message()));
+        out_err = "GetBackendFromString failed: " + std::string(backend_or.status().message());
+        LogDebug("[Trace] Step 2 FAILED: " + out_err);
         return nullptr;
     }
+    LogDebug("[Trace] Step 2 SUCCESS: Backend resolved.");
 
     // 根据开关决定是否启用多模态后端
     std::optional<Backend> vision_backend = config.bEnableVision ? std::make_optional(*backend_or) : std::nullopt;
     std::optional<Backend> audio_backend = config.bEnableAudio ? std::make_optional(*backend_or) : std::nullopt;
+    LogDebug("[Trace] Modality States: bEnableVision=" + std::to_string(config.bEnableVision) + ", bEnableAudio=" + std::to_string(config.bEnableAudio));
 
+    LogDebug("[Trace] Step 3: Generating EngineSettings::CreateDefault...");
     auto settings_or = EngineSettings::CreateDefault(
         std::move(*model_assets_or), 
         *backend_or, 
@@ -98,81 +154,198 @@ DLL_EXPORT void* LiteRtLm_CreateEngine(LiteRtLm_Config config) {
         audio_backend
     );
     if (!settings_or.ok()) {
-        LogDebug("LiteRtLm_CreateEngine: CreateDefault settings failed: " + std::string(settings_or.status().message()));
+        out_err = "EngineSettings::CreateDefault failed: " + std::string(settings_or.status().message());
+        LogDebug("[Trace] Step 3 FAILED: " + out_err);
         return nullptr;
     }
+    LogDebug("[Trace] Step 3 SUCCESS: Default settings initialized.");
 
     auto& main_settings = settings_or->GetMutableMainExecutorSettings();
 
     if (config.max_num_tokens > 0) {
         main_settings.SetMaxNumTokens(config.max_num_tokens);
+        LogDebug("[Trace] Set max_num_tokens = " + std::to_string(config.max_num_tokens));
     }
+    
+    // Step 3.3: CpuConfig —— 显式取出拷贝、修改并回写写回
     auto cpu_config_or = main_settings.MutableBackendConfig<CpuConfig>();
     if (cpu_config_or.ok()) {
+        CpuConfig cpu_cfg = cpu_config_or.value();
         if (config.num_threads > 0) {
-            cpu_config_or->number_of_threads = config.num_threads;
+            cpu_cfg.number_of_threads = config.num_threads;
+            LogDebug("[DIAGNOSTIC] Set CpuConfig number_of_threads = " + std::to_string(config.num_threads));
         }
         if (config.prefill_chunk_size > 0) {
-            cpu_config_or->prefill_chunk_size = config.prefill_chunk_size;
-            LogDebug("LiteRtLm_CreateEngine: Set prefill_chunk_size limit to: " + std::to_string(config.prefill_chunk_size));
+            cpu_cfg.prefill_chunk_size = config.prefill_chunk_size;
+            LogDebug("[DIAGNOSTIC] Set CpuConfig prefill_chunk_size = " + std::to_string(config.prefill_chunk_size));
         }
+        main_settings.SetBackendConfig(cpu_cfg);
+        LogDebug("[DIAGNOSTIC] Step 3.3 Finished. CpuConfig applied and written back.");
+    } else {
+        LogDebug("[DIAGNOSTIC] Step 3.3 Finished. CPU Config Status: " + std::string(cpu_config_or.status().message()));
     }
 
+    // Step 3.4: GpuConfig —— GPU backend 下显式获取并回写
+    auto gpu_config_or = main_settings.MutableBackendConfig<GpuConfig>();
+    if (gpu_config_or.ok()) {
+        GpuConfig gpu_cfg = gpu_config_or.value();
+        main_settings.SetBackendConfig(gpu_cfg);
+        LogDebug("[DIAGNOSTIC] Step 3.4 Finished. GpuConfig explicitly written back.");
+    } else {
+        LogDebug("[DIAGNOSTIC] Step 3.4 Finished. GPU Config Status: " + std::string(gpu_config_or.status().message()));
+    }
+
+    // Step 3.5: GpuArtisanConfig —— 获取、修改并回写
+    auto gpu_artisan_config_or = main_settings.MutableBackendConfig<GpuArtisanConfig>();
+    if (gpu_artisan_config_or.ok()) {
+        GpuArtisanConfig gpu_cfg = gpu_artisan_config_or.value();
+        gpu_cfg.set_enable_host_mapped_pointer = (config.bEnableHostMappedPointer != 0);
+        main_settings.SetBackendConfig(gpu_cfg);
+        LogDebug("[DIAGNOSTIC] Step 3.5 Finished. GpuArtisanConfig applied and written back: host_mapped=" + std::to_string(config.bEnableHostMappedPointer));
+    } else {
+        LogDebug("[DIAGNOSTIC] Step 3.5 Finished. GPU Artisan Config Status: " + std::string(gpu_artisan_config_or.status().message()));
+    }
+
+    // Step 3.6: AdvancedSettings —— 仅修改用户明确为 true 的字段，不覆盖默认值
+    LogDebug("[DIAGNOSTIC] Step 3.6: Updating AdvancedSettings...");
     AdvancedSettings adv = main_settings.GetAdvancedSettings().value_or(AdvancedSettings());
-    adv.optimize_shader_compilation = (config.bOptimizeShader != 0);
-    adv.is_benchmark = (config.bEnableBenchmark != 0);
+    if (config.bOptimizeShader) {
+        adv.optimize_shader_compilation = true;
+    }
+    if (config.bEnableBenchmark) {
+        adv.is_benchmark = true;
+    }
+    if (config.bShareConstantTensors) {
+        adv.share_constant_tensors = true;
+    }
     main_settings.SetAdvancedSettings(adv);
+    LogDebug("[DIAGNOSTIC] Step 3.6 Finished.");
+
+    // Step 3.7: 与 litert_lm_main.cc 对齐，显式初始化 BenchmarkParams 避免内部 nullptr
+    LogDebug("[DIAGNOSTIC] Step 3.7: Initializing BenchmarkParams...");
+    if (config.bEnableBenchmark) {
+        settings_or->GetMutableBenchmarkParams() = proto::BenchmarkParams();
+        LogDebug("[DIAGNOSTIC] Step 3.7: BenchmarkParams initialized (benchmark mode).");
+    }
+    LogDebug("[DIAGNOSTIC] Step 3.7 Finished.");
     
-    auto engine_or = EngineFactory::CreateAny(std::move(*settings_or));
+    LogDebug("[Trace] Step 4: Calling EngineFactory::CreateDefault (Crucial backend init point)...");
+    auto engine_or = EngineFactory::CreateDefault(std::move(*settings_or));
     if (!engine_or.ok()) {
-        LogDebug("LiteRtLm_CreateEngine: CreateAny engine failed: " + std::string(engine_or.status().message()));
+        out_err = "EngineFactory::CreateDefault failed: " + std::string(engine_or.status().message());
+        LogDebug("[Trace] Step 4 FAILED: " + out_err);
         return nullptr;
     }
+    LogDebug("[Trace] Step 4 SUCCESS: Engine instance created.");
 
     Engine* engine = engine_or->release();
-    g_ActiveEnginePtr = static_cast<void*>(engine);
 
     // --- 隐式自动初始化全局唯一的会话上下文 ---
+    LogDebug("[Trace] Step 5: Preparing ConversationConfig and session mapping...");
     auto builder = ConversationConfig::Builder();
     builder.SetEnableConstrainedDecoding(false);
     builder.SetConstraintProviderConfig(LlGuidanceConfig());
 
+    if (config.tools_json && strlen(config.tools_json) > 0) {
+        try {
+            JsonPreface preface;
+            preface.tools = nlohmann::ordered_json::parse(config.tools_json);
+            builder.SetPreface(preface);
+            LogDebug("[Trace] Preface tools successfully parsed and set.");
+        } catch (const std::exception& e) {
+            LogDebug("[Trace] WARNING - Parse tools_json failed: " + std::string(e.what()));
+        }
+    }
+
     // 创建默认的会话配置
     auto sess_cfg = SessionConfig::CreateDefault();
 
-    // 探测引擎多模态支持状态，若视觉执行器就绪则自动启用视觉模态
-    if (engine->GetVisionExecutorProperties().ok()) {
+    if (engine->GetEngineSettings().GetVisionExecutorSettings().has_value()) {
         sess_cfg.SetVisionModalityEnabled(true);
-        LogDebug("LiteRtLm_CreateEngine: Vision modality dynamically enabled in SessionConfig.");
+        LogDebug("[Trace] Vision modality detected and enabled in SessionConfig.");
     }
 
-    // 探测引擎多模态支持状态，若音频执行器就绪则自动启用音频模态
-    if (engine->GetAudioExecutorProperties().ok()) {
+    if (engine->GetEngineSettings().GetAudioExecutorSettings().has_value()) {
         sess_cfg.SetAudioModalityEnabled(true);
-        LogDebug("LiteRtLm_CreateEngine: Audio modality dynamically enabled in SessionConfig.");
+        LogDebug("[Trace] Audio modality detected and enabled in SessionConfig.");
     }
 
-    // 构建并生成最终的会话配置
+    LogDebug("[Trace] Step 6: Building ConversationConfig...");
     auto conv_cfg_or = builder.SetSessionConfig(sess_cfg).Build(*engine);
     if (!conv_cfg_or.ok()) {
-        LogDebug("LiteRtLm_CreateEngine: Build ConversationConfig failed: " + std::string(conv_cfg_or.status().message()));
+        out_err = "Build ConversationConfig failed: " + std::string(conv_cfg_or.status().message());
+        LogDebug("[Trace] Step 6 FAILED: " + out_err);
         delete engine;
-        g_ActiveEnginePtr = nullptr;
         return nullptr;
     }
+    LogDebug("[Trace] Step 6 SUCCESS: ConversationConfig built.");
 
+    LogDebug("[Trace] Step 7: Creating Conversation instance...");
     auto conv_or = Conversation::Create(*engine, *conv_cfg_or);
     if (!conv_or.ok()) {
-        LogDebug("LiteRtLm_CreateEngine: Conversation::Create failed: " + std::string(conv_or.status().message()));
+        out_err = "Conversation::Create failed: " + std::string(conv_or.status().message());
+        LogDebug("[Trace] Step 7 FAILED: " + out_err);
         delete engine;
-        g_ActiveEnginePtr = nullptr;
         return nullptr;
     }
+    LogDebug("[Trace] Step 7 SUCCESS: Conversation created successfully.");
 
     g_GlobalConversationContext = std::make_unique<LiteRtLm_ConversationContext>();
     g_GlobalConversationContext->conversation = std::move(*conv_or);
 
-    LogDebug("LiteRtLm_CreateEngine: Successfully created engine and active single conversation instance.");
+    LogDebug("[Trace] CreateEngineAndConversationInternal: Full flow completed SUCCESS.");
+    return engine;
+}
+
+struct CreateEngineParam {
+    LiteRtLm_Config config;
+    std::string* out_err;
+    Engine* out_engine;
+};
+
+static void RunEngineCreate(void* arg) {
+    CreateEngineParam* param = static_cast<CreateEngineParam*>(arg);
+    param->out_engine = CreateEngineAndConversationInternal(param->config, *(param->out_err));
+}
+
+DLL_EXPORT void* LiteRtLm_CreateEngine(LiteRtLm_Config config) {
+    std::lock_guard<std::mutex> global_lock(g_GlobalContextMutex);
+    LogDebug("==================================================");
+    LogDebug("LiteRtLm_CreateEngine: Initiating safe creation...");
+    LogDebug("  [Config] model_path: " + (config.model_path ? std::string(config.model_path) : "NULL"));
+    LogDebug("  [Config] backend: " + (config.backend ? std::string(config.backend) : "NULL"));
+    LogDebug("  [Config] max_num_tokens: " + std::to_string(config.max_num_tokens));
+    LogDebug("  [Config] prefill_chunk_size: " + std::to_string(config.prefill_chunk_size));
+    LogDebug("  [Config] num_threads: " + std::to_string(config.num_threads));
+    LogDebug("  [Config] bOptimizeShader: " + std::to_string(config.bOptimizeShader));
+    LogDebug("  [Config] bEnableBenchmark: " + std::to_string(config.bEnableBenchmark));
+    LogDebug("  [Config] bShareConstantTensors: " + std::to_string(config.bShareConstantTensors));
+    LogDebug("  [Config] bEnableHostMappedPointer: " + std::to_string(config.bEnableHostMappedPointer));
+    LogDebug("==================================================");
+
+    std::string err_buf;
+    CreateEngineParam param = { config, &err_buf, nullptr };
+
+#ifdef _MSC_VER
+    LogDebug("[Trace] Invoking SafeExecuteWithSehGuard...");
+    bool ok = SafeExecuteWithSehGuard(RunEngineCreate, &param);
+    if (!ok) {
+        LogDebug("[Trace] SafeExecuteWithSehGuard captured a SEH hard exception inside creation execution!");
+        g_ActiveEnginePtr = nullptr;
+        return nullptr;
+    }
+#else
+    RunEngineCreate(&param);
+#endif
+
+    if (!param.out_engine) {
+        LogDebug("[Trace] Engine creation returned nullptr. Diagnostics: " + err_buf);
+        g_ActiveEnginePtr = nullptr;
+        return nullptr;
+    }
+
+    g_ActiveEnginePtr = static_cast<void*>(param.out_engine);
+    LogDebug("[Trace] LiteRtLm_CreateEngine completed successfully. Engine handle stored: " + std::to_string((uintptr_t)g_ActiveEnginePtr));
     return g_ActiveEnginePtr;
 }
 
@@ -303,13 +476,31 @@ DLL_EXPORT void LiteRtLm_RunInference(LiteRtLm_SamplingParams params, LiteRtLmCa
         
         if (chunk->is_null() || chunk->empty()) {
             LogDebug("LiteRtLm_RunInference Callback: Generation Done (empty chunk).");
+            
+            // [绝杀修复] 从全局会话的历史中提取刚完成生成的完美、完整 Message
+            try {
+                auto history = ctx->conversation->GetHistory();
+                if (!history.empty()) {
+                    const auto& final_msg = history.back();
+                    ctx->cb_json_buffer = final_msg.dump();
+                    res.full_json_chunk = ctx->cb_json_buffer.c_str();
+                    LogDebug("LiteRtLm_RunInference Callback Done: Fetched final message from history: " + ctx->cb_json_buffer);
+                }
+            } catch (const std::exception& e) {
+                LogDebug("LiteRtLm_RunInference Callback Done: Fetch final message failed: " + std::string(e.what()));
+            }
+
             res.bIsDone = 1;
             callback(res, user_ptr); 
             return;
         }
 
         ctx->cb_json_buffer = chunk->dump();
-        res.full_json_chunk = ctx->cb_json_buffer.c_str();
+        if (chunk->contains("tool_calls")) {
+            res.full_json_chunk = ctx->cb_json_buffer.c_str();
+        } else {
+            res.full_json_chunk = nullptr;
+        }
 
         ctx->cb_text_buffer.clear();
         if (chunk->contains("content")) {
@@ -374,82 +565,15 @@ DLL_EXPORT int LiteRtLm_GetKVCache(void* data_ptr, size_t* out_size) {
         return -3;
     }
 
-    auto* executor = session->GetLlmExecutor();
-    if (!executor) {
-        LogDebug("LiteRtLm_GetKVCache: FAILED - No active LlmExecutor.");
+    auto cache_or = session->GetKVCache();
+    if (!cache_or.ok()) {
+        LogDebug("LiteRtLm_GetKVCache: FAILED - GetKVCache failed: " + std::string(cache_or.status().message()));
         return -4;
     }
 
-    auto* compiled_exec = dynamic_cast<LlmLiteRtCompiledModelExecutorBase*>(executor);
-    if (!compiled_exec) {
-        compiled_exec = static_cast<LlmLiteRtCompiledModelExecutorBase*>(executor);
-    }
+    const std::string& cache_data = cache_or.value();
+    size_t required_size = cache_data.size();
 
-    auto& map1 = compiled_exec->GetKVCacheBuffers1();
-    auto& map2 = compiled_exec->GetKVCacheBuffers2();
-
-    // 收集所有物理缓存 tensors 并且排好序以确物理顺序绝对一致
-    std::vector<std::pair<std::string, ::litert::TensorBuffer*>> all_tensors;
-    for (auto& pair : map1) {
-        all_tensors.push_back({std::string(pair.first), &pair.second});
-    }
-    for (auto& pair : map2) {
-        all_tensors.push_back({"_map2_" + std::string(pair.first), &pair.second});
-    }
-
-    std::sort(all_tensors.begin(), all_tensors.end(), [](const auto& a, const auto& b) {
-        return a.first < b.first;
-    });
-
-    // 物理序列化二进制数据流
-    std::vector<char> stream;
-    
-    // 1. 包头：Magic Number + Version + Count
-    uint32_t magic = 0x594E515F; // "WNYQ"
-    uint32_t version = 1;
-    uint32_t count = static_cast<uint32_t>(all_tensors.size());
-
-    auto append_val = [&stream](const void* val_ptr, size_t val_size) {
-        const char* byte_ptr = static_cast<const char*>(val_ptr);
-        stream.insert(stream.end(), byte_ptr, byte_ptr + val_size);
-    };
-
-    append_val(&magic, sizeof(magic));
-    append_val(&version, sizeof(version));
-    append_val(&count, sizeof(count));
-
-    // 2. 依次读取并打包每一个 TensorBuffer 的数据
-    for (auto& pair : all_tensors) {
-        const std::string& name = pair.first;
-        auto* buffer = pair.second;
-
-        auto size_expected = buffer->PackedSize();
-        if (!size_expected.HasValue()) {
-            LogDebug("LiteRtLm_GetKVCache: FAILED - Failed to get PackedSize for tensor: " + name);
-            return -5;
-        }
-        size_t tensor_bytes = size_expected.Value();
-
-        uint32_t name_len = static_cast<uint32_t>(name.size());
-        append_val(&name_len, sizeof(name_len));
-        stream.insert(stream.end(), name.begin(), name.end());
-
-        uint32_t data_len = static_cast<uint32_t>(tensor_bytes);
-        append_val(&data_len, sizeof(data_len));
-
-        // 物理分配临时接收缓冲区直接锁显存读取物理字节
-        std::vector<char> temp_data(tensor_bytes);
-        auto read_expected = buffer->Read<char>(absl::MakeSpan(temp_data));
-        if (!read_expected.HasValue()) {
-            LogDebug("LiteRtLm_GetKVCache: FAILED - Failed to read physical data from GPU for: " + name);
-            return -6;
-        }
-
-        stream.insert(stream.end(), temp_data.begin(), temp_data.end());
-    }
-
-    // 3. 返回大小或执行实际物理拷贝到外部缓冲区
-    size_t required_size = stream.size();
     if (!data_ptr) {
         *out_size = required_size;
         return 0;
@@ -461,7 +585,7 @@ DLL_EXPORT int LiteRtLm_GetKVCache(void* data_ptr, size_t* out_size) {
         return -7;
     }
 
-    std::memcpy(data_ptr, stream.data(), required_size);
+    std::memcpy(data_ptr, cache_data.data(), required_size);
     *out_size = required_size;
     
     LogDebug("LiteRtLm_GetKVCache: Successfully exported physical KV cache, size: " + std::to_string(required_size) + " bytes.");
@@ -482,15 +606,9 @@ DLL_EXPORT int LiteRtLm_SetKVCache(const void* data_ptr, size_t size) {
         return -3;
     }
 
-    auto* executor = session->GetLlmExecutor();
-    if (!executor) {
-        LogDebug("LiteRtLm_SetKVCache: FAILED - No active LlmExecutor.");
-        return -4;
-    }
-
     // A. 擦除/重置逻辑
     if (!data_ptr && size == 0) {
-        auto status = executor->Reset();
+        auto status = session->SetKVCache("");
         if (!status.ok()) {
             LogDebug("LiteRtLm_SetKVCache: Reset active KV cache FAILED: " + std::string(status.message()));
             return -5;
@@ -499,74 +617,12 @@ DLL_EXPORT int LiteRtLm_SetKVCache(const void* data_ptr, size_t size) {
         return 0;
     }
 
-    // B. 反序列化物理灌入显存
-    auto* compiled_exec = dynamic_cast<LlmLiteRtCompiledModelExecutorBase*>(executor);
-    if (!compiled_exec) {
-        compiled_exec = static_cast<LlmLiteRtCompiledModelExecutorBase*>(executor);
-    }
-
-    auto& map1 = compiled_exec->GetKVCacheBuffers1();
-    auto& map2 = compiled_exec->GetKVCacheBuffers2();
-
-    const char* stream_ptr = static_cast<const char*>(data_ptr);
-    size_t offset = 0;
-
-    auto read_val = [&stream_ptr, &offset, size](void* dest, size_t val_size) -> bool {
-        if (offset + val_size > size) return false;
-        std::memcpy(dest, stream_ptr + offset, val_size);
-        offset += val_size;
-        return true;
-    };
-
-    uint32_t magic = 0;
-    uint32_t version = 0;
-    uint32_t count = 0;
-
-    if (!read_val(&magic, sizeof(magic)) || magic != 0x594E515F) {
-        LogDebug("LiteRtLm_SetKVCache: FAILED - Invalid magic number.");
+    // B. 灌入逻辑
+    absl::string_view cache_data(static_cast<const char*>(data_ptr), size);
+    auto status = session->SetKVCache(cache_data);
+    if (!status.ok()) {
+        LogDebug("LiteRtLm_SetKVCache: FAILED - SetKVCache failed: " + std::string(status.message()));
         return -6;
-    }
-    if (!read_val(&version, sizeof(version)) || version != 1) {
-        LogDebug("LiteRtLm_SetKVCache: FAILED - Unsupported packet version.");
-        return -7;
-    }
-    if (!read_val(&count, sizeof(count))) {
-        LogDebug("LiteRtLm_SetKVCache: FAILED - Failed to read count.");
-        return -8;
-    }
-
-    for (uint32_t i = 0; i < count; ++i) {
-        uint32_t name_len = 0;
-        if (!read_val(&name_len, sizeof(name_len))) return -9;
-
-        if (offset + name_len > size) return -10;
-        std::string name(stream_ptr + offset, name_len);
-        offset += name_len;
-
-        uint32_t data_len = 0;
-        if (!read_val(&data_len, sizeof(data_len))) return -11;
-
-        if (offset + data_len > size) return -12;
-        const char* raw_tensor_data = stream_ptr + offset;
-        offset += data_len;
-
-        // 根据名称的前缀找到具体属于 map1 还是 map2
-        bool is_map2 = (name.rfind("_map2_", 0) == 0);
-        std::string origin_name = is_map2 ? name.substr(6) : name;
-
-        auto& target_map = is_map2 ? map2 : map1;
-        auto it = target_map.find(origin_name);
-        if (it != target_map.end()) {
-            auto& buffer = it->second;
-            // 物理锁显存将数据直接灌写回 GPU 显存
-            auto write_expected = buffer.Write<char>(absl::MakeSpan(raw_tensor_data, data_len));
-            if (!write_expected.HasValue()) {
-                LogDebug("LiteRtLm_SetKVCache: FAILED - Failed to write physical data to GPU for: " + name);
-                return -13;
-            }
-        } else {
-            LogDebug("LiteRtLm_SetKVCache: WARNING - Tensor key not found in active executors, skipping: " + origin_name);
-        }
     }
 
     LogDebug("LiteRtLm_SetKVCache: Successfully restored physical KV cache into GPU memory.");

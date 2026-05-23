@@ -291,6 +291,15 @@ class SessionInterface {
 
   // 获取底层的 LlmExecutor 实例，用于物理层面上直接锁显存读写 KV Cache
   virtual LlmExecutor* GetLlmExecutor() const { return nullptr; }
+
+  // Winyunq 原生“物理 KV 缓存直接锁显存零拷贝上下文切换架构” Session 级别原生接口
+  virtual absl::StatusOr<std::string> GetKVCache() const {
+    return absl::UnimplementedError("GetKVCache not implemented.");
+  }
+
+  virtual absl::Status SetKVCache(absl::string_view cache_data) {
+    return absl::UnimplementedError("SetKVCache not implemented.");
+  }
 };
 
 // EngineT is the templated interface for the LLM runtime.

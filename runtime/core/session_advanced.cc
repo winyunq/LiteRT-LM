@@ -42,6 +42,9 @@
 #include "runtime/framework/resource_management/execution_manager.h"
 #include "runtime/proto/sampler_params.pb.h"
 #include "runtime/util/status_macros.h"  // IWYU pragma: keep
+#include "runtime/executor/llm_processed_context.h"
+#include "litert/cc/litert_tensor_buffer.h"
+#include "runtime/executor/llm_executor_io_types.h"
 
 namespace litert::lm {
 namespace {
@@ -494,6 +497,226 @@ absl::StatusOr<int> SessionAdvanced::GetCurrentStep() const {
     return absl::FailedPreconditionError("Execution manager is not available.");
   }
   return execution_manager_lock->GetCurrentStep(*session_info_);
+}
+
+absl::StatusOr<std::string> SessionAdvanced::GetKVCache() const {
+  absl::MutexLock lock(const_cast<absl::Mutex*>(&mutex_));
+
+  auto execution_manager_lock = execution_manager_.lock();
+  if (execution_manager_lock == nullptr) {
+    return absl::FailedPreconditionError("Execution manager is not available.");
+  }
+
+  // 1. 获取当前的 current_step
+  ASSIGN_OR_RETURN(int current_step,
+                   execution_manager_lock->GetCurrentStep(*session_info_));
+
+  // 2. 获取 context_handler 中的 ProcessedContext 指针并转为 LlmProcessedContext*
+  if (!session_info_ || !session_info_->context_handler) {
+    return absl::FailedPreconditionError("No active context handler in session_info_.");
+  }
+
+  auto shared_ctx = session_info_->context_handler->shared_processed_context();
+  if (!shared_ctx) {
+    return absl::FailedPreconditionError("No shared processed context.");
+  }
+
+  auto* base_ctx = shared_ctx->processed_context();
+  if (!base_ctx) {
+    return absl::FailedPreconditionError("No active processed context.");
+  }
+
+  auto* llm_ctx = static_cast<LlmProcessedContext*>(base_ctx);
+  auto& kv_cache_map = llm_ctx->kv_cache_buffers();
+
+  // 3. 收集所有的 KV Cache Tensor 并排序，保证严格的物理顺序
+  std::vector<std::pair<std::string, ::litert::TensorBuffer*>> all_tensors;
+  for (auto& pair : kv_cache_map) {
+    all_tensors.push_back({std::string(pair.first), &pair.second});
+  }
+
+  std::sort(all_tensors.begin(), all_tensors.end(), [](const auto& a, const auto& b) {
+    return a.first < b.first;
+  });
+
+  // 4. 开始序列化二进制流
+  std::vector<char> stream;
+  
+  uint32_t magic = 0x594E515F; // "WNYQ" 的倒序/特定标识
+  uint32_t version = 1;
+  uint32_t count = static_cast<uint32_t>(all_tensors.size());
+  uint32_t step_val = static_cast<uint32_t>(current_step);
+  uint32_t state_val = static_cast<uint32_t>(session_state_);
+
+  auto append_val = [&stream](const void* val_ptr, size_t val_size) {
+    const char* byte_ptr = static_cast<const char*>(val_ptr);
+    stream.insert(stream.end(), byte_ptr, byte_ptr + val_size);
+  };
+
+  append_val(&magic, sizeof(magic));
+  append_val(&version, sizeof(version));
+  append_val(&step_val, sizeof(step_val));
+  append_val(&state_val, sizeof(state_val));
+  append_val(&count, sizeof(count));
+
+  // 5. 依次读取每个 TensorBuffer
+  for (auto& pair : all_tensors) {
+    const std::string& name = pair.first;
+    auto* buffer = pair.second;
+
+    auto size_expected = buffer->PackedSize();
+    if (!size_expected.HasValue()) {
+      return absl::InternalError(absl::StrCat("Failed to get PackedSize for tensor: ", name));
+    }
+    size_t tensor_bytes = size_expected.Value();
+
+    uint32_t name_len = static_cast<uint32_t>(name.size());
+    append_val(&name_len, sizeof(name_len));
+    stream.insert(stream.end(), name.begin(), name.end());
+
+    uint32_t data_len = static_cast<uint32_t>(tensor_bytes);
+    append_val(&data_len, sizeof(data_len));
+
+    std::vector<char> temp_data(tensor_bytes);
+    auto read_expected = buffer->Read<char>(absl::MakeSpan(temp_data));
+    if (!read_expected.HasValue()) {
+      return absl::InternalError(absl::StrCat("Failed to read physical data from GPU for: ", name));
+    }
+
+    stream.insert(stream.end(), temp_data.begin(), temp_data.end());
+  }
+
+  return std::string(stream.begin(), stream.end());
+}
+
+absl::Status SessionAdvanced::SetKVCache(absl::string_view cache_data) {
+  absl::MutexLock lock(&mutex_);
+
+  auto execution_manager_lock = execution_manager_.lock();
+  if (execution_manager_lock == nullptr) {
+    return absl::FailedPreconditionError("Execution manager is not available.");
+  }
+
+  if (!session_info_ || !session_info_->context_handler) {
+    return absl::FailedPreconditionError("No active context handler in session_info_.");
+  }
+
+  // A. 天然的 Reset / 重置物理语义 (入参为空时)
+  if (cache_data.empty()) {
+    session_state_ = SessionState::kFresh;
+    if (session_info_->context_handler->HasRuntimeState()) {
+      auto state_status = session_info_->context_handler->GetRuntimeState();
+      if (state_status.ok()) {
+        auto runtime_state = state_status.value();
+        runtime_state.current_step = 0;
+        runtime_state.ran_decode = false;
+        RETURN_IF_ERROR(session_info_->context_handler->SetRuntimeState(
+            std::make_unique<RuntimeState>(runtime_state)));
+      }
+    }
+    RETURN_IF_ERROR(execution_manager_lock->SetCurrentStep(*session_info_, 0));
+    return absl::OkStatus();
+  }
+
+  // B. 反序列化并灌入物理显存
+  auto shared_ctx = session_info_->context_handler->shared_processed_context();
+  if (!shared_ctx) {
+    return absl::FailedPreconditionError("No shared processed context.");
+  }
+
+  auto* base_ctx = shared_ctx->processed_context();
+  if (!base_ctx) {
+    return absl::FailedPreconditionError("No active processed context.");
+  }
+
+  auto* llm_ctx = static_cast<LlmProcessedContext*>(base_ctx);
+  auto& kv_cache_map = llm_ctx->kv_cache_buffers();
+
+  const char* stream_ptr = cache_data.data();
+  size_t size = cache_data.size();
+  size_t offset = 0;
+
+  auto read_val = [&stream_ptr, &offset, size](void* dest, size_t val_size) -> bool {
+    if (offset + val_size > size) return false;
+    std::memcpy(dest, stream_ptr + offset, val_size);
+    offset += val_size;
+    return true;
+  };
+
+  uint32_t magic = 0;
+  uint32_t version = 0;
+  uint32_t step_val = 0;
+  uint32_t state_val = 0;
+  uint32_t count = 0;
+
+  if (!read_val(&magic, sizeof(magic)) || magic != 0x594E515F) {
+    return absl::InvalidArgumentError("Invalid magic number.");
+  }
+  if (!read_val(&version, sizeof(version)) || version != 1) {
+    return absl::InvalidArgumentError("Unsupported packet version.");
+  }
+  if (!read_val(&step_val, sizeof(step_val))) {
+    return absl::InvalidArgumentError("Failed to read current_step.");
+  }
+  if (!read_val(&state_val, sizeof(state_val))) {
+    return absl::InvalidArgumentError("Failed to read session_state.");
+  }
+  if (!read_val(&count, sizeof(count))) {
+    return absl::InvalidArgumentError("Failed to read count.");
+  }
+
+  for (uint32_t i = 0; i < count; ++i) {
+    uint32_t name_len = 0;
+    if (!read_val(&name_len, sizeof(name_len))) {
+      return absl::InvalidArgumentError("Failed to read name length.");
+    }
+
+    if (offset + name_len > size) {
+      return absl::InvalidArgumentError("Packet truncated reading tensor name.");
+    }
+    std::string name(stream_ptr + offset, name_len);
+    offset += name_len;
+
+    uint32_t data_len = 0;
+    if (!read_val(&data_len, sizeof(data_len))) {
+      return absl::InvalidArgumentError("Failed to read data length.");
+    }
+
+    if (offset + data_len > size) {
+      return absl::InvalidArgumentError("Packet truncated reading tensor data.");
+    }
+    const char* raw_tensor_data = stream_ptr + offset;
+    offset += data_len;
+
+    auto it = kv_cache_map.find(name);
+    if (it != kv_cache_map.end()) {
+      auto& buffer = it->second;
+      auto write_expected = buffer.Write<char>(absl::MakeSpan(raw_tensor_data, data_len));
+      if (!write_expected.HasValue()) {
+        return absl::InternalError(absl::StrCat("Failed to write physical data to GPU for tensor: ", name));
+      }
+    } else {
+      ABSL_LOG(WARNING) << "Tensor key not found in active executors, skipping: " << name;
+    }
+  }
+
+  // C. 同步步数、内部状态及 RuntimeState
+  int current_step = static_cast<int>(step_val);
+  session_state_ = static_cast<SessionState>(state_val);
+
+  if (session_info_->context_handler->HasRuntimeState()) {
+    auto state_status = session_info_->context_handler->GetRuntimeState();
+    if (state_status.ok()) {
+      auto runtime_state = state_status.value();
+      runtime_state.current_step = current_step;
+      runtime_state.ran_decode = (current_step > 0);
+      RETURN_IF_ERROR(session_info_->context_handler->SetRuntimeState(
+          std::make_unique<RuntimeState>(runtime_state)));
+    }
+  }
+
+  RETURN_IF_ERROR(execution_manager_lock->SetCurrentStep(*session_info_, current_step));
+  return absl::OkStatus();
 }
 
 }  // namespace litert::lm
