@@ -324,10 +324,10 @@ absl::Status EngineSettings::MaybeUpdateAndValidate(
   }
 
   // Set the default values for the sampler params.
+  Backend backend = main_executor_settings_.GetBackend();
   if (!metadata.has_sampler_params()) {
     proto::SamplerParameters& sampler_params =
         *metadata.mutable_sampler_params();
-    Backend backend = main_executor_settings_.GetBackend();
     if (backend == Backend::NPU || backend == Backend::GPU_ARTISAN) {
       sampler_params.set_type(proto::SamplerParameters::TYPE_UNSPECIFIED);
     } else if (backend == Backend::CPU || backend == Backend::GPU
@@ -341,6 +341,13 @@ absl::Status EngineSettings::MaybeUpdateAndValidate(
       return absl::InvalidArgumentError(
           absl::StrCat("Not recognized backend: ", backend));
     }
+  }
+
+  if (metadata.sampler_params().type() ==
+          proto::SamplerParameters::TYPE_UNSPECIFIED &&
+      (backend == Backend::CPU || backend == Backend::GPU)) {
+    metadata.mutable_sampler_params()->set_type(
+        proto::SamplerParameters::TOP_P);
   }
 
   if (!metadata.has_llm_model_type()) {
@@ -545,7 +552,8 @@ bool EngineSettings::GetSingleThreadedExecution() const {
   return single_threaded_execution_;
 }
 
-void EngineSettings::SetSingleThreadedExecution(bool single_threaded_execution) {
+void EngineSettings::SetSingleThreadedExecution(
+    bool single_threaded_execution) {
   single_threaded_execution_ = single_threaded_execution;
 }
 
@@ -706,6 +714,15 @@ void SessionConfig::SetScopedLoraFile(
   scoped_lora_file_ = std::move(scoped_lora_file);
 }
 
+std::shared_ptr<ScopedFile> SessionConfig::GetAudioScopedLoraFile() const {
+  return scoped_audio_lora_file_;
+}
+
+void SessionConfig::SetAudioScopedLoraFile(
+    std::shared_ptr<ScopedFile> scoped_audio_lora_file) {
+  scoped_audio_lora_file_ = std::move(scoped_audio_lora_file);
+}
+
 std::ostream& operator<<(std::ostream& os, const SessionConfig& config) {
   os << "SessionConfig: " << std::endl;
   os << "  AudioModalityEnabled: " << config.AudioModalityEnabled()
@@ -730,6 +747,9 @@ std::ostream& operator<<(std::ostream& os, const SessionConfig& config) {
      << config.GetApplyPromptTemplateInSession() << std::endl;
   os << "  ScopedLoraFile: "
      << (config.GetScopedLoraFile() != nullptr ? "Present" : "Not present")
+     << std::endl;
+  os << "  ScopedAudioLoraFile: "
+     << (config.GetAudioScopedLoraFile() != nullptr ? "Present" : "Not present")
      << std::endl;
   return os;
 }

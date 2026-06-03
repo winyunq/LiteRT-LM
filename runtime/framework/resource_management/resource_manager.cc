@@ -163,6 +163,15 @@ class LockedAudioExecutor : public AudioExecutor {
     return audio_executor_->RestoreContext(std::move(audio_context));
   }
 
+  absl::Status LoadLoRA(uint32_t lora_id,
+                        const ModelAssets& model_assets) override {
+    return audio_executor_->LoadLoRA(lora_id, model_assets);
+  }
+
+  absl::Status UseLoRA(std::optional<uint32_t> lora_id) override {
+    return audio_executor_->UseLoRA(lora_id);
+  }
+
  private:
   std::shared_ptr<AudioExecutor> audio_executor_;
   // The mutex lock.
@@ -547,9 +556,29 @@ ResourceManager::CreateContextHandler(const SessionConfig& session_config) {
     return absl::InvalidArgumentError("Lora is not supported.");
   }
 
+  // Find the audio lora id.
+  std::optional<uint32_t> audio_lora_id = AssignLoraId(
+      /*lora_path=*/"",
+      /*has_scoped_lora_file=*/session_config.GetAudioScopedLoraFile() !=
+          nullptr);
+  if (audio_lora_id.has_value()) {
+    RET_CHECK(session_config.GetAudioScopedLoraFile() != nullptr);
+    ASSIGN_OR_RETURN(
+        ModelAssets lora_model_assets,
+        ModelAssets::Create(session_config.GetAudioScopedLoraFile(),
+                            /*model_path=*/""));
+    RETURN_IF_ERROR(TryLoadingAudioExecutor());
+    ASSIGN_OR_RETURN(auto audio_executor, AcquireAudioExecutor());
+    RETURN_IF_ERROR(
+        audio_executor->LoadLoRA(audio_lora_id.value(), lora_model_assets));
+    RETURN_IF_ERROR(audio_executor->UseLoRA(audio_lora_id.value()));
+  }
+
   auto runtime_config = RuntimeConfig{
-    .output_heads = session_config.GetNumOutputCandidates(),
-    .tokens_per_decode = 1,
+      .sampler_params = session_config.GetSamplerParams(),
+      .output_heads = session_config.GetNumOutputCandidates(),
+      // b/368348506 - Make tokens_per_decode configurable.
+      .tokens_per_decode = 1,
   };
 
   std::unique_ptr<litert::lm::LlmContext> llm_context;

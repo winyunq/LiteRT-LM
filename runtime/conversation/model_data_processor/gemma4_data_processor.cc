@@ -205,13 +205,17 @@ Gemma4DataProcessor::Create(Gemma4DataProcessorConfig config,
                             const Tokenizer* tokenizer,
                             const std::vector<std::vector<int>>& stop_token_ids,
                             bool enable_constrained_decoding) {
+  // For Gemma4 models without mel-spectrogram extraction, it use 640 PCM
+  // samples as one audio token.
+  const int frame_length = config.skip_mel_spectrogram_extraction ? 640 : 320;
+  const int hop_length = config.skip_mel_spectrogram_extraction ? 640 : 160;
   ASSIGN_OR_RETURN(
       auto audio_preprocessor,
       AudioPreprocessorMiniAudio::Create(AudioPreprocessorConfig::Create(
           /* sample_rate_hz= */ 16000,
           /* num_channels= */ 1,
-          /* frame_length= */ 320,
-          /* hop_length= */ 160,
+          /* frame_length= */ frame_length,
+          /* hop_length= */ hop_length,
           /* fft_length = */ 512,
           /* input_scale = */ 1.0,
           /* pre_emphasis_factor = */ 0.0,
@@ -225,7 +229,9 @@ Gemma4DataProcessor::Create(Gemma4DataProcessorConfig config,
           /* non_zero_hanning= */ false,
           /* periodic_hanning= */ true,
           /* fft_padding_type= */
-          AudioPreprocessorConfig::FftPaddingType::kCenter)));
+          AudioPreprocessorConfig::FftPaddingType::kCenter,
+          /*skip_mel_spectrogram_extraction=*/
+          config.skip_mel_spectrogram_extraction)));
 #if defined(LITERT_LM_FST_CONSTRAINTS_DISABLED)
   if (enable_constrained_decoding) {
     return absl::FailedPreconditionError(
@@ -460,8 +466,10 @@ absl::StatusOr<Message> Gemma4DataProcessor::ToMessageImpl(
         nlohmann::ordered_json content_and_tool_calls,
         ParseTextAndToolCalls(
             response_text, config_.code_fence_start, config_.code_fence_end,
-            GetSyntaxType(config_.syntax_type), config_.escape_fence_strings,
-            config_.tool_code_regex));
+            GetSyntaxType(config_.syntax_type),
+            {.escape_fence_strings = config_.escape_fence_strings,
+             .tool_code_regex = config_.tool_code_regex,
+             .return_error_on_parse_failure = ReturnErrorOnParseFailure()}));
     if (content_and_tool_calls.contains("content")) {
       message["content"] = content_and_tool_calls["content"];
     }

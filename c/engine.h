@@ -148,6 +148,22 @@ void litert_lm_session_config_set_sampler_params(
 LITERT_LM_C_API_EXPORT
 void litert_lm_session_config_delete(LiteRtLmSessionConfig* config);
 
+// Sets the path to the LoRA weights file.
+// @param config The config to modify.
+// @param lora_path The path to the text LoRA weights file.
+// @return 0 on success, non-zero on failure.
+LITERT_LM_C_API_EXPORT
+int litert_lm_session_config_set_lora_path(LiteRtLmSessionConfig* config,
+                                           const char* lora_path);
+
+// Sets the path to the Audio LoRA weights file.
+// @param config The config to modify.
+// @param audio_lora_path The path to the audio LoRA weights file.
+// @return 0 on success, non-zero on failure.
+LITERT_LM_C_API_EXPORT
+int litert_lm_session_config_set_audio_lora_path(LiteRtLmSessionConfig* config,
+                                                 const char* audio_lora_path);
+
 // Creates a LiteRT LM Conversation Config.
 // The caller is responsible for destroying the config using
 // `litert_lm_conversation_config_delete`.
@@ -370,6 +386,42 @@ void litert_lm_engine_settings_set_num_decode_tokens(
 LITERT_LM_C_API_EXPORT
 void litert_lm_engine_settings_set_enable_speculative_decoding(
     LiteRtLmEngineSettings* settings, bool enable_speculative_decoding);
+
+// Sets the LoRA rank for the engine.
+//
+// @param settings The engine settings.
+// @param lora_rank The LoRA rank.
+LITERT_LM_C_API_EXPORT
+void litert_lm_engine_settings_set_lora_rank(LiteRtLmEngineSettings* settings,
+                                             int lora_rank);
+
+// Sets the supported LoRA ranks for the engine.
+//
+// @param settings The engine settings.
+// @param lora_ranks An array of supported LoRA ranks.
+// @param num_ranks The number of ranks in the array.
+// @return 0 on success, non-zero on failure.
+LITERT_LM_C_API_EXPORT
+int litert_lm_engine_settings_set_supported_lora_ranks(
+    LiteRtLmEngineSettings* settings, const int* lora_ranks, size_t num_ranks);
+
+// Sets the Audio LoRA rank for the engine.
+//
+// @param settings The engine settings.
+// @param lora_rank The Audio LoRA rank.
+LITERT_LM_C_API_EXPORT
+void litert_lm_engine_settings_set_audio_lora_rank(
+    LiteRtLmEngineSettings* settings, int lora_rank);
+
+// Sets the supported Audio LoRA ranks for the engine.
+//
+// @param settings The engine settings.
+// @param lora_ranks An array of supported Audio LoRA ranks.
+// @param num_ranks The number of ranks in the array.
+// @return 0 on success, non-zero on failure.
+LITERT_LM_C_API_EXPORT
+int litert_lm_engine_settings_set_supported_audio_lora_ranks(
+    LiteRtLmEngineSettings* settings, const int* lora_ranks, size_t num_ranks);
 
 // Creates a LiteRT LM Engine from the given settings. The caller is responsible
 // for destroying the engine using `litert_lm_engine_delete`.
@@ -795,6 +847,11 @@ void litert_lm_conversation_cancel_process(LiteRtLmConversation* conversation);
 LITERT_LM_C_API_EXPORT
 LiteRtLmBenchmarkInfo* litert_lm_conversation_get_benchmark_info(
     LiteRtLmConversation* conversation);
+
+// Gets the number of tokens in the conversation KV Cache (prefill + decode).
+// Returns the number of tokens, or a negative value on failure.
+LITERT_LM_C_API_EXPORT
+int litert_lm_conversation_get_token_count(LiteRtLmConversation* conversation);
 
 // Tokenizes text using the engine's tokenizer.
 //

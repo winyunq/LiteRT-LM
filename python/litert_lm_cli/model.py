@@ -14,10 +14,13 @@
 
 """Utility functions for litert-lm models."""
 
+from __future__ import annotations
+
 import dataclasses
 import glob
 import importlib.util
 import inspect
+import io
 import mimetypes
 import os
 import pathlib
@@ -26,6 +29,7 @@ import traceback
 import click
 
 import litert_lm
+from litert_lm_builder import litertlm_peek
 
 
 def get_attachment_type(path: str) -> str:
@@ -99,16 +103,76 @@ def load_preset(preset: str):
   return tools, messages, extra_context
 
 
-def _parse_backend(
-    backend: str,
+def _backend_constraint(model_path: str) -> litert_lm.Backend:
+  """Inspects the .litertlm file metadata to detect the required backend.
+
+  Args:
+    model_path: The path to the .litertlm model file.
+
+  Returns:
+    Backend.GPU() if the model metadata specifies 'gpu_artisan' as the backend
+    constraint, otherwise Backend.CPU().
+  """
+  try:
+    with io.StringIO() as dummy_out:
+      metadata = litertlm_peek.read_litertlm_header(model_path, dummy_out)
+      section_metadata = metadata.SectionMetadata()
+      if not section_metadata:
+        return litert_lm.Backend.CPU()
+      for i in range(section_metadata.ObjectsLength()):
+        section = section_metadata.Objects(i)
+        if not section:
+          continue
+        if (
+            litertlm_peek.get_model_type(section)
+            == "tf_lite_artisan_text_decoder"
+        ):
+          return litert_lm.Backend.GPU()
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    click.echo(
+        click.style(f"Failed to inspect model metadata: {e!r}", fg="yellow")
+    )
+  return litert_lm.Backend.CPU()
+
+
+def parse_backend(
+    backend: str, *, model_obj: Model | None = None
 ) -> litert_lm.Backend:
-  """Parses the backend string and returns the corresponding Backend enum."""
+  """Parses the backend string and resolves it against model constraints.
+
+  If the user requests 'cpu' (or defaults to it) but the model metadata
+  specifies a 'gpu_artisan' constraint, this will automatically upgrade
+  the backend to GPU and print a notification.
+
+  Args:
+    backend: The backend requested by the user (e.g., "cpu", "gpu", "npu").
+    model_obj: Optional Model instance to check for constraints.
+
+  Returns:
+    The resolved litert_lm.Backend to use.
+  """
   backend_lower = backend.lower()
   if backend_lower == "gpu":
-    return litert_lm.Backend.GPU()
-  if backend_lower == "npu":
-    return litert_lm.Backend.NPU()
-  return litert_lm.Backend.CPU()
+    requested = litert_lm.Backend.GPU()
+  elif backend_lower == "npu":
+    requested = litert_lm.Backend.NPU()
+  else:
+    requested = litert_lm.Backend.CPU()
+
+  # Force GPU if the model requires it (CPU is unsupported for artisan models).
+  if model_obj is not None:
+    if isinstance(
+        _backend_constraint(model_obj.model_path), litert_lm.Backend.GPU
+    ):
+      click.echo(
+          click.style(
+              "Using GPU backend for this model because CPU is unsupported.",
+              fg="cyan",
+          )
+      )
+      return litert_lm.Backend.GPU()
+
+  return requested
 
 
 @dataclasses.dataclass
@@ -130,8 +194,6 @@ class Model:
   def to_str(self) -> str:
     """Returns a string representation of the model."""
     return self.model_id
-
-
 
   @classmethod
   def get_all_models(cls):
@@ -183,10 +245,18 @@ def model_id_dir_name(model_id):
   return model_id.replace("/", "--")
 
 
+def get_cli_base_dir() -> str:
+  """Gets the base directory for LiteRT-LM CLI."""
+  env_override = os.environ.get("LITERT_LM_DIR")
+  if env_override:
+    return os.path.abspath(env_override)
+  return os.path.join(os.path.expanduser("~"), ".litert-lm")
+
+
 # ~/.litert-lm/models
 def get_converted_models_base_dir():
   """Gets the base directory for all converted models."""
-  return os.path.join(os.path.expanduser("~"), ".litert-lm", "models")
+  return os.path.join(get_cli_base_dir(), "models")
 
 
 # ~/.litert-lm/models/<model_id>

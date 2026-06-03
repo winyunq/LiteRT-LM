@@ -54,9 +54,16 @@ std::string EditTemplateForMinijinja(absl::string_view template_content) {
                      R"( | split(\1))");
   RE2::GlobalReplace(&modified_template, R"regex(\.join\((.*?)\))regex",
                      R"( | join(\1))");
-  RE2::GlobalReplace(&modified_template, R"regex(\.[l,r]strip\(\))regex",
-                     " | trim");
-  RE2::GlobalReplace(&modified_template, R"regex(\.[l,r]strip\((.*?)\))regex",
+  RE2::GlobalReplace(&modified_template, R"regex(\.lstrip\(\))regex",
+                     " | lstrip");
+  RE2::GlobalReplace(&modified_template, R"regex(\.lstrip\((.*?)\))regex",
+                     R"( | lstrip(\1))");
+  RE2::GlobalReplace(&modified_template, R"regex(\.rstrip\(\))regex",
+                     " | rstrip");
+  RE2::GlobalReplace(&modified_template, R"regex(\.rstrip\((.*?)\))regex",
+                     R"( | rstrip(\1))");
+  RE2::GlobalReplace(&modified_template, R"regex(\.strip\(\))regex", " | trim");
+  RE2::GlobalReplace(&modified_template, R"regex(\.strip\((.*?)\))regex",
                      R"( | trim(\1))");
   RE2::GlobalReplace(&modified_template, R"regex(\.items\(\))regex",
                      " | items");

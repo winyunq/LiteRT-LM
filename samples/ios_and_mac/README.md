@@ -14,14 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 
-# LiteRT-LM Swift API for iOS
+# LiteRT-LM Swift API for iOS and macOS
 
 This directory provides examples and instructions for integrating large language
-models natively into iOS applications using the LiteRT-LM Swift API.
+models natively into iOS and macOS applications using the LiteRT-LM Swift API.
 
 ## Prerequisites
 
 - iOS 15.0 or later
+- macOS 12.0 or later
 - Xcode 15.0 or later
 - A `.litertlm` model file (e.g., Gemma)
 
@@ -74,11 +75,26 @@ It demonstrates how to:
 
 ## Running the App
 
+### On iOS
 1. Connect your physical iPhone to your Mac using a cable.
 2. In Xcode, select your iPhone's name from the run destination menu at the
    top center of the window.
 3. Click the **Run** button (or press `Cmd + R`) to build and run the app on
    your device!
+
+### On macOS
+1. In Xcode, select **My Mac** from the run destination menu at the top center
+   of the window.
+2. Click the **Run** button (or press `Cmd + R`) to build and run the app on
+   your Mac!
+
+> [!IMPORTANT]
+> If you are using a locally built, unsigned version of the library on Mac,
+  macOS may block it with a "Malware" warning. To bypass this for local testing,
+  run this command in your Mac terminal:
+> ```bash
+> xattr -rd com.apple.quarantine path/to/CLiteRTLM.xcframework
+> ```
 
 > [!TIP]
 > If your physical device's iOS version is lower than the deployment target set

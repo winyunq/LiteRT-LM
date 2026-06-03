@@ -15,6 +15,7 @@
 #include "c/engine.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -30,6 +31,7 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
+#include "runtime/components/tokenizer.h"
 #include "runtime/conversation/conversation.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/config_registry.h"
@@ -44,6 +46,7 @@
 #include "runtime/proto/sampler_params.pb.h"
 #include "runtime/proto/token.pb.h"
 #include "runtime/util/logging.h"
+#include "runtime/util/scoped_file.h"
 
 namespace {
 
@@ -160,7 +163,6 @@ using ::litert::lm::ConversationConfig;
 using ::litert::lm::Engine;
 using ::litert::lm::EngineFactory;
 using ::litert::lm::EngineSettings;
-using ::litert::lm::InputText;
 using ::litert::lm::OptionalArgs;
 
 using ::litert::lm::Message;
@@ -297,6 +299,44 @@ void litert_lm_session_config_set_sampler_params(
 
 void litert_lm_session_config_delete(LiteRtLmSessionConfig* config) {
   delete config;
+}
+
+int litert_lm_session_config_set_lora_path(LiteRtLmSessionConfig* config,
+                                           const char* lora_path) {
+  if (!config || !config->config || !lora_path) {
+    return -1;
+  }
+  absl::string_view path_view(lora_path);
+  if (path_view.empty()) {
+    return -1;
+  }
+  auto lora_file = litert::lm::ScopedFile::Open(path_view);
+  if (!lora_file.ok()) {
+    ABSL_LOG(ERROR) << "Failed to open LoRA file: " << lora_file.status();
+    return -1;
+  }
+  config->config->SetScopedLoraFile(
+      std::make_shared<litert::lm::ScopedFile>(std::move(*lora_file)));
+  return 0;
+}
+
+int litert_lm_session_config_set_audio_lora_path(LiteRtLmSessionConfig* config,
+                                                 const char* audio_lora_path) {
+  if (!config || !config->config || !audio_lora_path) {
+    return -1;
+  }
+  absl::string_view path_view(audio_lora_path);
+  if (path_view.empty()) {
+    return -1;
+  }
+  auto lora_file = litert::lm::ScopedFile::Open(path_view);
+  if (!lora_file.ok()) {
+    ABSL_LOG(ERROR) << "Failed to open Audio LoRA file: " << lora_file.status();
+    return -1;
+  }
+  config->config->SetAudioScopedLoraFile(
+      std::make_shared<litert::lm::ScopedFile>(std::move(*lora_file)));
+  return 0;
 }
 
 LiteRtLmConversationConfig* litert_lm_conversation_config_create() {
@@ -509,6 +549,55 @@ void litert_lm_engine_settings_set_enable_speculative_decoding(
     advanced_settings.enable_speculative_decoding = enable_speculative_decoding;
     main_settings.SetAdvancedSettings(advanced_settings);
   }
+}
+
+void litert_lm_engine_settings_set_lora_rank(LiteRtLmEngineSettings* settings,
+                                             int lora_rank) {
+  if (settings && settings->settings) {
+    settings->settings->GetMutableMainExecutorSettings().SetLoraRank(lora_rank);
+  }
+}
+
+int litert_lm_engine_settings_set_supported_lora_ranks(
+    LiteRtLmEngineSettings* settings, const int* lora_ranks, size_t num_ranks) {
+  if (!settings || !settings->settings || !lora_ranks || num_ranks == 0) {
+    return -1;
+  }
+  std::vector<uint32_t> ranks;
+  ranks.reserve(num_ranks);
+  for (size_t i = 0; i < num_ranks; ++i) {
+    ranks.push_back(static_cast<uint32_t>(lora_ranks[i]));
+  }
+  auto status = settings->settings->GetMutableMainExecutorSettings()
+                    .SetSupportedLoraRanks(ranks);
+  return status.ok() ? 0 : -1;
+}
+
+void litert_lm_engine_settings_set_audio_lora_rank(
+    LiteRtLmEngineSettings* settings, int lora_rank) {
+  if (settings && settings->settings &&
+      settings->settings->GetAudioExecutorSettings().has_value()) {
+    settings->settings->GetMutableAudioExecutorSettings()->SetLoraRank(
+        lora_rank);
+  }
+}
+
+int litert_lm_engine_settings_set_supported_audio_lora_ranks(
+    LiteRtLmEngineSettings* settings, const int* lora_ranks, size_t num_ranks) {
+  if (!settings || !settings->settings || !lora_ranks || num_ranks == 0) {
+    return -1;
+  }
+  if (!settings->settings->GetAudioExecutorSettings().has_value()) {
+    return -1;
+  }
+  std::vector<uint32_t> ranks;
+  ranks.reserve(num_ranks);
+  for (size_t i = 0; i < num_ranks; ++i) {
+    ranks.push_back(static_cast<uint32_t>(lora_ranks[i]));
+  }
+  auto status = settings->settings->GetMutableAudioExecutorSettings()
+                    ->SetSupportedLoraRanks(ranks);
+  return status.ok() ? 0 : -1;
 }
 
 void litert_lm_engine_settings_set_activation_data_type(
@@ -1135,6 +1224,18 @@ LiteRtLmBenchmarkInfo* litert_lm_conversation_get_benchmark_info(
     return nullptr;
   }
   return new LiteRtLmBenchmarkInfo{std::move(*benchmark_info)};
+}
+
+int litert_lm_conversation_get_token_count(LiteRtLmConversation* conversation) {
+  if (!conversation || !conversation->conversation) {
+    return -1;
+  }
+  absl::StatusOr<int> token_count = conversation->conversation->GetTokenCount();
+  if (!token_count.ok()) {
+    ABSL_LOG(ERROR) << "Failed to get token count: " << token_count.status();
+    return -1;
+  }
+  return *token_count;
 }
 
 LiteRtLmTokenizeResult* litert_lm_engine_tokenize(LiteRtLmEngine* engine,

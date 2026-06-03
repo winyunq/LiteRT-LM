@@ -74,10 +74,7 @@ pub struct MinijinjaTemplate {
 
 fn detect_capabilities(source: &str) -> ffi::ChatTemplateCapabilities {
     let mut caps = ffi::ChatTemplateCapabilities::default();
-    let mut env = Environment::new();
-    env.set_keep_trailing_newline(false);
-    env.set_trim_blocks(true);
-    env.set_lstrip_blocks(true);
+    let env = create_env();
 
     if let Ok(tmpl) = env.template_from_str(source) {
         let undeclared = tmpl.undeclared_variables(true);
@@ -217,6 +214,40 @@ fn is_none(value: minijinja::Value) -> bool {
     value.is_undefined()
 }
 
+fn lstrip(s: std::borrow::Cow<'_, str>, chars: Option<std::borrow::Cow<'_, str>>) -> String {
+    match chars {
+        Some(chars) => {
+            let chars = chars.chars().collect::<Vec<_>>();
+            s.trim_start_matches(&chars[..]).to_string()
+        }
+        None => s.trim_start().to_string(),
+    }
+}
+
+fn rstrip(s: std::borrow::Cow<'_, str>, chars: Option<std::borrow::Cow<'_, str>>) -> String {
+    match chars {
+        Some(chars) => {
+            let chars = chars.chars().collect::<Vec<_>>();
+            s.trim_end_matches(&chars[..]).to_string()
+        }
+        None => s.trim_end().to_string(),
+    }
+}
+
+fn create_env() -> Environment<'static> {
+    let mut env = Environment::new();
+    env.set_keep_trailing_newline(false);
+    env.set_trim_blocks(true);
+    env.set_lstrip_blocks(true);
+    env.add_function("strftime_now", strftime_now);
+    env.add_function("raise_exception", raise_exception);
+    env.add_filter("tojson", tojson);
+    env.add_filter("lstrip", lstrip);
+    env.add_filter("rstrip", rstrip);
+    env.add_test("none", is_none);
+    env
+}
+
 impl MinijinjaTemplate {
     fn apply(&self, inputs_json: String) -> ffi::ApplyResult {
         match self.apply_impl(inputs_json) {
@@ -254,14 +285,7 @@ impl MinijinjaTemplate {
             _ => vec![],
         };
 
-        let mut env = Environment::new();
-        env.set_keep_trailing_newline(false);
-        env.set_trim_blocks(true);
-        env.set_lstrip_blocks(true);
-        env.add_function("strftime_now", strftime_now);
-        env.add_function("raise_exception", raise_exception);
-        env.add_filter("tojson", tojson);
-        env.add_test("none", is_none);
+        let mut env = create_env();
         env.add_template("template", &self.source)?;
         let tmpl = env.get_template("template")?;
 
@@ -427,5 +451,20 @@ mod tests {
         let res = wrapper.apply(inputs.to_string());
         assert!(!res.is_ok);
         assert!(res.error.contains("Something went wrong"));
+    }
+
+    #[test]
+    fn test_lstrip_rstrip() {
+        let source = "  foo  |{{ '  bar  '|lstrip }}|{{ '  baz  '|rstrip }}|{{ '1212foo12'|lstrip('12') }}|{{ '12foo1212'|rstrip('12') }}";
+        let wrapper = new_minijinja_template(source.to_string());
+        let inputs = json!({
+            "messages": [],
+            "tools": null,
+            "add_generation_prompt": false,
+            "extra_context": {}
+        });
+        let res = wrapper.apply(inputs.to_string());
+        assert!(res.is_ok);
+        assert_eq!(res.content, "  foo  |bar  |  baz|foo12|12foo");
     }
 }

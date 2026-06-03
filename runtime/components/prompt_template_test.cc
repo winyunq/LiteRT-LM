@@ -152,5 +152,50 @@ INSTANTIATE_TEST_SUITE_P(
       return name;
     });
 
+TEST(PromptTemplateCustomTest, StripReplacementTest) {
+  {
+    PromptTemplate prompt_template("{{ '  hello  '.strip() }}");
+    PromptTemplateInput input;
+    auto res = prompt_template.Apply(input);
+    ASSERT_OK(res);
+    EXPECT_EQ(*res, "hello");
+  }
+  {
+    PromptTemplate prompt_template("{{ '  hello  '.lstrip() }}");
+    PromptTemplateInput input;
+    auto res = prompt_template.Apply(input);
+    ASSERT_OK(res);
+    EXPECT_EQ(*res, "hello  ");
+  }
+  {
+    PromptTemplate prompt_template("{{ '  hello  '.rstrip() }}");
+    PromptTemplateInput input;
+    auto res = prompt_template.Apply(input);
+    ASSERT_OK(res);
+    EXPECT_EQ(*res, "  hello");
+  }
+  {
+    PromptTemplate prompt_template("{{ 'ohelloo'.strip('o') }}");
+    PromptTemplateInput input;
+    auto res = prompt_template.Apply(input);
+    ASSERT_OK(res);
+    EXPECT_EQ(*res, "hell");
+  }
+  {
+    PromptTemplate prompt_template("{{ 'ohelloo'.lstrip('o') }}");
+    PromptTemplateInput input;
+    auto res = prompt_template.Apply(input);
+    ASSERT_OK(res);
+    EXPECT_EQ(*res, "helloo");
+  }
+  {
+    PromptTemplate prompt_template("{{ 'ohelloo'.rstrip('o') }}");
+    PromptTemplateInput input;
+    auto res = prompt_template.Apply(input);
+    ASSERT_OK(res);
+    EXPECT_EQ(*res, "ohell");
+  }
+}
+
 }  // namespace
 }  // namespace litert::lm

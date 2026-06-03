@@ -231,13 +231,13 @@ class LitertlmPeekUtilTest(absltest.TestCase):
 
   def test_get_tflite_weight_filename_with_type(self):
     with mock.patch.object(
-        litertlm_peek, "_get_model_type", return_value="decoder"
+        litertlm_peek, "get_model_type", return_value="decoder"
     ):
       filename = litertlm_peek._get_tflite_weight_filename(mock.Mock(), 0)
       self.assertEqual(filename, "Section0_TFLiteWeights_decoder.weight")
 
   def test_get_tflite_weight_filename_without_type(self):
-    with mock.patch.object(litertlm_peek, "_get_model_type", return_value=None):
+    with mock.patch.object(litertlm_peek, "get_model_type", return_value=None):
       filename = litertlm_peek._get_tflite_weight_filename(mock.Mock(), 1)
       self.assertEqual(filename, "Section1_TFLiteWeights.weight")
 

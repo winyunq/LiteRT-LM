@@ -49,6 +49,11 @@ ABSL_FLAG(std::string, backend, "cpu",
           "Executor backend to use for LLM execution (cpu, gpu, etc.)");
 ABSL_FLAG(std::string, model_path, "", "Model path to use for LLM execution.");
 ABSL_FLAG(
+    std::optional<std::string>, model_name, std::nullopt,
+    "The name of the model being tested. In Chrome performance tests, this "
+    "name is added to performance metrics to distinguish between different "
+    "models.");
+ABSL_FLAG(
     bool, load_model_from_descriptor, false,
     "Whether to load the model from a file descriptor rather than by path.");
 ABSL_FLAG(std::string, input_prompt, "",
@@ -200,6 +205,7 @@ absl::Status MainHelper(int argc, char** argv) {
   settings.audio_backend = absl::GetFlag(FLAGS_audio_backend);
   settings.sampler_backend = absl::GetFlag(FLAGS_sampler_backend);
   settings.model_path = absl::GetFlag(FLAGS_model_path);
+  settings.model_name = absl::GetFlag(FLAGS_model_name);
   settings.load_model_from_descriptor =
       absl::GetFlag(FLAGS_load_model_from_descriptor);
   settings.input_prompt = GetInputPrompt();

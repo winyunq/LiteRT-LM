@@ -21,6 +21,7 @@ import click
 import litert_lm
 from litert_lm_cli import common
 from litert_lm_cli import help_formatter
+from litert_lm_cli import huggingface_download
 from litert_lm_cli import model
 
 try:
@@ -40,6 +41,7 @@ def run_benchmark(
     backend: str = "cpu",
     enable_speculative_decoding: bool | None = None,
     max_num_tokens: int | None = None,
+    cache: str = "disk",
 ):
   """Benchmarks the model."""
   if not model_obj.exists():
@@ -53,12 +55,8 @@ def run_benchmark(
     return
 
   try:
-    backend_val = model._parse_backend(backend)
-    cache_dir_val = (
-        ":memory"
-        if isinstance(backend_val, litert_lm.Backend.CPU)
-        else ":nocache"
-    )
+    backend_val = model.parse_backend(backend)
+    cache_dir_val = common.cache_dir_value_from_cache_mode(cache)
 
     if is_android:
       if not _HAS_ADB:
@@ -69,6 +67,7 @@ def run_benchmark(
           prefill_tokens=prefill_tokens,
           decode_tokens=decode_tokens,
           max_num_tokens=max_num_tokens,
+          cache_dir=cache_dir_val,
       )
     else:
       benchmark_obj = litert_lm.Benchmark(
@@ -84,7 +83,8 @@ def run_benchmark(
     click.echo(
         f"Benchmarking model: {model_obj.to_str()} ({model_obj.model_path})"
     )
-    click.echo(f"Backend                    : {backend}")
+    resolved_backend_str = backend_val.get_name()
+    click.echo(f"Backend                    : {resolved_backend_str}")
     click.echo(f"Number of tokens in prefill: {prefill_tokens}")
     click.echo(f"Number of tokens in decode : {decode_tokens}")
     if max_num_tokens is not None:
@@ -95,6 +95,7 @@ def run_benchmark(
       spec_dec_str = "true"
     elif enable_speculative_decoding is False:
       spec_dec_str = "false"
+    click.echo(f"Cache                      : {cache}")
     click.echo(f"Speculative decoding       : {spec_dec_str}")
     if is_android:
       click.echo("Target                     : Android")
@@ -170,6 +171,7 @@ def benchmark(
     from_huggingface_repo: str | None = None,
     huggingface_token: str | None = None,
     max_num_tokens: int | None = None,
+    cache: str = "disk",
 ):
   """Benchmarks a LiteRT-LM model.
 
@@ -187,16 +189,17 @@ def benchmark(
     from_huggingface_repo: The HuggingFace repository ID.
     huggingface_token: The HuggingFace API token.
     max_num_tokens: Maximum number of tokens for the KV cache.
+    cache: The cache mode to use (no, memory, or disk).
   """
   if verbose:
     litert_lm.set_min_log_severity(litert_lm.LogSeverity.VERBOSE)
 
   if from_huggingface_repo:
-    model_path = common.download_from_huggingface(
-        from_huggingface_repo, model_reference, huggingface_token
+    model_path = huggingface_download.download_from_huggingface(
+        repo_id=from_huggingface_repo,
+        filename=model_reference,
+        token=huggingface_token,
     )
-    if not model_path:
-      return
     model_obj = model.Model.from_model_path(model_path)
   else:
     model_obj = model.Model.from_model_reference(model_reference)
@@ -214,6 +217,7 @@ def benchmark(
       backend=backend,
       enable_speculative_decoding=enable_speculative_decoding,
       max_num_tokens=max_num_tokens,
+      cache=cache,
   )
 
 

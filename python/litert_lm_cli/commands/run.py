@@ -26,6 +26,7 @@ from prompt_toolkit import key_binding
 import litert_lm
 from litert_lm_cli import common
 from litert_lm_cli import help_formatter
+from litert_lm_cli import huggingface_download
 from litert_lm_cli import model
 from litert_lm_cli.commands import convert as _convert_module
 
@@ -185,6 +186,7 @@ def run_interactive(
     top_p: float | None = None,
     temperature: float | None = None,
     seed: int | None = None,
+    cache: str = "disk",
 ):
   """Runs the model interactively or with a single prompt."""
   if not model_obj.exists():
@@ -200,12 +202,12 @@ def run_interactive(
   state = SessionState()
 
   try:
-    backend_val = model._parse_backend(backend)
+    backend_val = model.parse_backend(backend, model_obj=model_obj)
     vision_backend_val = (
-        model._parse_backend(vision_backend) if vision_backend else None
+        model.parse_backend(vision_backend) if vision_backend else None
     )
     audio_backend_val = (
-        model._parse_backend(audio_backend) if audio_backend else None
+        model.parse_backend(audio_backend) if audio_backend else None
     )
 
     sampler_config = None
@@ -222,6 +224,8 @@ def run_interactive(
           seed=seed,
       )
 
+    cache_dir_val = common.cache_dir_value_from_cache_mode(cache)
+
     if is_android:
       if not _HAS_ADB:
         raise ImportError("litert_lm.adb dependencies are not available.")
@@ -231,6 +235,7 @@ def run_interactive(
           max_num_tokens=max_num_tokens,
           vision_backend=vision_backend_val,
           audio_backend=audio_backend_val,
+          cache_dir=cache_dir_val,
       )
     else:
       engine_cm = litert_lm.Engine(
@@ -240,6 +245,7 @@ def run_interactive(
           max_num_tokens=max_num_tokens,
           vision_backend=vision_backend_val,
           audio_backend=audio_backend_val,
+          cache_dir=cache_dir_val,
       )
 
     with engine_cm as engine:
@@ -445,25 +451,26 @@ def run_interactive(
 )
 @common.common_inference_options
 def run(
-    model_reference,
-    prompt=None,
-    preset=None,
-    backend="cpu",
-    android=False,
-    enable_speculative_decoding=None,
-    verbose=False,
-    no_template=False,
-    from_huggingface_repo=None,
-    huggingface_token=None,
-    max_num_tokens=None,
-    filter_channel_content_from_kv_cache=False,
-    vision_backend=None,
-    audio_backend=None,
-    attachment=(),
+    model_reference: str,
+    prompt: str | None = None,
+    preset: str | None = None,
+    backend: str = "cpu",
+    android: bool = False,
+    enable_speculative_decoding: bool | None = None,
+    verbose: bool = False,
+    no_template: bool = False,
+    from_huggingface_repo: str | None = None,
+    huggingface_token: str | None = None,
+    max_num_tokens: int | None = None,
+    filter_channel_content_from_kv_cache: bool = False,
+    vision_backend: str | None = None,
+    audio_backend: str | None = None,
+    attachment: tuple[str, ...] = (),
     top_k: int | None = None,
     top_p: float | None = None,
     temperature: float | None = None,
     seed: int | None = None,
+    cache: str = "disk",
 ):
   r"""Runs a LiteRT-LM model interactively or with a single prompt.
 
@@ -493,6 +500,7 @@ def run(
     top_p: The cumulative probability threshold for nucleus sampling.
     temperature: The temperature to use for sampling.
     seed: The seed to use for randomization.
+    cache: The cache mode to use (no, memory, or disk).
   """
   if attachment and no_template:
     click.echo(
@@ -561,11 +569,11 @@ def run(
     litert_lm.set_min_log_severity(litert_lm.LogSeverity.VERBOSE)
 
   if from_huggingface_repo:
-    model_path = common.download_from_huggingface(
-        from_huggingface_repo, model_reference, huggingface_token
+    model_path = huggingface_download.download_from_huggingface(
+        repo_id=from_huggingface_repo,
+        filename=model_reference,
+        token=huggingface_token,
     )
-    if not model_path:
-      return
     model_obj = model.Model.from_model_path(model_path)
   else:
     model_obj = model.Model.from_model_reference(model_reference)
@@ -609,6 +617,7 @@ def run(
       top_p=top_p,
       temperature=temperature,
       seed=seed,
+      cache=cache,
   )
 
 

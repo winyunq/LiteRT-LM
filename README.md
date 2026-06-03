@@ -12,7 +12,8 @@ framework for deploying Large Language Models on edge devices.
     [Swift Guide](https://ai.google.dev/edge/litert-lm/swift).
 -   **Web JavaScript APIs**: Run models inside web browsers with high
     performance via web GPU/CPU. See the
-    [JavaScript Guide](https://ai.google.dev/edge/litert-lm/js).
+    [JavaScript Guide](https://ai.google.dev/edge/litert-lm/js) and try out our
+    [in-browser chat demo in Chrome](https://google-ai-edge.github.io/LiteRT-LM/web_demos/chat/index.html).
 -   **LiteRT-LM CLI Update**: The command-line interface now supports NPU,
     besides CPU and GPU backends across Linux, macOS, and Windows. See the
     [CLI Guide](https://ai.google.dev/edge/litert-lm/cli).

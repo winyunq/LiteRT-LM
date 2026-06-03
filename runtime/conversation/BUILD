@@ -158,6 +158,7 @@ cc_test(
     size = "medium",
     srcs = ["conversation_test.cc"],
     data = [
+        "//runtime/components/preprocessor/testdata",
         "//runtime/components/testdata",
         "//runtime/testdata",
     ],

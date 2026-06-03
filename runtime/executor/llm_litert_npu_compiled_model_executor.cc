@@ -472,7 +472,7 @@ LlmLiteRtNpuCompiledModelExecutor::CreateLiteRtCpuOptions(
 }
 
 LlmLiteRtNpuCompiledModelExecutor::~LlmLiteRtNpuCompiledModelExecutor() {
-  ABSL_VLOG(1) << "LatencyStats: " << GetLatencyStats();
+  ABSL_LOG(INFO) << "LatencyStats: " << GetLatencyStats();
 }
 
 absl::StatusOr<LlmLiteRtNpuCompiledModelExecutor::EmbedderContext>
@@ -1805,16 +1805,7 @@ LlmLiteRtNpuCompiledModelExecutor::Decode(
 
   } else {
     // Standard Non-Speculative path.
-    ::litert::TensorBuffer& decoded_logits =
-        llm_inference_context_
-            .decode_output_buffers[LlmSignatures::kDecodeLogitsOutput];
-    auto start_sample = absl::Now();
-    LITERT_ASSIGN_OR_RETURN(
-        const int max_index,
-        ApplyGreedySampling(decoded_logits,
-                            npu_config_.enable_neon_for_npu_greedy_sampling));
-    latency_stats_.decode_sampling_latency_us +=
-        absl::ToInt64Microseconds(absl::Now() - start_sample);
+    const int max_index = mtp_start_token_id;
 
     // Store the sampled id as the pending input token for next Decode.
 
@@ -2843,6 +2834,7 @@ LlmLiteRtNpuCompiledModelExecutor::CloneContext() const {
           processed_tokens_);
 
   RuntimeConfig runtime_config;
+  runtime_config.sampler_params = sampler_params_;
 
   RuntimeState runtime_state;
   runtime_state.current_step = current_step_;
@@ -2890,6 +2882,10 @@ absl::Status LlmLiteRtNpuCompiledModelExecutor::RestoreContext(
 
   processed_tokens_ = context_data->processed_context().processed_tokens();
   current_step_ = context_data->runtime_state().current_step;
+
+  if (context_data->runtime_config().sampler_params.has_value()) {
+    sampler_params_ = *context_data->runtime_config().sampler_params;
+  }
 
   return absl::OkStatus();
 }

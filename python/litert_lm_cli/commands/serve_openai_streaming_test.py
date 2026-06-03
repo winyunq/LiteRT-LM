@@ -15,6 +15,7 @@
 import collections.abc
 import http.client
 import json
+import os
 import pathlib
 import threading
 from unittest import mock
@@ -181,6 +182,55 @@ class ServeOpenAIStreamingTest(absltest.TestCase):
       self.assertIn("id", res_body2)
     finally:
       conn.close()
+
+  def test_get_models(self):
+    mock_get_all = self.enter_context(
+        mock.patch.object(model.Model, "get_all_models", autospec=True)
+    )
+    model1 = model.Model(model_id="cpu_model", model_path="/path/to/cpu_model")
+    model2 = model.Model(model_id="gpu_model", model_path="/path/to/gpu_model")
+    mock_get_all.return_value = [model1, model2]
+
+    self.enter_context(
+        mock.patch.object(
+            openai_handler.os.path, "getmtime", return_value=123456789
+        )
+    )
+
+    mock_is_gpu_only = self.enter_context(
+        mock.patch.object(openai_handler, "_is_gpu_only_model", autospec=True)
+    )
+
+    def is_gpu_only_side_effect(model_path: str) -> bool:
+      if "cpu_model" in model_path:
+        return False
+      elif "gpu_model" in model_path:
+        return True
+      return False
+
+    mock_is_gpu_only.side_effect = is_gpu_only_side_effect
+
+    req = urllib.request.Request(
+        f"http://localhost:{self.port}/v1/models",
+    )
+
+    with urllib.request.urlopen(req) as response:
+      self.assertEqual(response.getcode(), 200)
+      self.assertEqual(response.getheader("Content-Type"), "application/json")
+
+      res_body = json.loads(response.read().decode("utf-8"))
+      self.assertEqual(res_body["object"], "list")
+
+      # We expect cpu_model, cpu_model,gpu and gpu_model,gpu
+      # gpu_model (CPU version) should NOT be present.
+      model_ids = [m["id"] for m in res_body["data"]]
+      self.assertEqual(
+          model_ids, ["cpu_model", "cpu_model,gpu", "gpu_model,gpu"]
+      )
+      for m in res_body["data"]:
+        self.assertEqual(m["object"], "model")
+        self.assertEqual(m["created"], 123456789)
+        self.assertEqual(m["owned_by"], "litert-lm")
 
 
 if __name__ == "__main__":

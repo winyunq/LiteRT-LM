@@ -38,7 +38,6 @@
 #include "runtime/components/preprocessor/audio_preprocessor.h"
 #include "runtime/components/preprocessor/audio_preprocessor_miniaudio.h"
 #include "runtime/components/preprocessor/image_preprocessor.h"
-#include "runtime/components/preprocessor/stb_image_preprocessor.h"
 #include "runtime/components/prompt_template.h"
 #include "runtime/components/sentencepiece_tokenizer.h"
 #include "runtime/components/tokenizer.h"
@@ -131,7 +130,7 @@ Gemma3DataProcessor::Create(Gemma3DataProcessorConfig config,
                    AudioPreprocessorMiniAudio::Create(
                        AudioPreprocessorConfig::CreateDefaultUsmConfig()));
   return absl::WrapUnique(new Gemma3DataProcessor(
-      config, preface, std::make_unique<StbImagePreprocessor>(),
+      config, preface, ImagePreprocessor::Create(),
       std::move(audio_preprocessor)));
 #else
   std::unique_ptr<LiteRtLmGemmaModelConstraintProvider,
@@ -172,7 +171,7 @@ Gemma3DataProcessor::Create(Gemma3DataProcessorConfig config,
                        AudioPreprocessorConfig::CreateDefaultUsmConfig()));
   return absl::WrapUnique(new Gemma3DataProcessor(
       std::move(constraint_provider), config, preface,
-      std::make_unique<StbImagePreprocessor>(), std::move(audio_preprocessor)));
+      ImagePreprocessor::Create(), std::move(audio_preprocessor)));
 #endif
 }
 
@@ -368,8 +367,10 @@ absl::StatusOr<Message> Gemma3DataProcessor::ToMessageImpl(
         ordered_json content_and_tool_calls,
         ParseTextAndToolCalls(
             response_text, config_.code_fence_start, config_.code_fence_end,
-            GetSyntaxType(config_.syntax_type), config_.escape_fence_strings,
-            config_.tool_code_regex));
+            GetSyntaxType(config_.syntax_type),
+            {.escape_fence_strings = config_.escape_fence_strings,
+             .tool_code_regex = config_.tool_code_regex,
+             .return_error_on_parse_failure = ReturnErrorOnParseFailure()}));
     if (content_and_tool_calls.contains("content")) {
       message["content"] = content_and_tool_calls["content"];
     }

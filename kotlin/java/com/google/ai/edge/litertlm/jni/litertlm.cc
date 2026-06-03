@@ -22,15 +22,13 @@
 #include <variant>
 #include <vector>
 
-#include "absl/base/log_severity.h"  // from @com_google_absl
 #include "absl/functional/any_invocable.h"  // from @com_google_absl
 #include "absl/log/absl_log.h"  // from @com_google_absl
-#include "absl/log/globals.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "nlohmann/json_fwd.hpp"  // from @nlohmann_json
-#include "litert/c/internal/litert_logging.h"  // from @litert
+#include "litert/cc/internal/scoped_file.h"  // from @litert
 #include "runtime/components/prompt_template.h"
 #include "runtime/conversation/conversation.h"
 #include "runtime/conversation/io_types.h"
@@ -46,8 +44,6 @@
 #include "runtime/util/file_util.h"
 #include "runtime/util/logging.h"
 #include "schema/capabilities/capabilities_c.h"
-#include "tflite/logger.h"  // from @litert
-#include "tflite/minimal_logging.h"  // from @litert
 
 // For Windows, __declspec( dllexport ) is required to export function in .dll.
 // https://learn.microsoft.com/en-us/cpp/cpp/using-dllimport-and-dllexport-in-cpp-classes?view=msvc-170
@@ -620,14 +616,41 @@ JNI_METHOD(nativeDeleteEngine)(JNIEnv* env, jclass thiz, jlong engine_pointer) {
   delete reinterpret_cast<Engine*>(engine_pointer);
 }
 
-LITERTLM_JNIEXPORT jlong JNICALL
-JNI_METHOD(nativeCreateSession)(JNIEnv* env, jclass thiz, jlong engine_pointer,
-                                jobject sampler_config_obj) {
+LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateSession)(
+    JNIEnv* env, jclass thiz, jlong engine_pointer, jobject sampler_config_obj,
+    jstring lora_path_str, jstring audio_lora_path_str) {
   auto session_config = SessionConfig::CreateDefault();
 
   if (sampler_config_obj != nullptr) {
     session_config.GetMutableSamplerParams() =
         CreateSamplerParamsFromJni(env, sampler_config_obj);
+  }
+
+  if (lora_path_str != nullptr) {
+    const char* lora_path = env->GetStringUTFChars(lora_path_str, nullptr);
+    auto lora_file = ::litert::ScopedFile::Open(lora_path);
+    env->ReleaseStringUTFChars(lora_path_str, lora_path);
+    if (!lora_file.ok()) {
+      ThrowLiteRtLmJniException(
+          env, "Failed to open LoRA file: " + lora_file.status().ToString());
+      return 0;
+    }
+    session_config.SetScopedLoraFile(
+        std::make_shared<::litert::ScopedFile>(std::move(*lora_file)));
+  }
+
+  if (audio_lora_path_str != nullptr) {
+    const char* audio_lora_path =
+        env->GetStringUTFChars(audio_lora_path_str, nullptr);
+    auto audio_lora_file = ::litert::ScopedFile::Open(audio_lora_path);
+    env->ReleaseStringUTFChars(audio_lora_path_str, audio_lora_path);
+    if (!audio_lora_file.ok()) {
+      ThrowLiteRtLmJniException(env, "Failed to open Audio LoRA file: " +
+                                         audio_lora_file.status().ToString());
+      return 0;
+    }
+    session_config.SetAudioScopedLoraFile(
+        std::make_shared<::litert::ScopedFile>(std::move(*audio_lora_file)));
   }
 
   Engine* engine = reinterpret_cast<Engine*>(engine_pointer);
@@ -839,13 +862,29 @@ JNI_METHOD(nativeConversationGetBenchmarkInfo)(JNIEnv* env, jclass thiz,
   return CreateBenchmarkInfoJni(env, *benchmark_info);
 }
 
+LITERTLM_JNIEXPORT jint JNICALL JNI_METHOD(nativeConversationGetTokenCount)(
+    JNIEnv* env, jclass thiz, jlong conversation_pointer) {
+  Conversation* conversation =
+      reinterpret_cast<Conversation*>(conversation_pointer);
+
+  auto tokens_count = conversation->GetTokenCount();
+  if (!tokens_count.ok()) {
+    ThrowLiteRtLmJniException(
+        env, "Failed to get token count: " + tokens_count.status().ToString());
+    return 0;
+  }
+
+  return *tokens_count;
+}
+
 LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateConversation)(
     JNIEnv* env, jclass thiz, jlong engine_pointer, jobject sampler_config_obj,
     jstring messages_json_string, jstring tools_description_json_string,
     jstring channels_json_string, jstring extra_context_json_string,
     jboolean enable_constrained_decoding,
     jboolean filter_channel_content_from_kv_cache,
-    jstring overwrite_prompt_template) {
+    jstring overwrite_prompt_template, jstring lora_path_str,
+    jstring audio_lora_path_str) {
   Engine* engine = reinterpret_cast<Engine*>(engine_pointer);
 
   // Create a native SessionConfig
@@ -854,6 +893,34 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateConversation)(
     session_config.GetMutableSamplerParams() =
         CreateSamplerParamsFromJni(env, sampler_config_obj);
   }
+
+  if (lora_path_str != nullptr) {
+    const char* lora_path = env->GetStringUTFChars(lora_path_str, nullptr);
+    auto lora_file = ::litert::ScopedFile::Open(lora_path);
+    env->ReleaseStringUTFChars(lora_path_str, lora_path);
+    if (!lora_file.ok()) {
+      ThrowLiteRtLmJniException(
+          env, "Failed to open LoRA file: " + lora_file.status().ToString());
+      return 0;
+    }
+    session_config.SetScopedLoraFile(
+        std::make_shared<::litert::ScopedFile>(std::move(*lora_file)));
+  }
+
+  if (audio_lora_path_str != nullptr) {
+    const char* audio_lora_path =
+        env->GetStringUTFChars(audio_lora_path_str, nullptr);
+    auto audio_lora_file = ::litert::ScopedFile::Open(audio_lora_path);
+    env->ReleaseStringUTFChars(audio_lora_path_str, audio_lora_path);
+    if (!audio_lora_file.ok()) {
+      ThrowLiteRtLmJniException(env, "Failed to open Audio LoRA file: " +
+                                         audio_lora_file.status().ToString());
+      return 0;
+    }
+    session_config.SetAudioScopedLoraFile(
+        std::make_shared<::litert::ScopedFile>(std::move(*audio_lora_file)));
+  }
+
   if (engine->GetEngineSettings().GetAudioExecutorSettings().has_value()) {
     session_config.SetAudioModalityEnabled(true);
   }

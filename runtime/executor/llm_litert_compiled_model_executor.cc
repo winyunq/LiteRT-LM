@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <random>
@@ -35,7 +36,6 @@
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
-#include "litert/cc/litert_common.h"  // from @litert
 #include "litert/cc/litert_compiled_model.h"  // from @litert
 #include "litert/cc/litert_element_type.h"  // from @litert
 #include "litert/cc/litert_environment.h"  // from @litert
@@ -48,8 +48,6 @@
 #include "litert/cc/litert_ranked_tensor_type.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer_types.h"  // from @litert
-#include "litert/cc/options/litert_cpu_options.h"  // from @litert
-#include "litert/cc/options/litert_runtime_options.h"  // from @litert
 #include "runtime/components/embedding_lookup/embedding_lookup_manager.h"
 #include "runtime/components/model_resources.h"
 #include "runtime/components/sampler_factory.h"
@@ -65,10 +63,8 @@
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/log_tensor_buffer.h"
 #include "runtime/util/lora_util.h"
-#include "runtime/util/scoped_file.h"
 #include "runtime/util/status_macros.h"  // IWYU pragma: keep
 #include "runtime/util/tensor_buffer_util.h"
-#include "tflite/delegates/xnnpack/xnnpack_delegate.h"  // from @litert
 #include "tflite/types/half.h"  // from @litert
 
 namespace litert::lm {
@@ -1274,10 +1270,18 @@ LlmLiteRtCompiledModelExecutorBase::CreateNewContext(
       std::make_unique<LlmProcessedContext>(
           lora_id, absl::flat_hash_map<absl::string_view, TensorBuffer>());
 
+  auto runtime_state = std::make_unique<RuntimeState>();
+  if (runtime_config.sampler_params.has_value()) {
+    runtime_state->rand_gen = std::make_shared<std::default_random_engine>(
+        runtime_config.sampler_params->seed());
+  } else {
+    runtime_state->rand_gen = std::make_shared<std::default_random_engine>(0);
+  }
+
   return std::make_unique<LlmContext>(
       std::move(processed_context),
       std::make_unique<RuntimeConfig>(std::move(runtime_config)),
-      std::make_unique<RuntimeState>());
+      std::move(runtime_state));
 }
 
 absl::StatusOr<std::unique_ptr<LlmContext>>
@@ -1334,21 +1338,32 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::InitializeSampler(
     output_heads = llm_context_->runtime_config().output_heads.value();
   }
   proto::SamplerParameters sampler_params;
-  sampler_params.set_type(proto::SamplerParameters::TOP_P);
-  sampler_params.set_k(1);
-  sampler_params.set_p(0.0f);
-  sampler_params.set_temperature(1.0f);
-  sampler_params.set_seed(0);
+  if (llm_context_->runtime_config().sampler_params.has_value()) {
+    sampler_params = llm_context_->runtime_config().sampler_params.value();
+  } else {
+    sampler_params.set_type(proto::SamplerParameters::TOP_P);
+    sampler_params.set_k(1);
+    sampler_params.set_p(0.0f);
+    sampler_params.set_temperature(1.0f);
+    sampler_params.set_seed(0);
+  }
+
+  gpu_sampler_max_top_k_ = sampler_params.k();
+
   ASSIGN_OR_RETURN(
       sampler_,
       CreateSampler(sampler_backend, output_heads, std::move(sampler_params),
                     env_.Get(), /*sequence_size=*/1, vocab_size, data_type));
 
+  // Disable GPU token copy for models that run embedding on the GPU.
+  const bool runs_embedding_on_gpu = (embedding_lookup_ == nullptr);
+
   // If the sampler can handle input, prepare the input tensors for it.
   sampler_handles_input_ =
       (!executor_settings_.GetAdvancedSettings().has_value() ||
        executor_settings_.GetAdvancedSettings()->sampler_handles_input) &&
-      sampler_->CanHandleInput() && !signatures_.input_tokens.empty();
+      sampler_->CanHandleInput() && !signatures_.input_tokens.empty() &&
+      !runs_embedding_on_gpu;
   if (sampler_handles_input_) {
     ABSL_LOG(INFO) << "Sampler will handle decode input tensors.";
     if (!decode_prev_input_pos_) {
@@ -1795,11 +1810,15 @@ LlmLiteRtCompiledModelExecutorStatic::Create(
     if (advanced_settings.has_value() &&
         advanced_settings->enable_speculative_decoding) {
       RET_CHECK_NE(embedding_lookup, nullptr);
-      RET_CHECK_NE(per_layer_embedding_lookup, nullptr);
+      std::optional<std::reference_wrapper<EmbeddingLookupManager>>
+          ple_manager_opt;
+      if (per_layer_embedding_lookup) {
+        ple_manager_opt = std::ref(*per_layer_embedding_lookup);
+      }
       ASSIGN_OR_RETURN(mtp_drafter, LlmLiteRtMtpDrafter::Create(
                                         lrt_env, resources, executor_settings,
                                         *compiled_model, *embedding_lookup,
-                                        *per_layer_embedding_lookup));
+                                        ple_manager_opt));
     }
   }
 
@@ -2007,46 +2026,19 @@ LlmLiteRtCompiledModelExecutorDynamic::Create(
       CreateCompilationOptions(executor_settings, ActivationDataType::FLOAT32,
                                /*signatures=*/std::nullopt));
   std::string weight_cache_path = executor_settings.GetCacheDir();
+
   const Backend backend = executor_settings.GetBackend();
   RET_CHECK_EQ(backend, Backend::CPU)
       << "LlmLiteRtCompiledModelExecutorDynamic only supports CPU backend.";
   uint32_t kv_increament_size = 0;
   int prefill_chunk_size = -1;
   {
-    LITERT_ASSIGN_OR_RETURN(auto& cpu_compilation_options,
-                            compilation_options.GetCpuOptions());
     ASSIGN_OR_RETURN(const auto& cpu_config,
                      executor_settings.GetBackendConfig<CpuConfig>());
     kv_increament_size = cpu_config.kv_increment_size;
     prefill_chunk_size = cpu_config.prefill_chunk_size;
-    cpu_compilation_options.SetNumThreads(cpu_config.number_of_threads);
-    auto weight_cache_file = executor_settings.GetWeightCacheFile(
-        ExecutorSettingsBase::kXnnpackCacheSuffix, /*check_and_clean=*/true);
-    if (weight_cache_file.ok()) {
-      if (std::holds_alternative<std::string>(*weight_cache_file)) {
-        weight_cache_path = std::get<std::string>(*weight_cache_file);
-        ABSL_LOG(INFO) << "Setting XNNPACK weight cache path: "
-                       << weight_cache_path;
-        cpu_compilation_options.SetXNNPackWeightCachePath(
-            weight_cache_path.c_str());
-      } else {
-        auto scoped_cache_file =
-            std::get<std::shared_ptr<ScopedFile>>(*weight_cache_file);
-        ASSIGN_OR_RETURN(auto duplicated, scoped_cache_file->Duplicate());
-        ASSIGN_OR_RETURN(int fd, duplicated.Release());
-        cpu_compilation_options.SetXNNPackWeightCacheFileDescriptor(fd);
-      }
-    }
     RET_CHECK_GT(kv_increament_size, 0)
         << "KV increment size must be greater than 0.";
-    auto default_xnn_options = TfLiteXNNPackDelegateOptionsDefault();
-    cpu_compilation_options.SetXNNPackFlags(
-        default_xnn_options.flags |
-        TFLITE_XNNPACK_DELEGATE_FLAG_ENABLE_LATEST_OPERATORS);
-    LITERT_ASSIGN_OR_RETURN(auto& runtime_options,
-                            compilation_options.GetRuntimeOptions());
-    runtime_options.SetCompressQuantizationZeroPoints(true);
-    compilation_options.SetHardwareAccelerators(HwAccelerators::kCpu);
   }
 
   std::unique_ptr<CompiledModel> compiled_model;

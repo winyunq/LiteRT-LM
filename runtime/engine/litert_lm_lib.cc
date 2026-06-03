@@ -397,12 +397,16 @@ void LogBenchmarkInfo(const litert::lm::BenchmarkInfo& benchmark_info,
   if (!settings.log_sink_file.has_value()) {
     ABSL_LOG(INFO) << benchmark_info;
   } else {
+    std::string model_name_flag = "";
+    if (settings.model_name.has_value() && !settings.model_name->empty()) {
+      model_name_flag = absl::StrFormat(",model_name=%s", *settings.model_name);
+    }
     ABSL_LOG(INFO) << absl::StrFormat(
         "Benchmark flags: "
-        "benchmark_prefill_tokens=%d,benchmark_decode_tokens=%d,backend=%s",
+        "benchmark_prefill_tokens=%d,benchmark_decode_tokens=%d,backend=%s%s",
         benchmark_info.GetBenchmarkParams().num_prefill_tokens(),
         benchmark_info.GetBenchmarkParams().num_decode_tokens(),
-        settings.backend);
+        settings.backend, model_name_flag);
     for (const auto& phase : benchmark_info.GetInitPhases()) {
       ABSL_LOG(INFO) << absl::StrFormat(
           "%s: %.2f ms", phase.first, absl::ToDoubleMilliseconds(phase.second));

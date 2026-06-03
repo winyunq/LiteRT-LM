@@ -120,7 +120,7 @@ def read_litertlm_header(
     return metadata
 
 
-def _get_model_type(section_object: schema.SectionObject) -> Optional[str]:
+def get_model_type(section_object: schema.SectionObject) -> str | None:
   """Extracts model_type from section items."""
   for j in range(section_object.ItemsLength()):
     item = section_object.Items(j)
@@ -149,7 +149,7 @@ def _get_tflite_model_filename(
     section_object: schema.SectionObject, section_index: int
 ) -> str:
   """Constructs a filename for a TFLiteModel section."""
-  model_type = _get_model_type(section_object)
+  model_type = get_model_type(section_object)
   file_name = f"Section{section_index}_TFLiteModel"
   if model_type:
     file_name += f"_{model_type}"
@@ -160,7 +160,7 @@ def _get_tflite_weight_filename(
     section_object: schema.SectionObject, section_index: int
 ) -> str:
   """Constructs a filename for a TFLite weight section."""
-  model_type = _get_model_type(section_object)
+  model_type = get_model_type(section_object)
   file_name = f"Section{section_index}_TFLiteWeights"
   if model_type:
     file_name += f"_{model_type}"

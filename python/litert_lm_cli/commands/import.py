@@ -14,12 +14,10 @@
 
 """Import subcommand for LiteRT-LM CLI."""
 
-import collections.abc
-import http.client
 import os
+import pathlib
 import shutil
 import ssl
-import tempfile
 import textwrap
 import urllib.error
 import urllib.parse
@@ -29,57 +27,8 @@ import click
 
 from litert_lm_cli import common
 from litert_lm_cli import help_formatter
+from litert_lm_cli import huggingface_download
 from litert_lm_cli import model
-
-_DOWNLOAD_CHUNK_SIZE = 1024 * 64
-
-
-def _stream_download(
-    response: http.client.HTTPResponse,
-    *,
-    length: int | None,
-    format_progress: collections.abc.Callable[[int], str],
-) -> str:
-  """Streams the response body to a temporary file with a progress bar.
-
-  If any exception occurs during the download or file writing, the temporary
-  file is guaranteed to be cleaned up.
-
-  Args:
-    response: The HTTPResponse object to read the body from.
-    length: The total expected length of the download in bytes, if known. Used
-      for the progress bar's total size.
-    format_progress: A callable that takes the current progress position (in
-      bytes) and returns a formatted string for the progress bar.
-
-  Returns:
-    The absolute path to the temporary file where the response body was written.
-  """
-  tmp_file = tempfile.NamedTemporaryFile(delete=False)
-  tmp_file_path = tmp_file.name
-  try:
-    with tmp_file:
-      with click.progressbar(
-          length=length,
-          label="Downloading model",
-          show_pos=False,
-          show_percent=False,
-          show_eta=False,
-          item_show_func=lambda item: item,
-      ) as bar:
-        current_pos = 0
-        for chunk in iter(lambda: response.read(_DOWNLOAD_CHUNK_SIZE), b""):
-          tmp_file.write(chunk)
-          current_pos += len(chunk)
-          bar.update(len(chunk), current_item=format_progress(current_pos))
-    return tmp_file_path
-  except BaseException:
-    # Ensure the file is closed before attempting to remove it.
-    try:
-      os.remove(tmp_file_path)
-    except OSError:
-      pass
-    raise
 
 
 def download_experimental_model(
@@ -102,50 +51,33 @@ def download_experimental_model(
     click.ClickException: If the download fails.
   """
   url = f"https://dl.google.com/litert-lm/experimental/{urllib.parse.quote(model_id)}/model.litertlm"
-  click.echo(f"Downloading experimental model from {url}...")
 
   req = urllib.request.Request(url, headers={"User-Agent": user_agent})
 
   try:
-    response = urllib.request.urlopen(req, context=ssl_context)
+    with urllib.request.urlopen(req, context=ssl_context) as response:
+      total_size = common.parse_total_size(response.getheader("Content-Length"))
+      size_suffix = common.download_size_suffix(total_size)
+
+      click.echo(f"Downloading {model_id!r}{size_suffix}...")
+
+      format_progress = lambda pos: common.format_download_progress(
+          pos, total_size
+      )
+      downloading_dir = pathlib.Path(model.get_cli_base_dir()) / "downloading"
+      return str(
+          common.stream_download(
+              response,
+              download_dir=downloading_dir,
+              length=total_size,
+              format_progress=format_progress,
+          )
+      )
+
   except urllib.error.URLError as e:
     raise click.ClickException(
-        f"Failed to download model '{model_id}': {e!r}"
+        f"Failed to download model {model_id!r}: {e!r}"
     ) from e
-
-  with response:
-    content_length = response.getheader("Content-Length")
-    if content_length is None:
-      total_size = None
-    else:
-      try:
-        total_size = int(content_length)
-      except ValueError:
-        total_size = None
-
-    def format_progress(current_pos_bytes: int) -> str:
-      if total_size and total_size > 0:
-        pct = int((current_pos_bytes / total_size) * 100)
-        if total_size > 1024 * 1024:
-          return (
-              f"{current_pos_bytes / (1024 * 1024):.1f} MB / "
-              f"{total_size / (1024 * 1024):.1f} MB  {pct}%"
-          )
-        else:
-          return (
-              f"{current_pos_bytes / 1024:.1f} KB / "
-              f"{total_size / 1024:.1f} KB  {pct}%"
-          )
-
-      if current_pos_bytes > 1024 * 1024:
-        return f"{current_pos_bytes / (1024 * 1024):.1f} MB"
-      return f"{current_pos_bytes / 1024:.1f} KB"
-
-    return _stream_download(
-        response,
-        length=total_size,
-        format_progress=format_progress,
-    )
 
 
 def _copy_source(
@@ -186,7 +118,6 @@ def _copy_source(
     return None
   except FileNotFoundError as e:
     if source == model_file and user_agent:
-      click.echo(f"Local file '{source}' not found. Attempting download...")
       downloaded_file = download_experimental_model(
           model_id=model_file,
           user_agent=user_agent,
@@ -252,15 +183,11 @@ def import_model(
   temporary_file = None
 
   if from_huggingface_repo:
-    downloaded_file = common.download_from_huggingface(
-        from_huggingface_repo, model_file, huggingface_token
+    source = huggingface_download.download_from_huggingface(
+        repo_id=from_huggingface_repo,
+        filename=model_file,
+        token=huggingface_token,
     )
-    if not downloaded_file:
-      raise click.ClickException(
-          f"Failed to download model file '{model_file}' from HuggingFace"
-          f" repository '{from_huggingface_repo}'."
-      )
-    source = downloaded_file
   else:
     source = model_file
 

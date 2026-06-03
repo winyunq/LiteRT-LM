@@ -57,6 +57,8 @@ ENGINE_COMMON_DEPS = [
     "//runtime/proto:sampler_params_cc_proto",
     "//runtime/proto:token_cc_proto",
     "//runtime/util:logging",
+    "//runtime/util:scoped_file",
+    "//runtime/components:tokenizer",
 ]
 
 cc_library(
