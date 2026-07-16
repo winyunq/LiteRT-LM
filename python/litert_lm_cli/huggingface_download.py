@@ -15,6 +15,7 @@
 """Hugging Face model downloader and cacher for LiteRT-LM CLI."""
 
 import http.client
+import json
 import pathlib
 import shutil
 import urllib.error
@@ -150,4 +151,67 @@ def download_from_huggingface(
     raise click.ClickException(
         f"Error downloading {filename!r} from HuggingFace repo {repo_id!r}:"
         f" {e!r}"
+    ) from e
+
+
+def list_litertlm_files(
+    *,
+    repo_id: str,
+    token: str | None,
+) -> list[str]:
+  """Lists .litertlm files in a HuggingFace repository.
+
+  Args:
+    repo_id: The HuggingFace repository ID.
+    token: The HuggingFace API token.
+
+  Returns:
+    A list of .litertlm file paths in the repository.
+
+  Raises:
+    click.ClickException: If the API request fails or returns invalid data.
+  """
+  url = f"https://huggingface.co/api/models/{repo_id}"
+  headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
+  req = urllib.request.Request(url, headers=headers)
+
+  try:
+    with urllib.request.urlopen(req) as response:
+      try:
+        data = json.loads(response.read().decode())
+      except json.JSONDecodeError as e:
+        raise click.ClickException(
+            f"Failed to parse response from HuggingFace API: {e!r}"
+        ) from e
+
+      siblings = data.get("siblings", [])
+      return [
+          sibling["rfilename"]
+          for sibling in siblings
+          if sibling.get("rfilename", "").endswith(".litertlm")
+      ]
+
+  except urllib.error.HTTPError as e:
+    if e.code == 401 or e.code == 403:
+      if token is None:
+        click.echo(
+            click.style(
+                "HuggingFace token not found. If this is a private or gated"
+                " repository, you can provide the token via the"
+                " --huggingface-token option, or by setting the"
+                " HF_TOKEN environment variable.",
+                fg="yellow",
+            )
+        )
+      raise click.ClickException(
+          f"Error accessing HuggingFace repo {repo_id!r} (HTTP {e.code}):"
+          f" {e.reason!r}"
+      ) from e
+
+    raise click.ClickException(
+        f"Error accessing HuggingFace repo {repo_id!r}: {e!r}"
+    ) from e
+  except urllib.error.URLError as e:
+    raise click.ClickException(
+        f"Error accessing HuggingFace repo {repo_id!r}: {e!r}"
     ) from e

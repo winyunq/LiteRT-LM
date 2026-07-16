@@ -12,6 +12,8 @@
 
 from absl.testing import absltest
 from absl.testing import parameterized
+import click
+from click.testing import CliRunner
 
 from litert_lm_cli import common
 
@@ -63,6 +65,52 @@ class CommonTest(parameterized.TestCase):
   )
   def test_parse_total_size(self, content_length, expected):
     self.assertEqual(common.parse_total_size(content_length), expected)
+
+  @parameterized.named_parameters(
+      ('none_cache', None, ''),
+      ('disk_cache', 'disk', ''),
+      ('memory_cache', 'memory', ':memory'),
+      ('no_cache', 'no', ':nocache'),
+  )
+  def test_cache_dir_value_from_cache_mode(self, cache, expected):
+    self.assertEqual(common.cache_dir_value_from_cache_mode(cache), expected)
+
+  def test_cache_dir_value_from_cache_mode_invalid(self):
+    with self.assertRaises(ValueError):
+      common.cache_dir_value_from_cache_mode('invalid')
+
+
+class CommonInferenceOptionsTest(parameterized.TestCase):
+
+  def test_enable_speculative_decoding_case_insensitive(self):
+    @click.command()
+    @common.common_inference_options
+    def dummy_cmd(**kwargs):
+      click.echo(
+          f"speculative_decoding: {kwargs.get('enable_speculative_decoding')}"
+      )
+
+    runner = CliRunner()
+
+    # Test lowercase
+    result = runner.invoke(dummy_cmd, ['--enable-speculative-decoding', 'true'])
+    self.assertEqual(result.exit_code, 0)
+    self.assertIn('speculative_decoding: True', result.output)
+
+    # Test uppercase (verifies case_sensitive=False)
+    result = runner.invoke(dummy_cmd, ['--enable-speculative-decoding', 'TRUE'])
+    self.assertEqual(result.exit_code, 0)
+    self.assertIn('speculative_decoding: True', result.output)
+
+    # Test invalid value
+    result = runner.invoke(
+        dummy_cmd, ['--enable-speculative-decoding', 'invalid']
+    )
+    self.assertNotEqual(result.exit_code, 0)
+    self.assertIn(
+        "Error: Invalid value for '--enable-speculative-decoding'",
+        result.output,
+    )
 
 
 if __name__ == '__main__':

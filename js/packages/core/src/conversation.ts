@@ -16,7 +16,8 @@
 
 import {Message, MessageLike} from './conversation_config.js';
 import {Mutex} from './mutex.js';
-import {Conversation as WasmConversation, Engine as WasmEngine} from './wasm_binding_types.js';
+import {ChatInterface} from './orchestration/chat_interface.js';
+import {BenchmarkInfo, Conversation as WasmConversation, Engine as WasmEngine} from './wasm_binding_types.js';
 
 const BUSY_MESSAGE =
     'Conversation is busy. A generation is already in progress.';
@@ -24,7 +25,7 @@ const BUSY_MESSAGE =
 /**
  * LiteRT-LM Conversation
  */
-export class Conversation {
+export class Conversation implements ChatInterface {
   private isBusy = false;
 
   constructor(
@@ -39,8 +40,9 @@ export class Conversation {
     this.isBusy = true;
     try {
       return await this.mutexes.executor.acquireAndRun(async () => {
-        const jsonStr = messageToJsonString(message);
-        const resultStr = await this.conversation.sendMessage(jsonStr);
+        const currentMessageJson = messageToJsonString(message);
+        const resultStr =
+            await this.conversation.sendMessage(currentMessageJson);
         return JSON.parse(resultStr) as Message;
       });
     } finally {
@@ -60,56 +62,51 @@ export class Conversation {
     this.isBusy = true;
 
     let isCancelled = false;
-    const jsonStr = messageToJsonString(message);
+    let hasErrored = false;
     return new ReadableStream<Message>({
       start: (controller) => {
-        try {
-          this.conversation
-              .sendMessageAsync(
-                  jsonStr,
-                  (chunk: string|null, isDone: boolean, error: string|null) => {
-                    if (isCancelled) return;
-                    if (error) {
+        const currentMessageJson = messageToJsonString(message);
+
+        const executeGeneration = async(): Promise<void> => {
+          await this.mutexes.executor.acquireAndRun(async () => {
+            await this.conversation.sendMessageAsync(
+                currentMessageJson,
+                (chunk: string|null, isDone: boolean, error: string|null) => {
+                  if (isCancelled || hasErrored) return;
+                  if (error) {
+                    hasErrored = true;
+                    this.isBusy = false;
+                    controller.error(new Error(error));
+                    return;
+                  }
+                  if (chunk) {
+                    try {
+                      const msg = JSON.parse(chunk) as Message;
+                      controller.enqueue(msg);
+                    } catch (e) {
+                      hasErrored = true;
                       this.isBusy = false;
-                      controller.error(new Error(error));
-                      return;
+                      controller.error(e);
                     }
-                    if (chunk) {
-                      try {
-                        controller.enqueue(JSON.parse(chunk) as Message);
-                      } catch (e) {
-                        this.isBusy = false;
-                        controller.error(e);
-                      }
-                    }
-                    if (isDone) {
-                      this.isBusy = false;
-                      controller.close();
-                    }
-                  })
-              .catch((e) => {
-                if (isCancelled) return;
-                this.isBusy = false;
-                controller.error(e);
-              });
-          // Since we're using the synchronus execution manager in C++, which
-          // lazily executes tasks, we must call waitUntilDone to start the
-          // execution.
-          const runWait = async () => {
-            await this.mutexes.executor.acquireAndRun(async () => {
-              await this.engine.waitUntilDone();
-            });
-          };
-          runWait().catch((e) => {
-            if (isCancelled) return;
-            this.isBusy = false;
-            controller.error(e);
+                  }
+                });
+            // Since we're using the synchronus execution manager in C++, which
+            // lazily executes tasks, we must queue the message and call
+            // waitUntilDone to start the execution concurrently while holding
+            // the mutex lock.
+            await this.engine.waitUntilDone();
           });
-        } catch (e) {
-          if (isCancelled) return;
+
+          if (isCancelled || hasErrored) return;
+          this.isBusy = false;
+          controller.close();
+        };
+
+        executeGeneration().catch((e) => {
+          if (isCancelled || hasErrored) return;
           this.isBusy = false;
           controller.error(e);
-        }
+        });
       },
       cancel: () => {
         isCancelled = true;
@@ -126,12 +123,23 @@ export class Conversation {
     this.conversation.cancelProcess();
   }
 
-  getHistory(): Message[] {
-    if (this.isBusy) {
-      throw new Error(BUSY_MESSAGE);
-    }
-    const historyStr = this.conversation.getHistory();
-    return JSON.parse(historyStr) as Message[];
+  async getHistory(): Promise<Message[]> {
+    return this.mutexes.executor.acquireAndRun(() => {
+      const historyStr = this.conversation.getHistory();
+      return JSON.parse(historyStr) as Message[];
+    });
+  }
+
+  async getTokenCount(): Promise<number> {
+    return this.mutexes.executor.acquireAndRun(() => {
+      return this.conversation.getTokenCount();
+    });
+  }
+
+  async getBenchmarkInfo(): Promise<BenchmarkInfo> {
+    return this.mutexes.executor.acquireAndRun(() => {
+      return this.conversation.getBenchmarkInfo();
+    });
   }
 
   async delete(): Promise<void> {

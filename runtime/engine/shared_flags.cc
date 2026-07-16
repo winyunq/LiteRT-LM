@@ -97,7 +97,14 @@ ABSL_FLAG(std::string, score_target_text, "", "Target text to score.");
 ABSL_FLAG(bool, gpu_madvise_original_shared_tensors, true,
           "If true, the GPU backend will madvise the original shared tensors "
           "after use.");
-ABSL_FLAG(bool, disable_cache, false, "Disable weight cache.");
+ABSL_FLAG(
+    bool, disable_cache, false,
+    "Disable both the weight and program caches. If set to true, "
+    "--disable_weight_cache and --disable_gpu_program_cache will be ignored.");
+ABSL_FLAG(bool, disable_weight_cache, false,
+          "Disable only the weight cache. Applies to both CPU and GPU.");
+ABSL_FLAG(bool, disable_gpu_program_cache, false,
+          "Disable only the program cache. GPU path only.");
 ABSL_FLAG(
     std::string, cache_dir, "",
     "Directory for cache. Use ':memory' for in-memory cache. CPU path only");

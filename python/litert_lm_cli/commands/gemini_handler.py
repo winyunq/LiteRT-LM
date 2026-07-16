@@ -145,52 +145,16 @@ class ParsedRequest:
 
   Attributes:
     model_id: The identifier for the model.
-    backend: The hardware backend to use, or None for auto-selection.
-    max_num_tokens: The maximum number of tokens, or None for model default.
     is_stream: Whether the request is for streaming.
     error_msg: Error message if parsing failed, or None if successful.
   """
 
   model_id: str
-  backend: litert_lm.Backend | None = None
-  max_num_tokens: int | None = None
   is_stream: bool = False
   error_msg: str | None = None
 
 
-def parse_model_and_backend(path: str) -> ParsedRequest:
-  """Parses model spec, backend, max_tokens and stream flag from URL path.
-
-  Args:
-    path: The URL path.
-
-  Returns:
-    A ParsedRequest object.
-  """
-  path_without_query = path.split("?")[0]
-  gen_match = GEN_CONTENT_RE.fullmatch(path_without_query)
-  stream_match = STREAM_GEN_CONTENT_RE.fullmatch(path_without_query)
-
-  match = gen_match or stream_match
-  if not match:
-    return ParsedRequest(model_id="", error_msg="Not Found")
-
-  is_stream = bool(stream_match)
-  model_spec = match.group(1)
-  try:
-    spec = serve_util.parse_model_spec(model_spec)
-  except ValueError as e:
-    return ParsedRequest(model_id="", is_stream=is_stream, error_msg=str(e))
-
-  return ParsedRequest(
-      model_id=spec.model_id,
-      backend=spec.backend,
-      max_num_tokens=spec.max_num_tokens,
-      is_stream=is_stream,
-  )
-
-
-class GeminiHandler(http.server.BaseHTTPRequestHandler):
+class GeminiHandler(serve_util.CORSRequestHandler):
   """Handler for Gemini API requests."""
 
   def __init__(
@@ -256,8 +220,6 @@ class GeminiHandler(http.server.BaseHTTPRequestHandler):
       return serve_util.get_or_initialize_server_engine(
           self.server,
           model_id=req.model_id,
-          backend=req.backend,
-          max_num_tokens=req.max_num_tokens,
       )
     except FileNotFoundError as e:
       if not self._headers_sent:
@@ -344,7 +306,7 @@ class GeminiHandler(http.server.BaseHTTPRequestHandler):
   def _parse_request_path(
       self, match: re.Match[str], is_stream: bool
   ) -> ParsedRequest | None:
-    """Parses model spec and backend from regex match of the URL path.
+    """Parses model ID from regex match of the URL path.
 
     Args:
       match: The regex match object of the path.
@@ -353,18 +315,10 @@ class GeminiHandler(http.server.BaseHTTPRequestHandler):
     Returns:
       The ParsedRequest metadata, or None if parsing failed.
     """
-    model_spec = match.group(1)
-    try:
-      spec = serve_util.parse_model_spec(model_spec)
-      return ParsedRequest(
-          model_id=spec.model_id,
-          backend=spec.backend,
-          max_num_tokens=spec.max_num_tokens,
-          is_stream=is_stream,
-      )
-    except ValueError as e:
-      self.send_error(400, "".join(traceback.format_exception_only(e)))
-      return None
+    return ParsedRequest(
+        model_id=match.group(1),
+        is_stream=is_stream,
+    )
 
   def _handle_generate_content(self, match: re.Match[str]) -> None:
     """Handles non-streaming generateContent requests.

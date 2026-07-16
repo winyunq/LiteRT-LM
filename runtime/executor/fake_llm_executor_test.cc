@@ -26,8 +26,9 @@
 #include "absl/time/time.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "litert/test/matchers.h"  // from @litert
-#include "runtime/components/constrained_decoding/constrained_decoder.h"
-#include "runtime/components/constrained_decoding/fake_constraint.h"
+#include "runtime/components/logits_processor/constrained_decoding/constrained_decoder.h"
+#include "runtime/components/logits_processor/constrained_decoding/fake_constraint.h"
+#include "runtime/components/logits_processor/logits_processor.h"
 #include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/test_utils.h"  // IWYU pragma: keep
@@ -369,7 +370,9 @@ TEST(FakeLlmExecutorTest, DecodeWithConstraint) {
       std::make_unique<ConstrainedDecoder>(&constraint,
                                            /*num_output_candidates=*/1);
   auto decode_params = ExecutorDecodeParams();
-  decode_params.SetConstraintDecoder(constrained_decoder.get());
+  decode_params.SetLogitsProcessorList({
+      constrained_decoder.get(),
+  });
   // Call Decode for the 1st time. The output tokens should be the 1st decode
   // tokens: 4. (first constraint token)
   ASSERT_OK_AND_ASSIGN(auto output_tokens,

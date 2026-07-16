@@ -27,13 +27,12 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "litert/cc/litert_layout.h"  // from @litert
-#include "runtime/components/preprocessor/image_preprocessor.h"
-#include "runtime/components/preprocessor/stb_image_preprocessor.h"
 #include "runtime/components/prompt_template.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/data_utils.h"
 #include "runtime/conversation/model_data_processor/fastvlm_data_processor_config.h"
 #include "runtime/conversation/model_data_processor/model_data_processor.h"
+#include "runtime/conversation/model_data_processor/multimodal_processor_helper.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/util/memory_mapped_file.h"
 #include "runtime/util/status_macros.h"
@@ -82,64 +81,27 @@ absl::StatusOr<std::vector<InputData>>
 FastVlmDataProcessor::ToInputDataVectorImpl(
     const std::string& rendered_template_prompt, const ordered_json& messages,
     const FastVlmDataProcessorArguments& args) const {
-  std::vector<InputData> input_data;
-  std::deque<std::unique_ptr<MemoryMappedFile>> image_files;
-
-  for (const auto& message : messages) {
-    if (message.contains("content") && message["content"].is_array()) {
-      for (const auto& item : message["content"]) {
-        if (item.is_string()) {
-          continue;
-        }
-        ASSIGN_OR_RETURN(std::unique_ptr<MemoryMappedFile> mmap_file,
-                         LoadItemData(item));
-        if (item["type"] == "image") {
-          image_files.push_back(std::move(mmap_file));
-        }
-      }
-    }
-  }
-
-  RE2 re_delimiter("(<image_soft_token>)");
-  absl::string_view prompt_view(rendered_template_prompt);
-  const char* start = prompt_view.data();
-  std::string part;
-  ImagePreprocessParameter image_params;
-  image_params.SetTargetDimensions(Dimensions(
+  MultimodalPromptProcessingConfig multi_config{
+      .delimiter_regex = "(<image_soft_token>)",
+      .image_token_regex = "(<image_soft_token>)",
+      .audio_token_regex = "",
+      .boi_token = "",
+      .eoi_token = "",
+      .image_prefix = "",
+      .image_suffix = "",
+      .add_image_end = false,
+      .boa_token = "",
+      .eoa_token = "",
+      .audio_prefix = "",
+      .audio_suffix = "",
+      .add_audio_end = false,
+  };
+  ImagePreprocessParameter image_preprocess_parameter;
+  image_preprocess_parameter.SetTargetDimensions(Dimensions(
       {1, config_.image_tensor_height, config_.image_tensor_width, 3}));
-
-  while (RE2::FindAndConsume(&prompt_view, re_delimiter, &part)) {
-    absl::string_view text_part(start, prompt_view.data() - part.size());
-    start = prompt_view.data();
-    if (IsImage(part)) {
-      input_data.emplace_back(InputText(std::string(text_part)));
-
-      if (image_files.empty()) {
-        return absl::InvalidArgumentError(
-            "Provided less images than expected in the prompt.");
-      }
-      auto image_file = std::move(image_files.front());
-      image_files.pop_front();
-      ASSIGN_OR_RETURN(auto preprocessed_image,
-                       image_preprocessor_->Preprocess(
-                           InputImage(std::string(
-                               static_cast<const char*>(image_file->data()),
-                               image_file->length())),
-                           image_params));
-      input_data.emplace_back(InputImage(std::move(preprocessed_image)));
-    }
-  }
-
-  if (!image_files.empty()) {
-    return absl::InvalidArgumentError(
-        "Provided more images than expected in the prompt.");
-  }
-
-  if (!prompt_view.empty()) {
-    input_data.push_back(InputText(std::string(prompt_view)));
-  }
-
-  return input_data;
+  return ProcessMultimodalPrompt(
+      rendered_template_prompt, messages, image_preprocessor_.get(),
+      /*audio_preprocessor=*/nullptr, multi_config, image_preprocess_parameter);
 }
 
 absl::StatusOr<Message> FastVlmDataProcessor::ToMessageImpl(

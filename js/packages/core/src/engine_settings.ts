@@ -45,9 +45,10 @@ export interface LlmExecutorSettings {
  * LiteRT-LM EngineSettings
  */
 export interface EngineSettings {
-  model: string|ReadableStream<Uint8Array>;
+  model: string|Blob|ReadableStream<Uint8Array>;
   backend?: Backend;
   mainExecutorSettings?: LlmExecutorSettings;
+  benchmarkEnabled?: boolean;
 }
 
 /**
@@ -63,6 +64,10 @@ export function fillWasmEngineSettingsFromEngineSettings(
   const wasmExecutorSettings =
       wasmEngineSettings.getMutableMainExecutorSettings();
   wasmExecutorSettings.setCacheDir(':nocache');  // Not supported in JS.
+
+  if (engineSettings.benchmarkEnabled) {
+    wasmEngineSettings.enableBenchmark();
+  }
 
   if (engineSettings.mainExecutorSettings) {
     const mainExecutorSettings = engineSettings.mainExecutorSettings;
@@ -150,5 +155,6 @@ export function wasmEngineSettingsToEngineSettings(
       backendConfig,
       advancedSettings: wasmExecutorSettings.getAdvancedSettings(),
     },
+    benchmarkEnabled: false,
   };
 }

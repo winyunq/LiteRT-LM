@@ -30,8 +30,8 @@
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/str_split.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "support/tokenizer/tokenizer.h"  // from @litert
 #include "runtime/components/model_resources.h"
-#include "runtime/components/tokenizer.h"
 #include "runtime/executor/audio_executor_settings.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/llm_executor_settings.h"
@@ -223,7 +223,7 @@ absl::StatusOr<EngineSettings> EngineSettings::CreateDefault(
 // 1. The tokenizer is available.
 // 2. The tokenizer is not available, when it is nullptr.
 absl::Status EngineSettings::MaybeUpdateAndValidate(
-    Tokenizer* tokenizer,
+    support::Tokenizer* tokenizer,
     const proto::LlmMetadata* absl_nullable metadata_from_file,
     absl::string_view input_prompt_as_hint,
     const std::optional<std::string>& text_backend_constraint,
@@ -328,7 +328,9 @@ absl::Status EngineSettings::MaybeUpdateAndValidate(
   if (!metadata.has_sampler_params()) {
     proto::SamplerParameters& sampler_params =
         *metadata.mutable_sampler_params();
-    if (backend == Backend::NPU || backend == Backend::GPU_ARTISAN) {
+    if (backend == Backend::NPU ||
+        backend == Backend::GPU_ARTISAN
+    ) {
       sampler_params.set_type(proto::SamplerParameters::TYPE_UNSPECIFIED);
     } else if (backend == Backend::CPU || backend == Backend::GPU
     ) {
@@ -589,6 +591,24 @@ absl::Status SessionConfig::MaybeUpdateAndValidate(
         sampler_params = engine_settings.GetLlmMetadata()->sampler_params();
       }
     }
+    if (sampler_backend_ == Backend::UNSPECIFIED) {
+      proto::SamplerParameters::Backend backend_to_use =
+          sampler_params.backend();
+      if (backend_to_use == proto::SamplerParameters::UNSPECIFIED &&
+          llm_metadata.has_sampler_params()) {
+        // Prefer the sampler backend from user-provided value, and only if the
+        // user-provided value is unspecified, use the value from LlmMetadata.
+        backend_to_use = llm_metadata.sampler_params().backend();
+      }
+      // If the sampler backend is still unspecified, then it will be set later
+      // based on the main executor settings.
+      if (backend_to_use != proto::SamplerParameters::UNSPECIFIED) {
+        ASSIGN_OR_RETURN(
+            sampler_backend_,
+            GetBackendFromString(
+                proto::SamplerParameters::Backend_Name(backend_to_use)));
+      }
+    }
 
     // Set and validate the start token.
     if (start_token_id_ == -1) {
@@ -643,6 +663,8 @@ absl::Status SessionConfig::MaybeUpdateAndValidate(
         num_output_candidates_));
   }
 
+  // If the sampler backend is not specified, then use the same backend as the
+  // main executor settings.
   if (sampler_backend_ == Backend::UNSPECIFIED) {
     if (engine_settings.GetMainExecutorSettings().GetBackend() ==
         Backend::GPU) {

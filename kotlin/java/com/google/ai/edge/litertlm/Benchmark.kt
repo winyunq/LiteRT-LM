@@ -51,6 +51,9 @@ data class BenchmarkInfo(
  * @param cacheDir The directory for placing cache files. It should be a directory with write
  *   access. If not set, it uses the directory of the [modelPath]. Set to ":nocache" to disable
  *   caching at all.
+ * @param prompt The custom prompt string to tokenize and run. If the tokenized prompt is shorter
+ *   than [prefillTokens], the remaining tokens are padded with zero. If it is longer, the prompt is
+ *   truncated to [prefillTokens].
  * @return The benchmark info.
  */
 @ExperimentalApi
@@ -60,6 +63,7 @@ fun benchmark(
   prefillTokens: Int = 256,
   decodeTokens: Int = 256,
   cacheDir: String? = null,
+  prompt: String = "How are you",
 ): BenchmarkInfo {
   val enginePointer =
     LiteRtLmJni.nativeCreateBenchmark(
@@ -69,6 +73,7 @@ fun benchmark(
       decodeTokens,
       cacheDir ?: "",
       (backend as? Backend.NPU)?.nativeLibraryDir ?: "",
+      ExperimentalFlags.enableSpeculativeDecoding,
     )
 
   try {
@@ -80,7 +85,7 @@ fun benchmark(
         "[]", // toolsDescriptionJsonString
         null, // channelsJsonString
         "{}", // extraContextJsonString
-        false, // enableConversationConstrainedDecoding
+        ExperimentalFlags.enableConversationConstrainedDecoding,
         ExperimentalFlags.filterChannelContentFromKvCache,
         ExperimentalFlags.overwritePromptTemplate,
         null, // loraPath
@@ -88,7 +93,7 @@ fun benchmark(
       )
 
     Conversation(conversationHandle).use { conversation ->
-      val unused = conversation.sendMessage("Engine ignore this message in this mode.")
+      val unused = conversation.sendMessage(prompt)
       return conversation.getBenchmarkInfo()
     }
   } finally {

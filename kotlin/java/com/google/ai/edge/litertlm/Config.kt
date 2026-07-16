@@ -42,10 +42,14 @@ data class Channel(val channelName: String, val start: String, val end: String) 
 sealed class Backend(val name: String) {
 
   /**
-   * @property numOfThreads The number of threads to use for CPU backend. When `null` or 0, use the
+   * @property threadCount The number of threads to use for CPU backend. When `null` or 0, use the
    *   default value from the native engine.
+   * @property numOfThreads Deprecated. Use [threadCount] instead.
    */
-  data class CPU(val numOfThreads: Int? = null) : Backend("CPU")
+  data class CPU(
+    val threadCount: Int? = null,
+    @Deprecated("Use threadCount instead", ReplaceWith("threadCount")) val numOfThreads: Int? = null,
+  ) : Backend("CPU")
 
   class GPU : Backend("GPU")
 

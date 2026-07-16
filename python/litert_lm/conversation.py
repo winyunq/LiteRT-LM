@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import collections.abc
+import ctypes
 import json
 import logging
 import queue
@@ -23,7 +24,9 @@ from typing import Any
 
 from . import interfaces
 from ._ffi import STREAM_CALLBACK_TYPE
-from ._messages import Contents, Message, normalize_message
+from ._messages import Contents
+from ._messages import Message
+from ._messages import normalize_message
 
 
 class Conversation(interfaces.AbstractConversation):
@@ -41,6 +44,8 @@ class Conversation(interfaces.AbstractConversation):
       automatic_tool_calling=True,
       extra_context=None,
       sampler_config=None,
+      lora_config=None,
+      max_output_tokens=None,
   ):
     super().__init__(
         messages=messages,
@@ -49,6 +54,8 @@ class Conversation(interfaces.AbstractConversation):
         automatic_tool_calling=automatic_tool_calling,
         extra_context=extra_context,
         sampler_config=sampler_config,
+        lora_config=lora_config,
+        max_output_tokens=max_output_tokens,
     )
     self._lib = lib
     self._ptr = conv_ptr
@@ -115,11 +122,31 @@ class Conversation(interfaces.AbstractConversation):
 
     return tool_responses
 
-  # TODO - b/482060476: Change the return type to "Message".
+  def _create_optional_args(
+      self, max_output_tokens: int | None
+  ) -> ctypes.c_void_p | None:
+    """Creates a C pointer for ConversationOptionalArgs if needed."""
+    if max_output_tokens is None:
+      return None
+    ptr = self._lib.litert_lm_conversation_optional_args_create()
+    self._lib.litert_lm_conversation_optional_args_set_max_output_tokens(
+        ptr, max_output_tokens
+    )
+    return ptr
+
+  def _delete_optional_args(self, ptr: ctypes.c_void_p | None) -> None:
+    """Deletes the ConversationOptionalArgs C pointer."""
+    if ptr:
+      self._lib.litert_lm_conversation_optional_args_delete(ptr)
+
+  # TODO: b/482060476 - Change the return type to "Message".
   def send_message(
       self,
       message: str | Contents | Message | collections.abc.Mapping[str, Any],
+      *,
+      max_output_tokens: int | None = None,
   ) -> collections.abc.Mapping[str, Any]:
+    """See base class."""
     if not self._ptr:
       raise RuntimeError("Conversation is closed.")
     current_message = normalize_message(message)
@@ -128,19 +155,26 @@ class Conversation(interfaces.AbstractConversation):
       msg_json = json.dumps(current_message)
       ctx_json = json.dumps(getattr(self, "extra_context", {}))
 
-      resp_ptr = self._lib.litert_lm_conversation_send_message(
-          self._ptr, msg_json, ctx_json,
-          # TODO(b/508420269): Add visual token budget option.
-          None,
-      )
-      if not resp_ptr:
-        raise RuntimeError("litert_lm_conversation_send_message failed")
-
+      optional_args_ptr = self._create_optional_args(max_output_tokens)
       try:
-        resp_str = self._lib.litert_lm_json_response_get_string(resp_ptr)
-        response_dict = json.loads(resp_str.decode("utf-8")) if resp_str else {}
+        resp_ptr = self._lib.litert_lm_conversation_send_message(
+            self._ptr,
+            msg_json,
+            ctx_json,
+            optional_args_ptr,
+        )
+        if not resp_ptr:
+          raise RuntimeError("litert_lm_conversation_send_message failed")
+
+        try:
+          resp_str = self._lib.litert_lm_json_response_get_string(resp_ptr)
+          response_dict = (
+              json.loads(resp_str.decode("utf-8")) if resp_str else {}
+          )
+        finally:
+          self._lib.litert_lm_json_response_delete(resp_ptr)
       finally:
-        self._lib.litert_lm_json_response_delete(resp_ptr)
+        self._delete_optional_args(optional_args_ptr)
 
       if not self.automatic_tool_calling:
         return response_dict
@@ -154,7 +188,10 @@ class Conversation(interfaces.AbstractConversation):
   def send_message_async(
       self,
       message: str | Contents | Message | collections.abc.Mapping[str, Any],
+      *,
+      max_output_tokens: int | None = None,
   ) -> collections.abc.Iterator[collections.abc.Mapping[str, Any]]:
+    """See base class."""
     if not self._ptr:
       raise RuntimeError("Conversation is closed.")
     current_message = normalize_message(message)
@@ -173,15 +210,20 @@ class Conversation(interfaces.AbstractConversation):
 
       c_callback = STREAM_CALLBACK_TYPE(callback)
       self._current_callback = c_callback
-      res = self._lib.litert_lm_conversation_send_message_stream(
-          self._ptr,
-          msg_json,
-          ctx_json,
-          # TODO(b/508420269): Add visual token budget option.
-          None,
-          c_callback,
-          None,
-      )
+
+      optional_args_ptr = self._create_optional_args(max_output_tokens)
+      try:
+        res = self._lib.litert_lm_conversation_send_message_stream(
+            self._ptr,
+            msg_json,
+            ctx_json,
+            optional_args_ptr,
+            c_callback,
+            None,
+        )
+      finally:
+        self._delete_optional_args(optional_args_ptr)
+
       if res != 0:
         raise RuntimeError("litert_lm_conversation_send_message_stream failed")
 

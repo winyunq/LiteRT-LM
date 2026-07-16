@@ -28,9 +28,8 @@
 #include "litert/cc/litert_buffer_ref.h"  // from @litert
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "litert/cc/litert_model.h"  // from @litert
+#include "support/tokenizer/sentencepiece_tokenizer.h"  // from @litert
 #include "runtime/components/model_resources.h"
-#include "runtime/components/sentencepiece_tokenizer.h"
-#include "runtime/components/tokenizer.h"
 #include "runtime/util/metadata_util.h"
 #include "runtime/util/model_asset_bundle_resources.h"
 #include "runtime/util/status_macros.h"
@@ -39,6 +38,7 @@ namespace litert::lm {
 
 using ::litert::BufferRef;
 using ::litert::Model;
+using ::litert::support::SentencePieceTokenizer;
 
 // static
 absl::StatusOr<std::unique_ptr<ModelResources>> ModelResourcesTask::Create(

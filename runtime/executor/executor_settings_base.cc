@@ -73,9 +73,9 @@ absl::StatusOr<Backend> GetBackendFromString(absl::string_view backend_str) {
     return Backend::GOOGLE_TENSOR_ARTISAN;
   } else {
     return absl::InvalidArgumentError(
-        absl::StrCat("Unsupported backend: ", backend_str,
-                     ". Supported backends are: [CPU, GPU, NPU, GPU_ARTISAN, "
-                     "CPU_ARTISAN, GOOGLE_TENSOR_ARTISAN]"));
+      absl::StrCat("Unsupported backend: ", backend_str,
+                   ". Supported backends are: [CPU, GPU, NPU, GPU_ARTISAN, "
+                   "CPU_ARTISAN, GOOGLE_TENSOR_ARTISAN]"));
   }
 }
 
@@ -253,7 +253,12 @@ std::ostream& operator<<(std::ostream& os, const ModelAssets& model_assets) {
   } else if (model_assets.HasDataStream()) {
     os << "model_file is loading from a data stream\n";
   } else {
-    os << "model_path: " << model_assets.GetPath().value() << "\n";
+    const auto& model_path = model_assets.GetPath();
+    if (model_path.ok()) {
+      os << "model_path: " << model_path.value() << "\n";
+    } else {
+      os << "model_path is empty \n";
+    }
   }
   os << "fake_weights_mode: " << model_assets.fake_weights_mode() << "\n";
   return os;
@@ -303,7 +308,7 @@ absl::StatusOr<
 ExecutorSettingsBase::GetWeightCacheFile(absl::string_view suffix,
                                          bool check_and_clean) const {
   // Cache is explicitly disabled.
-  if (GetCacheDir() == ":nocache") {
+  if (GetCacheDir() == ":nocache" || disable_weight_cache_) {
     return absl::InvalidArgumentError("Cache is explicitly disabled.");
   }
 
@@ -312,7 +317,12 @@ ExecutorSettingsBase::GetWeightCacheFile(absl::string_view suffix,
     return GetScopedCacheFile();
   }
 
-  ASSIGN_OR_RETURN(auto model_path, GetModelAssets().GetPath());
+  const auto& model_path = GetModelAssets().GetPath().value_or("");
+  if (model_path.empty()) {
+    // No model path to suffix and rest of the processing can be skipped.
+    return absl::InvalidArgumentError(
+        "Weight cache path cannot be computed with an empty model path.");
+  }
 
   // Get unique identifier based on the model file's content and metadata.
   std::string metadata_id = "";
@@ -323,18 +333,18 @@ ExecutorSettingsBase::GetWeightCacheFile(absl::string_view suffix,
                       << ": " << id_or.status();
   }
 
-  std::string path;
+  std::string cache_path;
   if (GetCacheDir().empty()) {
-    path = absl::StrCat(model_path, suffix, metadata_id);
+    cache_path = absl::StrCat(model_path, suffix, metadata_id);
   } else {
     ASSIGN_OR_RETURN(
-        path, JoinPath(GetCacheDir(), absl::StrCat(Basename(model_path), suffix,
-                                                   metadata_id)));
+        cache_path, JoinPath(GetCacheDir(), absl::StrCat(Basename(model_path),
+                                                         suffix, metadata_id)));
   }
 
   // Try to delete stale caches if the current cache file doesn't exist.
   if (check_and_clean) {
-    if (!FileExists(path)) {
+    if (!FileExists(cache_path)) {
       std::string dir_to_clean = GetCacheDir().empty()
                                      ? std::string(Dirname(model_path))
                                      : GetCacheDir();
@@ -350,7 +360,7 @@ ExecutorSettingsBase::GetWeightCacheFile(absl::string_view suffix,
     }
   }
 
-  return path;
+  return cache_path;
 }
 
 absl::StatusOr<
@@ -358,7 +368,7 @@ absl::StatusOr<
 ExecutorSettingsBase::GetProgramCacheFile(absl::string_view suffix,
                                           bool check_and_clean) const {
   // Cache is explicitly disabled.
-  if (GetCacheDir() == ":nocache") {
+  if (GetCacheDir() == ":nocache" || disable_program_cache_) {
     return absl::InvalidArgumentError("Cache is explicitly disabled.");
   }
 
@@ -367,7 +377,12 @@ ExecutorSettingsBase::GetProgramCacheFile(absl::string_view suffix,
     return GetScopedProgramCacheFile();
   }
 
-  ASSIGN_OR_RETURN(auto model_path, GetModelAssets().GetPath());
+  const auto& model_path = GetModelAssets().GetPath().value_or("");
+  if (model_path.empty()) {
+    // No model path to suffix and rest of the processing can be skipped.
+    return absl::InvalidArgumentError(
+        "Program cache path cannot be computed with an empty model path.");
+  }
 
   // Get unique identifier based on the model file's content and metadata.
   std::string metadata_id = "";
@@ -378,19 +393,19 @@ ExecutorSettingsBase::GetProgramCacheFile(absl::string_view suffix,
                       << ": " << id_or.status();
   }
 
-  std::string path;
+  std::string cache_path;
   if (GetCacheDir().empty()) {
-    path = absl::StrCat(model_path, metadata_id, suffix);
+    cache_path = absl::StrCat(model_path, metadata_id, suffix);
   } else {
     ASSIGN_OR_RETURN(
-        path, JoinPath(GetCacheDir(), absl::StrCat(Basename(model_path),
-                                                   metadata_id, suffix)));
+        cache_path, JoinPath(GetCacheDir(), absl::StrCat(Basename(model_path),
+                                                         metadata_id, suffix)));
   }
 
   // Try to delete stale caches if the current cache file doesn't exist.
   if (check_and_clean) {
-    if (!FileExists(path)) {
-      ABSL_LOG(INFO) << "File does not exist: " << path
+    if (!FileExists(cache_path)) {
+      ABSL_LOG(INFO) << "File does not exist: " << cache_path
                      << " Cleaning stale caches.";
       std::string dir_to_clean = GetCacheDir().empty()
                                      ? std::string(Dirname(model_path))
@@ -407,7 +422,7 @@ ExecutorSettingsBase::GetProgramCacheFile(absl::string_view suffix,
     }
   }
 
-  return path;
+  return cache_path;
 }
 
 }  // namespace litert::lm

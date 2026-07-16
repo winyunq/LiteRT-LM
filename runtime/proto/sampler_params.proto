@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-
 syntax = "proto3";
 
 package litert.lm.proto;
@@ -46,5 +45,17 @@ message SamplerParameters {
   float temperature = 4;
   // The seed used to initialize the random number generator.
   optional int32 seed = 5;
-}
 
+  // The backend to use for sampling.
+  enum Backend {
+    // Use the default backend, which is the same backend as the main model.
+    UNSPECIFIED = 0;
+    // Use the CPU for sampling.
+    CPU = 1;
+    // Use the GPU for sampling.
+    GPU = 2;
+  }
+  // The specific backend used for sampling. If not specified, the default
+  // backend will be used.
+  Backend backend = 6;
+}

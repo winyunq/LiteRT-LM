@@ -3,8 +3,8 @@
 The JavaScript API of LiteRT-LM for running LLMs in the browser. This is an
 early preview that supports text-in / text-out running in WebGPU.
 [LiteRT-LM](https://www.google.com/url?sa=D&q=https%3A%2F%2Fai.google.dev%2Fedge%2Flitert-lm%2F)
-is a production-ready, open-source inference framework designed to deliver
-high-performance, cross-platform LLM deployments on edge devices.
+is the **production-ready** orchestration layer to run LLMs with LiteRT,
+engineered for **high-performance**, **cross-platform** execution.
 
 -   **Documentation**: [https://ai.google.dev/edge/litert-lm/js](https://ai.google.dev/edge/litert-lm/js)
 -   **GitHub**: [https://github.com/google-ai-edge/LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM)

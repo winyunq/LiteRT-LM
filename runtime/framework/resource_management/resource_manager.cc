@@ -465,6 +465,24 @@ class LockedLlmExecutor : public LlmExecutor {
   MovableMutexLock lock_;
 };
 
+ResourceManager::~ResourceManager() {
+  {
+    absl::MutexLock lock(vision_executor_mutex_);
+    vision_executor_.reset();
+  }
+  {
+    absl::MutexLock lock(audio_executor_mutex_);
+    audio_executor_.reset();
+  }
+  {
+    absl::MutexLock lock(executor_mutex_);
+    llm_executor_.reset();
+  }
+
+  // Environment is only released after all the executors are destroyed.
+  backup_litert_env_.reset();
+}
+
 ResourceManager::ResourceManager(
     ModelResources* absl_nullable model_resources,
     std::unique_ptr<LlmExecutor> llm_executor,
@@ -811,15 +829,12 @@ absl::Status ResourceManager::TryLoadingAudioExecutor() {
   if (!audio_executor_settings_) {
     return absl::InvalidArgumentError("Audio options should not be null.");
   }
-  if (audio_executor_settings_->GetBackend() == litert::lm::Backend::CPU ||
-      audio_executor_settings_->GetBackend() == litert::lm::Backend::GPU) {
+  {
     RETURN_IF_ERROR(MaybeCreateLitertEnv());
+    RET_CHECK_NE(litert_env_, nullptr);
     ASSIGN_OR_RETURN(audio_executor_,
                      litert::lm::AudioLiteRtCompiledModelExecutor::Create(
                          *audio_executor_settings_, *litert_env_));
-  } else {
-    return absl::InvalidArgumentError(
-        "Audio executor backend is not supported.");
   }
   return absl::OkStatus();
 }

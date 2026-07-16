@@ -14,10 +14,16 @@
 
 #include "runtime/executor/llm_executor_settings_utils.h"
 
+#include <filesystem>  // NOLINT: Required for path manipulation.
+#include <optional>
+#include <string>
+#include <utility>
+
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"  // from @com_google_absl
 #include "runtime/executor/executor_settings_base.h"
+#include "runtime/executor/llm_executor_settings.h"
 #include "runtime/util/test_utils.h"  // IWYU pragma: keep
 
 namespace litert::lm {

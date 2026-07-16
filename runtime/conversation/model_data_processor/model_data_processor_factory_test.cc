@@ -25,9 +25,6 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/status_matchers.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl  // IWYU pragma: keep
-#include "runtime/util/test_utils.h"  // IWYU pragma: keep
-#include "runtime/components/sentencepiece_tokenizer.h"
-#include "runtime/components/tokenizer.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/config_registry.h"
 #include "runtime/conversation/model_data_processor/fastvlm_data_processor_config.h"
@@ -39,6 +36,7 @@
 #include "runtime/conversation/model_data_processor/qwen3_data_processor_config.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/proto/llm_model_type.pb.h"
+#include "runtime/util/test_utils.h"  // IWYU pragma: keep
 
 namespace litert::lm {
 namespace {
@@ -82,6 +80,42 @@ TEST_F(ModelDataProcessorFactoryTest, CreateGenericModelDataProcessor) {
   EXPECT_THAT(processor->ToInputDataVector("test prompt", {},
                                            Gemma3DataProcessorArguments()),
               StatusIs(absl::StatusCode::kInvalidArgument));
+}
+
+TEST_F(ModelDataProcessorFactoryTest,
+       CreateGenericModelDataProcessorMultimodal) {
+  proto::LlmModelType llm_model_type;
+  auto* generic_model = llm_model_type.mutable_generic_model();
+  generic_model->set_image_enabled(true);
+  generic_model->set_audio_enabled(true);
+  generic_model->set_image_tensor_height(224);
+  generic_model->set_image_tensor_width(128);
+  generic_model->set_audio_sample_rate_hz(16000);
+  generic_model->set_audio_fft_padding_type(proto::FFT_PADDING_TYPE_CENTER);
+
+  ASSERT_OK_AND_ASSIGN(
+      auto config, CreateDataProcessorConfigFromLlmModelType(llm_model_type));
+  ASSERT_TRUE(std::holds_alternative<GenericDataProcessorConfig>(config));
+
+  const auto& generic_config = std::get<GenericDataProcessorConfig>(config);
+  ASSERT_TRUE(generic_config.multimodal.has_value());
+  EXPECT_TRUE(generic_config.multimodal->image_enabled);
+  EXPECT_TRUE(generic_config.multimodal->audio_enabled);
+
+  // Check target dimensions are set correctly.
+  const auto& dims = generic_config.multimodal->image_preprocess_parameter
+                         .GetTargetDimensions();
+  ASSERT_GE(dims.size(), 3);
+  EXPECT_EQ(dims[1], 224);
+  EXPECT_EQ(dims[2], 128);
+
+  // Check audio config fft padding type is set correctly.
+  EXPECT_EQ(
+      generic_config.multimodal->audio_preprocessor_config.GetFftPaddingType(),
+      AudioPreprocessorConfig::FftPaddingType::kCenter);
+
+  ASSERT_OK_AND_ASSIGN(auto processor, CreateModelDataProcessor(config));
+  EXPECT_NE(processor, nullptr);
 }
 
 TEST_F(ModelDataProcessorFactoryTest, CreateGemma3DataProcessor) {

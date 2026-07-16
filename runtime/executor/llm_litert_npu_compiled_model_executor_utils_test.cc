@@ -777,6 +777,64 @@ TEST_F(ExecutorUtilsTest, HWMaskUpdateGemma3Decode) {
   EXPECT_EQ(global_lock.second[1280], valid_val);
 }
 
+TEST_F(ExecutorUtilsTest, HWMaskUpdateWithValidMask) {
+  int seq_q = 128;
+  int seq_k = 1408;
+  int time_step = 0;
+
+  absl::flat_hash_map<absl::string_view, TensorBuffer> in_buffers;
+  std::vector<int32_t> time_step_data = {time_step};
+  in_buffers.emplace("time_step",
+                     CreateTensorBuffer(time_step_data, ElementType::Int32));
+
+  // 50 valid tokens in valid_mask, rest are padding (false)
+  std::vector<uint8_t> valid_mask_data(seq_q, false);
+  for (int i = 0; i < 50; ++i) {
+    valid_mask_data[i] = true;
+  }
+  in_buffers.emplace("valid_mask",
+                     CreateTensorBuffer(valid_mask_data, ElementType::Bool));
+
+  // We pass input_tokens with ALL valid (0) to ensure it uses valid_mask
+  // instead
+  std::vector<int32_t> input_tokens_data(seq_q, 0);
+  in_buffers.emplace("input_tokens",
+                     CreateTensorBuffer(input_tokens_data, ElementType::Int32));
+
+  absl::flat_hash_map<absl::string_view, TensorBuffer> out_buffers;
+  std::vector<int8_t> mask_data(seq_q * seq_k, 0);
+  out_buffers.emplace("mask_local",
+                      CreateTensorBufferWithDims(mask_data, ElementType::Int8,
+                                                 {1, seq_q, seq_k}));
+  out_buffers.emplace("mask_global",
+                      CreateTensorBufferWithDims(mask_data, ElementType::Int8,
+                                                 {1, seq_q, seq_k}));
+
+  ASSERT_TRUE(HWMaskUpdate(in_buffers, out_buffers).ok());
+
+  auto global_lock_expected = TensorBufferScopedLock::Create<int8_t>(
+      out_buffers.at("mask_global"), TensorBuffer::LockMode::kRead);
+  ASSERT_TRUE(global_lock_expected);
+  auto& global_lock = *global_lock_expected;
+
+  int8_t valid_val = 127;
+  int8_t masked_val = -128;
+
+  // Check row q = 100
+  // k_rel = k - 1280.
+  // We expect valid_val for k_rel < 50.
+  // We expect masked_val for 50 <= k_rel <= 100.
+  int64_t row_offset = 100 * seq_k;
+  for (int k_rel = 0; k_rel < 50; ++k_rel) {
+    EXPECT_EQ(global_lock.second[row_offset + 1280 + k_rel], valid_val)
+        << "k_rel " << k_rel;
+  }
+  for (int k_rel = 50; k_rel <= 100; ++k_rel) {
+    EXPECT_EQ(global_lock.second[row_offset + 1280 + k_rel], masked_val)
+        << "k_rel " << k_rel;
+  }
+}
+
 TEST_F(ExecutorUtilsTest, HWPerLayerEmbeddingLookupFloat32) {
   constexpr int kNumTables = 2;
   constexpr int kColSize = 4;
@@ -808,7 +866,7 @@ TEST_F(ExecutorUtilsTest, HWPerLayerEmbeddingLookupFloat32) {
 
   auto status = HWPerLayerEmbeddingLookup(
       token_ids.data(), num_tokens, table_ptrs.data(), qp, kNumTables, kColSize,
-      output.data(), litert::ElementType::Float32);
+      output.data(), litert::ElementType::Float32, litert::ElementType::Int4);
 
   ASSERT_TRUE(status.ok());
 
@@ -847,7 +905,8 @@ TEST_F(ExecutorUtilsTest, HWPerLayerEmbeddingLookupInt16) {
 
   auto status = HWPerLayerEmbeddingLookup(
       token_ids.data(), num_tokens, table_ptrs.data(), qp, kNumTables, kColSize,
-      output.data(), litert::ElementType::Int16, final_scale, final_zero_point);
+      output.data(), litert::ElementType::Int16, litert::ElementType::Int4,
+      1.0f, final_scale, final_zero_point);
 
   ASSERT_TRUE(status.ok());
 
@@ -883,13 +942,75 @@ TEST_F(ExecutorUtilsTest, HWPerLayerEmbeddingLookupNeon) {
 
   auto status = HWPerLayerEmbeddingLookup(
       token_ids.data(), num_tokens, table_ptrs.data(), qp, kNumTables, kColSize,
-      output.data(), litert::ElementType::Float32);
+      output.data(), litert::ElementType::Float32, litert::ElementType::Int4);
 
   ASSERT_TRUE(status.ok());
 
   for (size_t i = 0; i < output.size(); ++i) {
     EXPECT_NEAR(output[i], static_cast<float>(table0_unpacked[i]), 1e-5)
         << "Index " << i;
+  }
+}
+
+TEST_F(ExecutorUtilsTest, HWPerLayerEmbeddingLookupInt8Float32WithScale) {
+  constexpr int kNumTables = 2;
+  constexpr int kColSize = 4;
+
+  // Raw Int8 table data (no packing needed).
+  std::vector<int8_t> table0 = {0, 1, 2, 3, -1, -2, -3, -4,
+                                4, 5, 6, 7, -5, -6, -7, -8};
+  std::vector<int8_t> table1 = {0,  -1, -2, -3, 4, 5, 6, 7,
+                                -4, -5, -6, -7, 1, 2, 3, -8};
+
+  std::vector<const uint8_t*> table_ptrs = {
+      reinterpret_cast<const uint8_t*>(table0.data()),
+      reinterpret_cast<const uint8_t*>(table1.data())};
+
+  std::vector<float> scales0 = {1.0f, 2.0f, 0.5f, 1.0f};
+  std::vector<float> scales1 = {0.5f};
+
+  HWQuantizationParams qp[kNumTables];
+  qp[0].scales = scales0.data();
+  qp[0].is_per_channel = true;
+  qp[1].scales = scales1.data();
+  qp[1].is_per_channel = false;
+
+  std::vector<int32_t> token_ids = {1, 2};
+  int num_tokens = token_ids.size();
+
+  std::vector<float> output(num_tokens * kNumTables * kColSize, 0.0f);
+
+  // Apply a final scaling factor of 16.0f (mimicking Gemma's sqrt(d_model)).
+  float final_scale = 16.0f;
+
+  auto status = HWPerLayerEmbeddingLookup(
+      token_ids.data(), num_tokens, table_ptrs.data(), qp, kNumTables, kColSize,
+      output.data(), litert::ElementType::Float32, litert::ElementType::Int8,
+      final_scale);
+
+  ASSERT_TRUE(status.ok());
+
+  // Expected output:
+  // For Token 1 (t=0):
+  //   Table 0: row=[-1, -2, -3, -4], scale=scales0[1]=2.0, final_scale=16.0 ->
+  //   val * 32.0
+  //            expected = [-32.0, -64.0, -96.0, -128.0]
+  //   Table 1: row=[4, 5, 6, 7], scale=scales1[0]=0.5, final_scale=16.0 -> val
+  //   * 8.0
+  //            expected = [32.0, 40.0, 48.0, 56.0]
+  // For Token 2 (t=1):
+  //   Table 0: row=[4, 5, 6, 7], scale=scales0[2]=0.5, final_scale=16.0 -> val
+  //   * 8.0
+  //            expected = [32.0, 40.0, 48.0, 56.0]
+  //   Table 1: row=[-4, -5, -6, -7], scale=scales1[0]=0.5, final_scale=16.0 ->
+  //   val * 8.0
+  //            expected = [-32.0, -40.0, -48.0, -56.0]
+  std::vector<float> expected_output = {
+      -32.0f, -64.0f, -96.0f, -128.0f, 32.0f,  40.0f,  48.0f,  56.0f,
+      32.0f,  40.0f,  48.0f,  56.0f,   -32.0f, -40.0f, -48.0f, -56.0f};
+
+  for (size_t i = 0; i < output.size(); ++i) {
+    EXPECT_NEAR(output[i], expected_output[i], 1e-5) << "Index " << i;
   }
 }
 
@@ -1241,6 +1362,246 @@ TEST_F(ExecutorUtilsTest, DequantizeLogitsInt8) {
         scale * (static_cast<float>(quantized_data[i]) - zero_point);
     EXPECT_NEAR(lock.second[i], expected, 1e-5);
   }
+}
+
+TEST_F(ExecutorUtilsTest, WritePleEmbeddingsFloat32) {
+  std::vector<float> ple_embeddings = {1.0f, 2.0f, 3.0f, 4.0f};
+  TensorBuffer buffer =
+      CreateTensorBuffer(std::vector<float>(4, 0.0f), ElementType::Float32);
+
+  ASSERT_TRUE(
+      WritePleEmbeddings(buffer, ple_embeddings, ElementType::Float32, 1.0f, 0)
+          .ok());
+
+  auto lock_expected = TensorBufferScopedLock::Create<float>(
+      buffer, TensorBuffer::LockMode::kRead);
+  ASSERT_TRUE(lock_expected.HasValue());
+  auto& lock = *lock_expected;
+
+  for (size_t i = 0; i < ple_embeddings.size(); ++i) {
+    EXPECT_EQ(lock.second[i], ple_embeddings[i]);
+  }
+}
+
+TEST_F(ExecutorUtilsTest, WritePleEmbeddingsInt16) {
+  std::vector<float> ple_embeddings = {1.0f, -2.0f, 3.5f, -4.5f};
+  float scale = 0.5f;
+  int32_t zero_point = 10;
+  TensorBuffer buffer =
+      CreateTensorBuffer(std::vector<int16_t>(4, 0), ElementType::Int16);
+
+  ASSERT_TRUE(WritePleEmbeddings(buffer, ple_embeddings, ElementType::Int16,
+                                 scale, zero_point)
+                  .ok());
+
+  auto lock_expected = TensorBufferScopedLock::Create<int16_t>(
+      buffer, TensorBuffer::LockMode::kRead);
+  ASSERT_TRUE(lock_expected.HasValue());
+  auto& lock = *lock_expected;
+
+  for (size_t i = 0; i < ple_embeddings.size(); ++i) {
+    int16_t expected = Quantize<int16_t>(ple_embeddings[i], scale, zero_point);
+    EXPECT_EQ(lock.second[i], expected);
+  }
+}
+
+TEST_F(ExecutorUtilsTest, WritePleEmbeddingsInt16InsufficientCapacity) {
+  std::vector<float> ple_embeddings = {1.0f, -2.0f, 3.5f, -4.5f};
+  float scale = 0.5f;
+  int32_t zero_point = 10;
+  // Buffer size 3 instead of 4
+  TensorBuffer buffer =
+      CreateTensorBuffer(std::vector<int16_t>(3, 0), ElementType::Int16);
+
+  EXPECT_FALSE(WritePleEmbeddings(buffer, ple_embeddings, ElementType::Int16,
+                                  scale, zero_point)
+                   .ok());
+}
+
+TEST_F(ExecutorUtilsTest, WriteAndPadPleEmbeddingsFloat32) {
+  std::vector<float> ple_embeddings = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+  size_t ple_dim = 3;
+  size_t seq_pos_size = 2;
+  std::vector<float> default_ple_emb = {0.1f, 0.2f, 0.3f};
+
+  TensorBuffer buffer = CreateTensorBufferWithDims(
+      std::vector<float>(4 * ple_dim, 0.0f), ElementType::Float32,
+      {1, 4, (int32_t)ple_dim});
+
+  ASSERT_TRUE(WriteAndPadPleEmbeddings(buffer, ple_embeddings, ple_dim,
+                                       seq_pos_size, default_ple_emb,
+                                       ElementType::Float32, 1.0f, 0)
+                  .ok());
+
+  auto lock_expected = TensorBufferScopedLock::Create<float>(
+      buffer, TensorBuffer::LockMode::kRead);
+  ASSERT_TRUE(lock_expected.HasValue());
+  auto& lock = *lock_expected;
+
+  for (size_t i = 0; i < ple_embeddings.size(); ++i) {
+    EXPECT_EQ(lock.second[i], ple_embeddings[i]);
+  }
+
+  for (size_t t = seq_pos_size; t < 4; ++t) {
+    for (size_t d = 0; d < ple_dim; ++d) {
+      EXPECT_EQ(lock.second[t * ple_dim + d], default_ple_emb[d]);
+    }
+  }
+}
+
+TEST_F(ExecutorUtilsTest, WriteAndPadPleEmbeddingsInt16) {
+  std::vector<float> ple_embeddings = {1.0f, -2.0f, 3.0f, -4.0f, 5.0f, -6.0f};
+  size_t ple_dim = 3;
+  size_t seq_pos_size = 2;
+  std::vector<float> default_ple_emb = {0.5f, -0.5f, 1.5f};
+  float scale = 0.5f;
+  int32_t zero_point = 10;
+
+  TensorBuffer buffer =
+      CreateTensorBufferWithDims(std::vector<int16_t>(4 * ple_dim, 0),
+                                 ElementType::Int16, {1, 4, (int32_t)ple_dim});
+
+  ASSERT_TRUE(WriteAndPadPleEmbeddings(buffer, ple_embeddings, ple_dim,
+                                       seq_pos_size, default_ple_emb,
+                                       ElementType::Int16, scale, zero_point)
+                  .ok());
+
+  auto lock_expected = TensorBufferScopedLock::Create<int16_t>(
+      buffer, TensorBuffer::LockMode::kRead);
+  ASSERT_TRUE(lock_expected.HasValue());
+  auto& lock = *lock_expected;
+
+  for (size_t i = 0; i < ple_embeddings.size(); ++i) {
+    int16_t expected = Quantize<int16_t>(ple_embeddings[i], scale, zero_point);
+    EXPECT_EQ(lock.second[i], expected);
+  }
+
+  for (size_t t = seq_pos_size; t < 4; ++t) {
+    for (size_t d = 0; d < ple_dim; ++d) {
+      int16_t expected =
+          Quantize<int16_t>(default_ple_emb[d], scale, zero_point);
+      EXPECT_EQ(lock.second[t * ple_dim + d], expected);
+    }
+  }
+}
+
+TEST_F(ExecutorUtilsTest, WriteAndPadPleEmbeddingsFloat32NoDefault) {
+  std::vector<float> ple_embeddings = {1.0f, 2.0f, 3.0f, -4.0f, 5.0f, 6.0f};
+  size_t ple_dim = 3;
+  size_t seq_pos_size = 2;
+  std::vector<float> default_ple_emb = {};
+
+  TensorBuffer buffer = CreateTensorBufferWithDims(
+      std::vector<float>(4 * ple_dim, -1.0f), ElementType::Float32,
+      {1, 4, (int32_t)ple_dim});
+
+  ASSERT_TRUE(WriteAndPadPleEmbeddings(buffer, ple_embeddings, ple_dim,
+                                       seq_pos_size, default_ple_emb,
+                                       ElementType::Float32, 1.0f, 0)
+                  .ok());
+
+  auto lock_expected = TensorBufferScopedLock::Create<float>(
+      buffer, TensorBuffer::LockMode::kRead);
+  ASSERT_TRUE(lock_expected.HasValue());
+  auto& lock = *lock_expected;
+
+  for (size_t i = 0; i < ple_embeddings.size(); ++i) {
+    EXPECT_EQ(lock.second[i], ple_embeddings[i]);
+  }
+
+  for (size_t t = seq_pos_size; t < 4; ++t) {
+    for (size_t d = 0; d < ple_dim; ++d) {
+      EXPECT_EQ(lock.second[t * ple_dim + d], 0.0f);
+    }
+  }
+}
+
+TEST_F(ExecutorUtilsTest, WriteAndPadPleEmbeddingsInt16NoDefault) {
+  std::vector<float> ple_embeddings = {1.0f, -2.0f, 3.0f, -4.0f, 5.0f, -6.0f};
+  size_t ple_dim = 3;
+  size_t seq_pos_size = 2;
+  std::vector<float> default_ple_emb = {};
+  float scale = 0.5f;
+  int32_t zero_point = 10;
+
+  TensorBuffer buffer =
+      CreateTensorBufferWithDims(std::vector<int16_t>(4 * ple_dim, -1),
+                                 ElementType::Int16, {1, 4, (int32_t)ple_dim});
+
+  ASSERT_TRUE(WriteAndPadPleEmbeddings(buffer, ple_embeddings, ple_dim,
+                                       seq_pos_size, default_ple_emb,
+                                       ElementType::Int16, scale, zero_point)
+                  .ok());
+
+  auto lock_expected = TensorBufferScopedLock::Create<int16_t>(
+      buffer, TensorBuffer::LockMode::kRead);
+  ASSERT_TRUE(lock_expected.HasValue());
+  auto& lock = *lock_expected;
+
+  for (size_t i = 0; i < ple_embeddings.size(); ++i) {
+    int16_t expected = Quantize<int16_t>(ple_embeddings[i], scale, zero_point);
+    EXPECT_EQ(lock.second[i], expected);
+  }
+
+  int16_t expected_padding = Quantize<int16_t>(0.0f, scale, zero_point);
+  for (size_t t = seq_pos_size; t < 4; ++t) {
+    for (size_t d = 0; d < ple_dim; ++d) {
+      EXPECT_EQ(lock.second[t * ple_dim + d], expected_padding);
+    }
+  }
+}
+
+TEST_F(ExecutorUtilsTest, WriteAndPadPleEmbeddingsInt16SizeMismatch) {
+  std::vector<float> ple_embeddings = {1.0f, -2.0f, 3.0f, -4.0f, 5.0f};
+  size_t ple_dim = 3;
+  size_t seq_pos_size = 2;
+  std::vector<float> default_ple_emb = {0.5f, -0.5f, 1.5f};
+  float scale = 0.5f;
+  int32_t zero_point = 10;
+
+  TensorBuffer buffer =
+      CreateTensorBufferWithDims(std::vector<int16_t>(4 * ple_dim, 0),
+                                 ElementType::Int16, {1, 4, (int32_t)ple_dim});
+
+  EXPECT_FALSE(WriteAndPadPleEmbeddings(buffer, ple_embeddings, ple_dim,
+                                        seq_pos_size, default_ple_emb,
+                                        ElementType::Int16, scale, zero_point)
+                   .ok());
+}
+
+TEST_F(ExecutorUtilsTest, WriteAndPadPleEmbeddingsInt16InsufficientCapacity) {
+  std::vector<float> ple_embeddings = {1.0f, -2.0f, 3.0f, -4.0f, 5.0f, -6.0f};
+  size_t ple_dim = 3;
+  size_t seq_pos_size = 2;
+  std::vector<float> default_ple_emb = {0.5f, -0.5f, 1.5f};
+  float scale = 0.5f;
+  int32_t zero_point = 10;
+
+  // Buffer only has capacity for 1 token, but seq_pos_size is 2.
+  TensorBuffer buffer =
+      CreateTensorBufferWithDims(std::vector<int16_t>(1 * ple_dim, 0),
+                                 ElementType::Int16, {1, 1, (int32_t)ple_dim});
+
+  EXPECT_FALSE(WriteAndPadPleEmbeddings(buffer, ple_embeddings, ple_dim,
+                                        seq_pos_size, default_ple_emb,
+                                        ElementType::Int16, scale, zero_point)
+                   .ok());
+}
+
+TEST(ExecutorUtilsQuantizeTest, QuantizeInt16) {
+  EXPECT_EQ(Quantize<int16_t>(10.0f, 2.0f, 5), 10);
+  EXPECT_EQ(Quantize<int16_t>(9.0f, 2.0f, 5), 10);
+  EXPECT_EQ(Quantize<int16_t>(-9.0f, 2.0f, 5), 0);
+  EXPECT_EQ(Quantize<int16_t>(100000.0f, 1.0f, 0), 32767);
+  EXPECT_EQ(Quantize<int16_t>(-100000.0f, 1.0f, 0), -32768);
+}
+
+TEST(ExecutorUtilsQuantizeTest, QuantizeInt8) {
+  EXPECT_EQ(Quantize<int8_t>(10.0f, 2.0f, 5), 10);
+  EXPECT_EQ(Quantize<int8_t>(9.0f, 2.0f, 5), 10);
+  EXPECT_EQ(Quantize<int8_t>(-9.0f, 2.0f, 5), 0);
+  EXPECT_EQ(Quantize<int8_t>(1000.0f, 1.0f, 0), 127);
+  EXPECT_EQ(Quantize<int8_t>(-1000.0f, 1.0f, 0), -128);
 }
 
 }  // namespace

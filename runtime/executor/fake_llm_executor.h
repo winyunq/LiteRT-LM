@@ -16,6 +16,7 @@
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_EXECUTOR_MOCK_LLM_EXECUTOR_H_
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -36,6 +37,13 @@ namespace litert::lm {
 // Fake LLM executor for testing.
 class FakeLlmExecutor : public LlmExecutor {
  public:
+  struct DecodeLogitsOptions {
+    float match_value = std::numeric_limits<float>::max();
+    float mismatch_value = std::numeric_limits<float>::lowest();
+    int end_token_id = -1;
+    float mismatch_end_token_value = std::numeric_limits<float>::lowest();
+  };
+
   // Creates a fake LLM executor with the given prefill and decode tokens.
   // - vocab_size: The vocabulary size of the LLM. It is used to determine the
   //   shape of the output logits TensorBuffer.
@@ -131,6 +139,11 @@ class FakeLlmExecutor : public LlmExecutor {
   // logic. The default value is 0, which means no delay.
   void SetDecodeDelay(absl::Duration delay) { decode_delay_ = delay; }
 
+  // Sets the options for the DecodeIdsToLogits function.
+  void SetDecodeLogitsOptions(const DecodeLogitsOptions& options) {
+    decode_logits_options_ = options;
+  }
+
   absl::Status Reset() override;
 
  private:
@@ -169,6 +182,9 @@ class FakeLlmExecutor : public LlmExecutor {
   // The delay before decoding. Useful for testing the cancellation logic.
   // The default value is 0, which means no delay.
   absl::Duration decode_delay_;
+
+  // The options for the DecodeIdsToLogits function.
+  DecodeLogitsOptions decode_logits_options_;
 
   enum class LastOp {
     kNone,

@@ -21,6 +21,7 @@ from absl.testing import absltest
 from click.testing import CliRunner
 from prompt_toolkit import key_binding
 
+import litert_lm
 from litert_lm_cli import common
 from litert_lm_cli import main
 from litert_lm_cli import model
@@ -176,6 +177,102 @@ class MainTest(absltest.TestCase):
       self.assertEqual(kwargs["temperature"], 0.8)
       self.assertEqual(kwargs["seed"], 42)
 
+  @unittest.mock.patch(
+      "litert_lm_cli.model.Model.from_model_reference"
+  )
+  @unittest.mock.patch(
+      "litert_lm_cli.commands.run.run_interactive"
+  )
+  def test_run_activation_data_type_flag(
+      self, mock_run_interactive, mock_from_model_ref
+  ):
+    mock_model = unittest.mock.MagicMock()
+    mock_from_model_ref.return_value = mock_model
+    mock_model.exists.return_value = True
+
+    for choice in ["fp32", "fp16", "int16", "int8"]:
+      mock_run_interactive.reset_mock()
+      runner = CliRunner()
+      result = runner.invoke(
+          main.cli,
+          [
+              "run",
+              "my-model",
+              "--prompt",
+              "hi",
+              f"--activation-data-type={choice}",
+          ],
+      )
+
+      self.assertEqual(result.exit_code, 0)
+      mock_run_interactive.assert_called_once()
+      kwargs = mock_run_interactive.call_args.kwargs
+      self.assertEqual(
+          kwargs["activation_data_type"],
+          litert_lm.ActivationDataType.from_str(choice),
+      )
+
+  def test_run_activation_data_type_flag_invalid(self):
+    runner = CliRunner()
+    result = runner.invoke(
+        main.cli,
+        [
+            "run",
+            "my-model",
+            "--prompt",
+            "hi",
+            "--activation-data-type=invalid",
+        ],
+    )
+    self.assertNotEqual(result.exit_code, 0)
+    self.assertIn("Invalid value for '--activation-data-type'", result.output)
+
+  @unittest.mock.patch(
+      "litert_lm_cli.model.Model.from_model_reference"
+  )
+  @unittest.mock.patch(
+      "litert_lm_cli.commands.benchmark.run_benchmark"
+  )
+  def test_benchmark_activation_data_type_flag(
+      self, mock_run_benchmark, mock_from_model_ref
+  ):
+    mock_model = unittest.mock.MagicMock()
+    mock_from_model_ref.return_value = mock_model
+    mock_model.exists.return_value = True
+
+    for choice in ["fp32", "fp16", "int16", "int8"]:
+      mock_run_benchmark.reset_mock()
+      runner = CliRunner()
+      result = runner.invoke(
+          main.cli,
+          [
+              "benchmark",
+              "my-model",
+              f"--activation-data-type={choice}",
+          ],
+      )
+
+      self.assertEqual(result.exit_code, 0)
+      mock_run_benchmark.assert_called_once()
+      kwargs = mock_run_benchmark.call_args.kwargs
+      self.assertEqual(
+          kwargs["activation_data_type"],
+          litert_lm.ActivationDataType.from_str(choice),
+      )
+
+  def test_benchmark_activation_data_type_flag_invalid(self):
+    runner = CliRunner()
+    result = runner.invoke(
+        main.cli,
+        [
+            "benchmark",
+            "my-model",
+            "--activation-data-type=invalid",
+        ],
+    )
+    self.assertNotEqual(result.exit_code, 0)
+    self.assertIn("Invalid value for '--activation-data-type'", result.output)
+
   def test_run_no_template_flag(self):
     runner = CliRunner()
     # Test that --no-template is a valid option for the run command.
@@ -308,7 +405,7 @@ class MainTest(absltest.TestCase):
   @unittest.mock.patch(
       "litert_lm_cli.commands.run.run_interactive"
   )
-  def test_run_with_audio_attachment_missing_backend(
+  def test_run_with_audio_attachment_default_backend(
       self, mock_run_interactive, mock_from_model_ref, mock_exists
   ):
     mock_model = unittest.mock.MagicMock()
@@ -329,11 +426,10 @@ class MainTest(absltest.TestCase):
     )
 
     self.assertEqual(result.exit_code, 0)
-    self.assertIn(
-        "Error: Audio attachments require --audio-backend to be set.",
-        result.output,
-    )
-    mock_run_interactive.assert_not_called()
+    mock_run_interactive.assert_called_once()
+    kwargs = mock_run_interactive.call_args.kwargs
+    self.assertIsNone(kwargs["audio_backend"])
+    self.assertIsNone(kwargs["vision_backend"])
 
   @unittest.mock.patch("os.path.exists", return_value=True)
   @unittest.mock.patch(
@@ -342,7 +438,7 @@ class MainTest(absltest.TestCase):
   @unittest.mock.patch(
       "litert_lm_cli.commands.run.run_interactive"
   )
-  def test_run_with_image_attachment_missing_backend(
+  def test_run_with_image_attachment_default_backend(
       self, mock_run_interactive, mock_from_model_ref, mock_exists
   ):
     mock_model = unittest.mock.MagicMock()
@@ -363,11 +459,10 @@ class MainTest(absltest.TestCase):
     )
 
     self.assertEqual(result.exit_code, 0)
-    self.assertIn(
-        "Error: Image attachments require --vision-backend to be set.",
-        result.output,
-    )
-    mock_run_interactive.assert_not_called()
+    mock_run_interactive.assert_called_once()
+    kwargs = mock_run_interactive.call_args.kwargs
+    self.assertIsNone(kwargs["audio_backend"])
+    self.assertIsNone(kwargs["vision_backend"])
 
   @unittest.mock.patch("os.path.exists", return_value=True)
   @unittest.mock.patch(
@@ -495,6 +590,18 @@ class MainTest(absltest.TestCase):
     self.assertIn("500.0 MB", result.output)
     self.assertIn("custom-model", result.output)
     self.assertNotIn("Unknown", result.output)
+
+  def test_run_invalid_cpu_thread_count(self):
+    runner = CliRunner()
+    result = runner.invoke(
+        main.cli,
+        ["run", "my-model", "--cpu-thread-count", "0"],
+    )
+    self.assertNotEqual(result.exit_code, 0)
+    self.assertIn(
+        "Invalid value for '--cpu-thread-count': 0 is not in the range x>=1.",
+        result.output,
+    )
 
 
 if __name__ == "__main__":

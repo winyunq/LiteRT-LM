@@ -12,13 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# [Google-internal load of `cc_library`]
-load("@rules_rust//rust:defs.bzl", "rust_library")
 load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
 
 package(
     default_visibility = [
-        "//:__subpackages__",
+        "//visibility:public",
     ],
 )
 
@@ -39,16 +37,12 @@ config_setting(
     visibility = ["//:__subpackages__"],
 )
 
-rust_library(
+alias(
     name = "global_allocator",
-    srcs = [
-        "global_allocator.rs",
-    ],
+    actual = "@litert//support/util:global_allocator",
 )
 
-cc_library(
+alias(
     name = "alloc_defs",
-    srcs = [
-        "alloc_defs.cc",
-    ],
+    actual = "@litert//support/util:alloc_defs",
 )

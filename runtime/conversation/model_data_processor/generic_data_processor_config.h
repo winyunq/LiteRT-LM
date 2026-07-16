@@ -15,18 +15,50 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_CONVERSATION_MODEL_DATA_PROCESSOR_GENERIC_DATA_PROCESSOR_CONFIG_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_CONVERSATION_MODEL_DATA_PROCESSOR_GENERIC_DATA_PROCESSOR_CONFIG_H_
 
+#include <optional>
 #include <string>
 
+#include "support/preprocessor/audio_preprocessor.h"  // from @litert
+#include "support/preprocessor/image_preprocessor.h"  // from @litert
+#include "runtime/conversation/model_data_processor/multimodal_processor_helper.h"
+
 namespace litert::lm {
+
+using ImagePreprocessParameter = ::litert::support::ImagePreprocessParameter;
+using AudioPreprocessorConfig = ::litert::support::AudioPreprocessorConfig;
+
+// Configuration for multimodal processing in the generic data processor.
+struct MultimodalConfig {
+  // Image modality related config.
+  // Whether to enable image modality.
+  bool image_enabled = false;
+  // Parameters for image preprocessing.
+  ImagePreprocessParameter image_preprocess_parameter;
+
+  // Audio modality related config.
+  // Whether to enable audio modality.
+  bool audio_enabled = false;
+  // Configuration for audio preprocessing.
+  AudioPreprocessorConfig audio_preprocessor_config =
+      AudioPreprocessorConfig::CreateDefaultUsmConfig();
+
+  // Configuration for prompt processing.
+  MultimodalPromptProcessingConfig processing_config;
+};
 
 struct GenericDataProcessorConfig {
   std::string model_role = "assistant";
   // If true, force the content from the model to be a string instead of an
   // array. Some legacy templates only support string content.
   bool force_string_content = false;
+
+  // When set, the generic processor operates in multimodal mode
+  std::optional<MultimodalConfig> multimodal;
 };
 
-struct GenericDataProcessorArguments {};
+struct GenericDataProcessorArguments {
+  std::optional<int> visual_token_budget;
+};
 
 }  // namespace litert::lm
 

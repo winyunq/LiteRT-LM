@@ -40,7 +40,11 @@ pytype_strict_library(
     deps = [
         ":litertlm_header_schema_py",
         "@absl_py//absl:app",
-    ],
+    ] + select({
+        "@platforms//os:macos": [],
+        "//conditions:default": [
+        ],
+    }),
 )
 
 py_test(
@@ -229,6 +233,7 @@ py_wheel(
     }),
     platform = "any",
     python_tag = "py3",
+    python_requires = ">=3.10",
     summary = "Python tools for building and inspecting LiteRT-LM file formats",
     description_file = "README.md",
     license = "Apache-2.0",

@@ -15,7 +15,8 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_CONVERSATION_MODEL_DATA_PROCESSOR_FASTVLM_DATA_PROCESSOR_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_CONVERSATION_MODEL_DATA_PROCESSOR_FASTVLM_DATA_PROCESSOR_H_
 
-#include "runtime/components/preprocessor/image_preprocessor.h"
+#include "support/preprocessor/image_preprocessor.h"  // from @litert
+#include "support/preprocessor/stb_image_preprocessor.h"  // from @litert
 #include "runtime/components/prompt_template.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/fastvlm_data_processor_config.h"
@@ -23,6 +24,10 @@
 #include "runtime/engine/io_types.h"
 
 namespace litert::lm {
+
+using ::litert::support::ImagePreprocessor;
+using ::litert::support::ImagePreprocessParameter;
+using ::litert::support::StbImagePreprocessor;
 
 // FastVlmDataProcessor is a model data processor for FastVLM models.
 class FastVlmDataProcessor

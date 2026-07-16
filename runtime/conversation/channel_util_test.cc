@@ -120,6 +120,18 @@ TEST(ExtractChannelTextTest, MissingEndDelimiter) {
   EXPECT_THAT(responses.GetTexts()[0], Eq("Hello "));
 }
 
+TEST(ExtractChannelTextTest, EmptyChannelContent) {
+  Responses responses(TaskState::kProcessing, {"Hello <think></think> World!"});
+  std::vector<Channel> channels = {{"thought", "<think>", "</think>"}};
+
+  auto channel_content = ExtractChannelContent(channels, responses);
+  ASSERT_OK(channel_content);
+  EXPECT_THAT(*channel_content,
+              UnorderedElementsAre(
+                  std::pair<const std::string, std::string>("thought", "")));
+  EXPECT_THAT(responses.GetTexts()[0], Eq("Hello  World!"));
+}
+
 TEST(InsertChannelContentIntoMessageTest, MessageInsertion) {
   Message message = {{"role", "assistant"}, {"content", "Hello!"}};
   absl::flat_hash_map<std::string, std::string> channel_content = {
@@ -153,6 +165,19 @@ TEST(ExtractChannelContentTest, OpenChannelAtStartWithEndTag) {
   EXPECT_THAT(*channel_content,
               UnorderedElementsAre(
                   std::pair<const std::string, std::string>("thought", "hmm")));
+  EXPECT_THAT(responses.GetTexts()[0], Eq(" World!"));
+}
+
+TEST(ExtractChannelContentTest, OpenChannelAtStartWithEndTagEmpty) {
+  Responses responses(TaskState::kProcessing, {"</think> World!"});
+  std::vector<Channel> channels = {{"thought", "<think>", "</think>"}};
+
+  auto channel_content = ExtractChannelContent(channels, responses,
+                                               /*open_channel_name=*/"thought");
+  ASSERT_OK(channel_content);
+  EXPECT_THAT(*channel_content,
+              UnorderedElementsAre(
+                  std::pair<const std::string, std::string>("thought", "")));
   EXPECT_THAT(responses.GetTexts()[0], Eq(" World!"));
 }
 

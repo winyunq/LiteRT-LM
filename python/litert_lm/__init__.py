@@ -14,6 +14,7 @@
 
 """LiteRT LM is a library for running GenAI models on devices."""
 
+from ._ffi import ActivationDataType
 from ._ffi import LogSeverity
 from ._ffi import set_min_log_severity
 from ._messages import Content
@@ -30,6 +31,8 @@ from .interfaces import AbstractEngine
 from .interfaces import AbstractSession
 from .interfaces import Backend
 from .interfaces import BenchmarkInfo
+from .interfaces import LoraConfig
+from .interfaces import LoraRankConfig
 from .interfaces import Responses
 from .interfaces import SamplerConfig
 from .interfaces import Tool
@@ -42,6 +45,7 @@ __all__ = (
     "AbstractConversation",
     "AbstractEngine",
     "AbstractSession",
+    "ActivationDataType",
     "Backend",
     "Benchmark",
     "BenchmarkInfo",
@@ -50,6 +54,8 @@ __all__ = (
     "Conversation",
     "Engine",
     "LogSeverity",
+    "LoraConfig",
+    "LoraRankConfig",
     "Message",
     "Responses",
     "Role",

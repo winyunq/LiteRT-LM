@@ -44,7 +44,7 @@ void SetupLogging() { drishti::wasm::InitializeLog(); }
 
 /**
  * Fill the prefill_batch_sizes field in AdvancedSettings from the given JS
- * set.
+ * array.
  */
 void setPrefills(litert::lm::AdvancedSettings& advanced_settings,
                  val prefill_batch_sizes) {
@@ -60,15 +60,23 @@ void setPrefills(litert::lm::AdvancedSettings& advanced_settings,
 }
 
 /**
- * Get the prefill_batch_sizes field in AdvancedSettings as a JS set.
+ * Get the prefill_batch_sizes field in AdvancedSettings as a JS array.
  */
 val getPrefills(const litert::lm::AdvancedSettings& advanced_settings) {
-  val jsSet = val::global("Set").new_();
+  val jsArray = val::global("Array").new_();
   for (int prefill_batch_size : advanced_settings.prefill_batch_sizes) {
-    jsSet.call<void>("add", prefill_batch_size);
+    jsArray.call<void>("push", prefill_batch_size);
   }
-  return jsSet;
+  return jsArray;
 }
+
+struct JsBenchmarkInfo {
+  double lastPrefillTokensPerSecond = 0.0;
+  int lastPrefillTokenCount = 0;
+  double lastDecodeTokensPerSecond = 0.0;
+  int lastDecodeTokenCount = 0;
+  double timeToFirstTokenInSecond = 0.0;
+};
 
 EMSCRIPTEN_BINDINGS(litertlm_web) {
   emscripten::function("setupLogging", &SetupLogging);
@@ -122,6 +130,10 @@ EMSCRIPTEN_BINDINGS(litertlm_web) {
                 &litert::lm::EngineSettings::GetSingleThreadedExecution)
       .function("setSingleThreadedExecution",
                 &litert::lm::EngineSettings::SetSingleThreadedExecution)
+      .function("enableBenchmark",
+                optional_override([](litert::lm::EngineSettings& settings) {
+                  settings.GetMutableBenchmarkParams();
+                }))
       .function("getMutableMainExecutorSettings",
                 &litert::lm::EngineSettings::GetMutableMainExecutorSettings,
                 emscripten::return_value_policy::reference());
@@ -394,6 +406,16 @@ EMSCRIPTEN_BINDINGS(litertlm_web) {
   emscripten::class_<litert::lm::Responses>("Responses")
       .function("getTexts", &litert::lm::Responses::GetTexts);
 
+  emscripten::value_object<JsBenchmarkInfo>("BenchmarkInfo")
+      .field("lastPrefillTokensPerSecond",
+             &JsBenchmarkInfo::lastPrefillTokensPerSecond)
+      .field("lastPrefillTokenCount", &JsBenchmarkInfo::lastPrefillTokenCount)
+      .field("lastDecodeTokensPerSecond",
+             &JsBenchmarkInfo::lastDecodeTokensPerSecond)
+      .field("lastDecodeTokenCount", &JsBenchmarkInfo::lastDecodeTokenCount)
+      .field("timeToFirstTokenInSecond",
+             &JsBenchmarkInfo::timeToFirstTokenInSecond);
+
   emscripten::class_<litert::lm::ConversationConfig>("ConversationConfig")
       .class_function(
           "createDefault",
@@ -443,7 +465,8 @@ EMSCRIPTEN_BINDINGS(litertlm_web) {
             return UnwrapStatusOr(
                 litert::lm::Conversation::Create(engine, config));
           }),
-          emscripten::return_value_policy::take_ownership())
+          emscripten::return_value_policy::take_ownership(),
+          emscripten::async())
       .function("sendMessage",
                 optional_override([](litert::lm::Conversation& conversation,
                                      std::string message_json) {
@@ -490,6 +513,38 @@ EMSCRIPTEN_BINDINGS(litertlm_web) {
             });
             return json_history.dump();
           }))
+      .function(
+          "getTokenCount",
+          optional_override([](const litert::lm::Conversation& conversation) {
+            return UnwrapStatusOr(conversation.GetTokenCount());
+          }))
+      .function("getBenchmarkInfo",
+                optional_override([](litert::lm::Conversation& conversation) {
+                  auto info_or = conversation.GetBenchmarkInfo();
+                  JsBenchmarkInfo js_info;
+                  if (!info_or.ok()) return js_info;
+
+                  auto& info = *info_or;
+                  int totalPrefillTurns = info.GetTotalPrefillTurns();
+                  if (totalPrefillTurns > 0) {
+                    js_info.lastPrefillTokensPerSecond =
+                        info.GetPrefillTokensPerSec(totalPrefillTurns - 1);
+                    auto prefill_turn =
+                        info.GetPrefillTurn(totalPrefillTurns - 1);
+                    if (prefill_turn.ok())
+                      js_info.lastPrefillTokenCount = prefill_turn->num_tokens;
+                  }
+                  int totalDecodeTurns = info.GetTotalDecodeTurns();
+                  if (totalDecodeTurns > 0) {
+                    js_info.lastDecodeTokensPerSecond =
+                        info.GetDecodeTokensPerSec(totalDecodeTurns - 1);
+                    auto decode_turn = info.GetDecodeTurn(totalDecodeTurns - 1);
+                    if (decode_turn.ok())
+                      js_info.lastDecodeTokenCount = decode_turn->num_tokens;
+                  }
+                  js_info.timeToFirstTokenInSecond = info.GetTimeToFirstToken();
+                  return js_info;
+                }))
       .function("cancelProcess", &litert::lm::Conversation::CancelProcess);
 
   emscripten::class_<litert::lm::DataStream>("DataStream");

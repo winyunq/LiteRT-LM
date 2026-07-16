@@ -18,11 +18,13 @@
 #include <string>
 
 #include "absl/status/statusor.h"  // from @com_google_absl
-#include "runtime/components/tokenizer.h"
+#include "support/tokenizer/tokenizer.h"  // from @litert
 #include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/proto/llm_model_type.pb.h"
 
 namespace litert::lm {
+
+using ::litert::support::Tokenizer;
 
 // Try to infer the model type from the tokenizer. This is for backward
 // compatibility, when the model type is not set in the model LlmMetadata.

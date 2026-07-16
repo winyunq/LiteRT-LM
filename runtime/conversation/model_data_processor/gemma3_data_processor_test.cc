@@ -15,12 +15,8 @@
 #include "runtime/conversation/model_data_processor/gemma3_data_processor.h"
 
 #include <filesystem>  // NOLINT: Required for path manipulation.
-#include <fstream>
-#include <ios>
-#include <iterator>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <utility>
 #include <variant>
@@ -29,19 +25,15 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/status/status.h"  // from @com_google_absl
-#include "absl/status/statusor.h"  // from @com_google_absl
-#include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "litert/cc/litert_layout.h"  // from @litert
-#include "runtime/components/preprocessor/audio_preprocessor.h"
-#include "runtime/components/preprocessor/audio_preprocessor_miniaudio.h"
-#include "runtime/components/preprocessor/image_preprocessor.h"
+#include "support/preprocessor/audio_preprocessor_miniaudio.h"  // from @litert
+#include "support/preprocessor/image_preprocessor.h"  // from @litert
 #include "runtime/components/prompt_template.h"
-#include "runtime/components/sentencepiece_tokenizer.h"
-#include "runtime/components/tokenizer.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/gemma3_data_processor_config.h"
+#include "runtime/conversation/model_data_processor/test_utils.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/test_utils.h"  // NOLINT
@@ -52,102 +44,6 @@ namespace {
 using json = nlohmann::ordered_json;
 using ::testing::ElementsAre;
 using ::testing::status::IsOkAndHolds;
-
-constexpr char kTestdataDir[] =
-    "litert_lm/runtime/components/testdata/";
-
-constexpr char kImageTestdataDir[] =
-    "litert_lm/runtime/components/preprocessor/testdata/";
-
-std::string GetTestdataPath(const std::string& file_name) {
-  return (std::filesystem::path(::testing::SrcDir()) / kTestdataDir / file_name)
-      .string();
-}
-
-std::string ReadFile(absl::string_view path) {
-  std::ifstream ifstr(std::string(path), std::ios::binary);
-  std::stringstream contents;
-  contents << ifstr.rdbuf();
-  return contents.str();
-}
-
-absl::StatusOr<std::string> GetContents(const std::string& path) {
-  std::ifstream input_stream(path);
-  if (!input_stream.is_open()) {
-    return absl::InternalError(absl::StrCat("Could not open file: ", path));
-  }
-
-  std::string content;
-  content.assign((std::istreambuf_iterator<char>(input_stream)),
-                 (std::istreambuf_iterator<char>()));
-  return std::move(content);
-}
-
-MATCHER_P(HasInputText, text_input, "") {
-  if (!std::holds_alternative<InputText>(arg)) {
-    return false;
-  }
-  auto text_bytes = std::get<InputText>(arg).GetRawTextString();
-  if (!text_bytes.ok()) {
-    return false;
-  }
-  return text_bytes.value() == text_input->GetRawTextString().value();
-}
-
-MATCHER_P(HasInputImage, image_input, "") {
-  if (!std::holds_alternative<InputImage>(arg)) {
-    return false;
-  }
-  if (std::get<InputImage>(arg).GetRawImageBytes().ok()) {
-    auto image_bytes = std::get<InputImage>(arg).GetRawImageBytes();
-    return image_bytes.value() == image_input->GetRawImageBytes().value();
-  }
-  if (std::get<InputImage>(arg).GetPreprocessedImageTensor().ok()) {
-    auto buffer_span = ReferTensorBufferAsSpan<float>(
-        *std::get<InputImage>(arg).GetPreprocessedImageTensor().value());
-    if (!buffer_span.HasValue()) {
-      return false;
-    }
-    auto expected_buffer_span = ReferTensorBufferAsSpan<float>(
-        *image_input->GetPreprocessedImageTensor().value());
-    if (!expected_buffer_span.HasValue()) {
-      return false;
-    }
-    return *buffer_span == *expected_buffer_span;
-  }
-  return true;
-}
-
-MATCHER_P(HasInputAudio, audio_input, "") {
-  if (!std::holds_alternative<InputAudio>(arg)) {
-    return false;
-  }
-  if (std::get<InputAudio>(arg).GetRawAudioBytes().ok()) {
-    auto audio_bytes = std::get<InputAudio>(arg).GetRawAudioBytes();
-    return audio_bytes.value() == audio_input->GetRawAudioBytes().value();
-  }
-  if (std::get<InputAudio>(arg).GetPreprocessedAudioTensor().ok()) {
-    auto buffer_span = ReferTensorBufferAsSpan<float>(
-        *std::get<InputAudio>(arg).GetPreprocessedAudioTensor().value());
-    if (!buffer_span.HasValue()) {
-      return false;
-    }
-    auto expected_buffer_span = ReferTensorBufferAsSpan<float>(
-        *audio_input->GetPreprocessedAudioTensor().value());
-    if (!expected_buffer_span.HasValue()) {
-      return false;
-    }
-    return *buffer_span == *expected_buffer_span;
-  }
-  return true;
-}
-
-MATCHER(HasInputAudioEnd, "") {
-  if (!std::holds_alternative<InputAudioEnd>(arg)) {
-    return false;
-  }
-  return true;
-}
 
 class Gemma3DataProcessorTest : public ::testing::Test {
  protected:
@@ -160,6 +56,10 @@ class Gemma3DataProcessorTest : public ::testing::Test {
 
   std::unique_ptr<Tokenizer> tokenizer_;
 };
+
+class Gemma3DataProcessorImageTest
+    : public Gemma3DataProcessorTest,
+      public ::testing::WithParamInterface<std::string> {};
 
 TEST_F(Gemma3DataProcessorTest, ToInputDataVectorTextOnly) {
   ASSERT_OK_AND_ASSIGN(auto processor, Gemma3DataProcessor::Create());
@@ -177,7 +77,13 @@ TEST_F(Gemma3DataProcessorTest, ToInputDataVectorTextOnly) {
   EXPECT_THAT(input_data, ElementsAre(HasInputText(&expected_text)));
 }
 
-TEST_F(Gemma3DataProcessorTest, ToInputDataVectorTextAndImage) {
+TEST_P(Gemma3DataProcessorImageTest, ToInputDataVectorTextAndImage) {
+  std::string image_name = GetParam();
+#ifdef LITERT_USE_SKIA
+  if (image_name == "apple.png") {
+    GTEST_SKIP() << "Skipping PNG test for SKIA";
+  }
+#endif
   ASSERT_OK_AND_ASSIGN(auto processor, Gemma3DataProcessor::Create(
                                            /*Gemma3DataProcessorConfig=*/
                                            {.image_tensor_height = 224,
@@ -186,9 +92,7 @@ TEST_F(Gemma3DataProcessorTest, ToInputDataVectorTextAndImage) {
       "<start_of_turn>user\nHere is an image of apples "
       "<start_of_image><end_of_turn>";
 
-  std::string image_path = (std::filesystem::path(::testing::SrcDir()) /
-                            kImageTestdataDir / "apple.bmp")
-                               .string();
+  std::string image_path = GetImageTestdataPath(image_name);
   const nlohmann::ordered_json message = {
       {"role", "user"},
       {"content",
@@ -446,16 +350,21 @@ What is the capital of France?<end_of_turn>
   EXPECT_THAT(input_data, ElementsAre(HasInputText(&expected_text)));
 }
 
-TEST_F(Gemma3DataProcessorTest, PromptTemplateToInputDataVectorTextAndImage) {
+TEST_P(Gemma3DataProcessorImageTest,
+       PromptTemplateToInputDataVectorTextAndImage) {
+  std::string image_name = GetParam();
+#ifdef LITERT_USE_SKIA
+  if (image_name == "apple.png") {
+    GTEST_SKIP() << "Skipping PNG test for SKIA";
+  }
+#endif
   const std::string test_file_path =
       GetTestdataPath("google-gemma-3-1b-it.jinja");
   ASSERT_OK_AND_ASSIGN(const std::string template_content,
                        GetContents(test_file_path));
   PromptTemplate prompt_template(template_content);
 
-  std::string image_path = (std::filesystem::path(::testing::SrcDir()) /
-                            kImageTestdataDir / "apple.bmp")
-                               .string();
+  std::string image_path = GetImageTestdataPath(image_name);
   const nlohmann::ordered_json messages = {
       {{"role", "system"}, {"content", "Hello world!"}},
       {{"role", "user"},
@@ -1000,9 +909,7 @@ TEST_F(Gemma3DataProcessorTest, ToInputDataVectorTextAndAudio) {
       "<start_of_turn>user\nHere is an audio. Please transcribe it: "
       "<start_of_audio><end_of_turn>";
 
-  std::string audio_path = (std::filesystem::path(::testing::SrcDir()) /
-                            kTestdataDir / "audio_sample.wav")
-                               .string();
+  std::string audio_path = GetTestdataPath("audio_sample.wav");
   const nlohmann::ordered_json message = {
       {"role", "user"},
       {"content",
@@ -1039,9 +946,7 @@ TEST_F(Gemma3DataProcessorTest, PromptTemplateToInputDataVectorTextAndAudio) {
                        GetContents(test_file_path));
   PromptTemplate prompt_template(template_content);
 
-  std::string audio_path = (std::filesystem::path(::testing::SrcDir()) /
-                            kTestdataDir / "audio_sample.wav")
-                               .string();
+  std::string audio_path = GetTestdataPath("audio_sample.wav");
   const nlohmann::ordered_json messages = {
       {{"role", "system"}, {"content", "Hello world!"}},
       {{"role", "user"},
@@ -1216,9 +1121,7 @@ TEST_F(Gemma3DataProcessorTest, CloneStateWithAudio) {
       "<start_of_turn>user\nHere is an audio. Please transcribe it: "
       "<start_of_audio><end_of_turn>";
 
-  std::string audio_path = (std::filesystem::path(::testing::SrcDir()) /
-                            kTestdataDir / "audio_sample.wav")
-                               .string();
+  std::string audio_path = GetTestdataPath("audio_sample.wav");
   const nlohmann::ordered_json message = {
       {"role", "user"},
       {"content",
@@ -1250,4 +1153,9 @@ TEST_F(Gemma3DataProcessorTest, CloneStateWithAudio) {
 #endif
 
 }  // namespace
+
+INSTANTIATE_TEST_SUITE_P(Gemma3DataProcessorImageTests,
+                         Gemma3DataProcessorImageTest,
+                         ::testing::Values("apple.bmp", "apple.png"));
+
 }  // namespace litert::lm

@@ -26,6 +26,7 @@
 #include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "nlohmann/json_fwd.hpp"  // from @nlohmann_json
 #include "litert/cc/internal/scoped_file.h"  // from @litert
@@ -545,7 +546,7 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateEngine)(
 LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateBenchmark)(
     JNIEnv* env, jclass thiz, jstring model_path, jstring backend,
     jint prefill_tokens, jint decode_tokens, jstring cache_dir,
-    jstring main_npu_native_library_dir) {
+    jstring main_npu_native_library_dir, jobject enable_speculative_decoding) {
   const char* model_path_chars = env->GetStringUTFChars(model_path, nullptr);
   std::string model_path_str(model_path_chars);
   env->ReleaseStringUTFChars(model_path, model_path_chars);
@@ -596,6 +597,19 @@ LITERTLM_JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateBenchmark)(
     settings->GetMutableMainExecutorSettings().SetLitertDispatchLibDir(
         main_npu_native_library_dir_str);
   }
+
+  auto advanced_settings =
+      settings->GetMainExecutorSettings().GetAdvancedSettings().value_or(
+          litert::lm::AdvancedSettings());
+  if (enable_speculative_decoding != nullptr) {
+    jmethodID boolean_value_mid = env->GetMethodID(
+        env->FindClass("java/lang/Boolean"), "booleanValue", "()Z");
+    jboolean is_enabled =
+        env->CallBooleanMethod(enable_speculative_decoding, boolean_value_mid);
+    advanced_settings.enable_speculative_decoding = (is_enabled == JNI_TRUE);
+  }
+  settings->GetMutableMainExecutorSettings().SetAdvancedSettings(
+      advanced_settings);
 
   auto& benchmark_params = settings->GetMutableBenchmarkParams();
   benchmark_params.set_num_prefill_tokens(prefill_tokens);
@@ -1201,6 +1215,25 @@ LITERTLM_JNIEXPORT jstring JNICALL JNI_METHOD(
     ThrowLiteRtLmJniException(
         env, "Failed to call nativeConversationRenderMessageIntoString: " +
                  response.status().ToString());
+    return nullptr;
+  }
+
+  return NewStringStandardUTF(env, *response);
+}
+
+LITERTLM_JNIEXPORT jstring JNICALL JNI_METHOD(
+    nativeConversationRenderPrefaceIntoString)(JNIEnv* env, jclass thiz,
+                                               jlong conversation_pointer) {
+  Conversation* conversation =
+      reinterpret_cast<Conversation*>(conversation_pointer);
+
+  auto response =
+      conversation->RenderPrefaceIntoString(litert::lm::OptionalArgs());
+  if (!response.ok()) {
+    ThrowLiteRtLmJniException(
+        env, absl::StrCat(
+                 "Failed to call nativeConversationRenderPrefaceIntoString: ",
+                 response.status().ToString()));
     return nullptr;
   }
 

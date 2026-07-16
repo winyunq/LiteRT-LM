@@ -65,6 +65,10 @@ RenderSingleTurnTemplateCommon(
     std::optional<nlohmann::ordered_json> extra_context,
     bool push_dummy_user_message_to_preface);
 
+// Strips blobs from PromptTemplateInput to avoid copying/formatting large data
+// during template rendering. The input is modified in-place.
+void StripBlobsFromTemplateInput(PromptTemplateInput& input);
+
 }  // namespace litert::lm
 
 #endif  // THIRD_PARTY_ODML_LITERT_LM_RUNTIME_CONVERSATION_PROMPT_UTILS_H_

@@ -15,18 +15,22 @@
 #include "runtime/executor/llm_executor_io_types.h"
 
 #include <atomic>
+#include <cstddef>
 #include <ios>
 #include <optional>
 #include <ostream>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
-#include "runtime/components/constrained_decoding/constrained_decoder.h"
+#include "runtime/components/logits_processor/constrained_decoding/constrained_decoder.h"
+#include "runtime/components/logits_processor/logits_processor.h"
 #include "runtime/util/logging_tensor_buffer.h"
 
 namespace litert::lm {
@@ -574,24 +578,33 @@ std::ostream& operator<<(std::ostream& os,
 }
 
 // --- ExecutorDecodeParams Implementation ---
-void ExecutorDecodeParams::SetConstraintDecoder(
-    ConstrainedDecoder* constraint) {
-  constraint_decoder_ = constraint;
+void ExecutorDecodeParams::SetLogitsProcessorList(
+    std::vector<LogitsProcessor*> logits_processors) {
+  logits_processors_ = std::move(logits_processors);
 }
 
-bool ExecutorDecodeParams::HasConstraintDecoder() const {
-  return constraint_decoder_ != nullptr;
+absl::Span<LogitsProcessor* const>
+ExecutorDecodeParams::GetLogitsProcessorList() const {
+  return logits_processors_;
 }
 
 ConstrainedDecoder* ExecutorDecodeParams::GetConstraintDecoder() const {
-  return constraint_decoder_;
+  for (LogitsProcessor* processor : logits_processors_) {
+    if (ConstrainedDecoder* constraint_decoder =
+            processor->GetConstraintDecoder();
+        constraint_decoder != nullptr) {
+      return constraint_decoder;
+    }
+  }
+  return nullptr;
 }
 
 std::ostream& operator<<(std::ostream& os, const ExecutorDecodeParams& params) {
   os << "ExecutorDecodeParams: {\n";
-  os << kFieldIndent << "ConstraintDecoder: ";
-  if (params.HasConstraintDecoder()) {
-    os << params.GetConstraintDecoder();
+  os << kFieldIndent << "LogitsProcessor: ";
+  if (size_t num_processors = params.GetLogitsProcessorList().size();
+      num_processors > 0) {
+    os << num_processors << " processors";
   } else {
     os << "not set";
   }

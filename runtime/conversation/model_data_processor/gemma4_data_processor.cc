@@ -14,9 +14,7 @@
 
 #include "runtime/conversation/model_data_processor/gemma4_data_processor.h"
 
-#include <algorithm>
 #include <cstddef>
-#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -30,28 +28,22 @@
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
-#include "runtime/components/constrained_decoding/constraint.h"
+#include "runtime/components/logits_processor/constrained_decoding/constraint.h"
 #include "runtime/components/prompt_template.h"
 #include "runtime/conversation/model_data_processor/model_data_processor.h"
+#include "runtime/conversation/model_data_processor/multimodal_processor_helper.h"
 #if !defined(LITERT_LM_FST_CONSTRAINTS_DISABLED)
-#include "runtime/components/constrained_decoding/gemma_model_constraint_provider.h"
+#include "runtime/components/logits_processor/constrained_decoding/gemma_model_constraint_provider.h"
 #endif
-#include "runtime/components/preprocessor/audio_preprocessor.h"
-#include "runtime/components/preprocessor/audio_preprocessor_miniaudio.h"
-#include "runtime/components/preprocessor/image_preprocessor.h"
-#include "runtime/components/preprocessor/stb_image_preprocessor.h"
-#include "runtime/components/sentencepiece_tokenizer.h"
-#include "runtime/components/tokenizer.h"
+#include "support/preprocessor/audio_preprocessor.h"  // from @litert
+#include "support/preprocessor/image_preprocessor.h"  // from @litert
 #include "runtime/components/tool_use/fc_tool_format_utils.h"
 #include "runtime/components/tool_use/parser_utils.h"
 #include "runtime/conversation/io_types.h"
-#include "runtime/conversation/model_data_processor/data_utils.h"
 #include "runtime/conversation/model_data_processor/gemma4_data_processor_config.h"
 #include "runtime/conversation/prompt_utils.h"
 #include "runtime/engine/io_types.h"
-#include "runtime/util/memory_mapped_file.h"
 #include "runtime/util/status_macros.h"
-#include "re2/re2.h"  // from @com_googlesource_code_re2
 #include "sentencepiece_model.pb.h"  // from @sentencepiece
 
 namespace litert::lm {
@@ -186,17 +178,6 @@ bool IsToolMessage(const nlohmann::ordered_json& template_input,
                    const nlohmann::ordered_json& message) {
   return template_input.contains("role") && template_input["role"] == "tool";
 }
-
-bool IsImage(absl::string_view part) {
-  return part == "<start_of_image>" || part == "<image_soft_token>" ||
-         part == "<|image|>";
-}
-
-bool IsAudio(absl::string_view part) {
-  return part == "<start_of_audio>" || part == "<audio_soft_token>" ||
-         part == "<|audio|>";
-}
-
 }  // namespace
 
 absl::StatusOr<std::unique_ptr<Gemma4DataProcessor>>
@@ -237,9 +218,9 @@ Gemma4DataProcessor::Create(Gemma4DataProcessorConfig config,
     return absl::FailedPreconditionError(
         "Constrained decoding was disabled at build time.");
   }
-  return absl::WrapUnique(new Gemma4DataProcessor(
-      config, preface, std::make_unique<StbImagePreprocessor>(),
-      std::move(audio_preprocessor)));
+  return absl::WrapUnique(
+      new Gemma4DataProcessor(config, preface, ImagePreprocessor::Create(),
+                              std::move(audio_preprocessor)));
 #else
   std::unique_ptr<LiteRtLmGemmaModelConstraintProvider,
                   decltype(&LiteRtLmGemmaModelConstraintProvider_Destroy)>
@@ -276,7 +257,7 @@ Gemma4DataProcessor::Create(Gemma4DataProcessorConfig config,
   }
   return absl::WrapUnique(new Gemma4DataProcessor(
       std::move(constraint_provider), config, preface,
-      std::make_unique<StbImagePreprocessor>(), std::move(audio_preprocessor)));
+      ImagePreprocessor::Create(), std::move(audio_preprocessor)));
 #endif
 }
 
@@ -350,109 +331,34 @@ Gemma4DataProcessor::ToInputDataVectorImpl(
     const std::string& rendered_template_prompt,
     const nlohmann::ordered_json& messages,
     const Gemma4DataProcessorArguments& args) const {
-  std::vector<InputData> input_data;
-  std::deque<std::unique_ptr<MemoryMappedFile>> image_files;
-  std::deque<std::unique_ptr<MemoryMappedFile>> audio_files;
-  // Find all images and audio contained in the messages.
-  for (const auto& message : messages) {
-    if (message.contains("content") && message["content"].is_array()) {
-      for (const auto& item : message["content"]) {
-        if (item.is_string()) {
-          continue;
-        }
-        if (!item.contains("type")) {
-          continue;
-        }
-        ASSIGN_OR_RETURN(std::unique_ptr<MemoryMappedFile> mmap_file,
-                         LoadItemData(item));
-        if (item["type"] == "image") {
-          image_files.push_back(std::move(mmap_file));
-        } else if (item["type"] == "audio") {
-          audio_files.push_back(std::move(mmap_file));
-        }
-      }
-    }
-  }
-  RE2 re_delimiter(
-      R"regex((<start_of_image>|<\|image\|>|<start_of_audio>|<\|audio\|>))regex");
-  absl::string_view prompt_view(rendered_template_prompt);
-  const char* start = prompt_view.data();
-  std::string part;
-  ImagePreprocessParameter image_params;
-
-  int max_num_patches = config_.max_num_patches;
-  if (args.visual_token_budget) {
-    int visual_token_budget = args.visual_token_budget.value();
-    if (visual_token_budget <= 0) {
-      return absl::InvalidArgumentError(
-          "Visual token budget must be positive.");
-    }
-    // There is a 9:1 ratio between the number of patches and the visual token
-    // budget, because of the pooling operation of (3x3=9) patches in the image
-    // encoder.
-    max_num_patches = std::min(max_num_patches, visual_token_budget * 9);
-  }
-
-  image_params.SetPatchifyConfig(ImagePreprocessParameter::PatchifyConfig{
-      .patch_width = config_.patch_width,
-      .patch_height = config_.patch_height,
-      .max_num_patches = max_num_patches,
-      .pooling_kernel_size = config_.pooling_kernel_size});
-  // Replace the placeholders with the actual data.
-  while (RE2::FindAndConsume(&prompt_view, re_delimiter, &part)) {
-    absl::string_view text_part(start, prompt_view.data() - part.size());
-    start = prompt_view.data();
-    if (IsImage(part)) {
-      // Vision modality needs double newlines before image soft token.
-      // while audio modality does not. See b/476152260.
-      input_data.emplace_back(
-          InputText(absl::StrCat(text_part, config_.boi_token)));
-      if (image_files.empty()) {
-        return absl::InvalidArgumentError(
-            "Provided less images than expected in the prompt.");
-      }
-      auto image_file = std::move(image_files.front());
-      image_files.pop_front();
-      ASSIGN_OR_RETURN(auto preprocessed_image,
-                       image_preprocessor_->Preprocess(
-                           InputImage(std::string(
-                               static_cast<const char*>(image_file->data()),
-                               image_file->length())),
-                           image_params));
-      input_data.emplace_back(InputImage(std::move(preprocessed_image)));
-      input_data.emplace_back(InputImageEnd());
-      input_data.emplace_back(InputText("\n\n"));
-    } else if (IsAudio(part)) {
-      input_data.emplace_back(
-          InputText(absl::StrCat(text_part, config_.boa_token)));
-      if (audio_files.empty()) {
-        return absl::InvalidArgumentError(
-            "Provided less audio than expected in the prompt.");
-      }
-      auto audio_file = std::move(audio_files.front());
-      audio_files.pop_front();
-      ASSIGN_OR_RETURN(auto preprocessed_audio,
-                       audio_preprocessor_->Preprocess(InputAudio(std::string(
-                           static_cast<const char*>(audio_file->data()),
-                           audio_file->length()))));
-      audio_preprocessor_->Reset();
-      input_data.emplace_back(InputAudio(std::move(preprocessed_audio)));
-      input_data.emplace_back(InputAudioEnd());
-    }
-  }
-  if (!image_files.empty()) {
-    return absl::InvalidArgumentError(
-        "Provided more images than expected in the prompt.");
-  }
-  if (!audio_files.empty()) {
-    return absl::InvalidArgumentError(
-        "Provided more audio than expected in the prompt.");
-  }
-  // Add the remaining text in the prompt.
-  if (!prompt_view.empty()) {
-    input_data.push_back(InputText(std::string(prompt_view)));
-  }
-  return input_data;
+  MultimodalPromptProcessingConfig multi_config{
+      .delimiter_regex =
+          R"regex((<start_of_image>|<\|image\|>|<start_of_audio>|<\|audio\|>))regex",
+      .image_token_regex = R"regex((<start_of_image>|<\|image\|>))regex",
+      .audio_token_regex = R"regex((<start_of_audio>|<\|audio\|>))regex",
+      .boi_token = config_.boi_token,
+      .eoi_token = config_.eoi_token,
+      .image_prefix = "",
+      .image_suffix = "",
+      .add_image_end = true,
+      .boa_token = config_.boa_token,
+      .eoa_token = config_.eoa_token,
+      .audio_prefix = "",
+      .audio_suffix = "",
+      .add_audio_end = true,
+  };
+  ImagePreprocessParameter image_preprocess_parameter;
+  image_preprocess_parameter.SetPatchifyConfig(
+      ImagePreprocessParameter::PatchifyConfig{
+          .patch_width = config_.patch_width,
+          .patch_height = config_.patch_height,
+          .max_num_patches = config_.max_num_patches,
+          .pooling_kernel_size = config_.pooling_kernel_size,
+      });
+  return ProcessMultimodalPrompt(
+      rendered_template_prompt, messages, image_preprocessor_.get(),
+      audio_preprocessor_.get(), multi_config, image_preprocess_parameter,
+      args.visual_token_budget);
 }
 
 absl::StatusOr<Message> Gemma4DataProcessor::ToMessageImpl(

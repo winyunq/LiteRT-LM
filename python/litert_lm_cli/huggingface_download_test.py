@@ -13,6 +13,7 @@
 import email.message
 import http.client
 import io
+import json
 import pathlib
 from unittest import mock
 import urllib.error
@@ -156,6 +157,54 @@ class HuggingFaceDownloadTest(absltest.TestCase):
       )
 
     self.assertIn("connection refused", str(ctx.exception))
+
+  @mock.patch.object(urllib.request, "urlopen", autospec=True)
+  def test_list_litertlm_files_success(self, mock_urlopen):
+    repo_id = "test-owner/test-model"
+    mock_response = mock.create_autospec(
+        http.client.HTTPResponse, spec_set=True, instance=True
+    )
+    response_data = {
+        "siblings": [
+            {"rfilename": "README.md"},
+            {"rfilename": "model.litertlm"},
+            {"rfilename": "other_file.bin"},
+            {"rfilename": "sub/another_model.litertlm"},
+        ]
+    }
+    mock_response.read.return_value = json.dumps(response_data).encode()
+    mock_urlopen.return_value.__enter__.return_value = mock_response
+
+    result = huggingface_download.list_litertlm_files(
+        repo_id=repo_id, token="fake-token"
+    )
+
+    self.assertEqual(result, ["model.litertlm", "sub/another_model.litertlm"])
+    mock_urlopen.assert_called_once()
+    req = mock_urlopen.call_args[0][0]
+    self.assertEqual(req.get_header("Authorization"), "Bearer fake-token")
+    self.assertEqual(
+        req.full_url,
+        f"https://huggingface.co/api/models/{repo_id}",
+    )
+
+  @mock.patch.object(urllib.request, "urlopen", autospec=True)
+  def test_list_litertlm_files_http_error(self, mock_urlopen):
+    repo_id = "test-owner/test-model"
+    mock_urlopen.side_effect = urllib.error.HTTPError(
+        url="http://fake",
+        code=404,
+        msg="Not Found",
+        hdrs=email.message.Message(),
+        fp=None,
+    )
+
+    with self.assertRaises(click.ClickException) as ctx:
+      huggingface_download.list_litertlm_files(
+          repo_id=repo_id, token="fake-token"
+      )
+
+    self.assertIn("404", str(ctx.exception))
 
 
 if __name__ == "__main__":

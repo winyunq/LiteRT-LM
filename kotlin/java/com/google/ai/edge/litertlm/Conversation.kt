@@ -459,6 +459,19 @@ class Conversation(
   }
 
   /**
+   * Renders the preface into a string for testing and logging.
+   *
+   * @return The rendered preface string.
+   * @throws IllegalStateException if the conversation is not alive.
+   * @throws LiteRtLmJniException if an error occurs during the native call.
+   */
+  @ExperimentalApi
+  fun renderPrefaceIntoString(): String {
+    checkIsAlive()
+    return LiteRtLmJni.nativeConversationRenderPrefaceIntoString(handle)
+  }
+
+  /**
    * Closes the conversation and releases the native conversation's resources.
    *
    * @throws IllegalStateException if the conversation has already been closed.

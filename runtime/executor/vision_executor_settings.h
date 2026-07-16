@@ -102,21 +102,17 @@ class VisionExecutorSettings : public ExecutorSettingsBase {
     scoped_adapter_program_cache_file_ = std::move(cache_file);
   }
 
-  // Returns the weight cache file path for the vision encoder or adapter
-  // model.
-  // Note users should not use the ExecutorSettingsBase::GetWeightCacheFile()
-  // method to get the weight cache file for the vision encoder or adapter
-  // model, because the base class does not distinguish between the two
-  // models.
+  using ExecutorSettingsBase::GetWeightCacheFile;
   absl::StatusOr<
       std::variant<std::string, std::shared_ptr<litert::lm::ScopedFile>>>
   GetWeightCacheFile(absl::string_view suffix,
-                     bool check_and_clean = false) const;
+                     bool check_and_clean) const override;
 
+  using ExecutorSettingsBase::GetProgramCacheFile;
   absl::StatusOr<
       std::variant<std::string, std::shared_ptr<litert::lm::ScopedFile>>>
   GetProgramCacheFile(absl::string_view suffix,
-                      bool check_and_clean = false) const;
+                      bool check_and_clean) const override;
 
  private:
   explicit VisionExecutorSettings(const ModelAssets& model_assets)

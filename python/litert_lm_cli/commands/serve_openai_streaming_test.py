@@ -197,19 +197,6 @@ class ServeOpenAIStreamingTest(absltest.TestCase):
         )
     )
 
-    mock_is_gpu_only = self.enter_context(
-        mock.patch.object(openai_handler, "_is_gpu_only_model", autospec=True)
-    )
-
-    def is_gpu_only_side_effect(model_path: str) -> bool:
-      if "cpu_model" in model_path:
-        return False
-      elif "gpu_model" in model_path:
-        return True
-      return False
-
-    mock_is_gpu_only.side_effect = is_gpu_only_side_effect
-
     req = urllib.request.Request(
         f"http://localhost:{self.port}/v1/models",
     )
@@ -221,12 +208,9 @@ class ServeOpenAIStreamingTest(absltest.TestCase):
       res_body = json.loads(response.read().decode("utf-8"))
       self.assertEqual(res_body["object"], "list")
 
-      # We expect cpu_model, cpu_model,gpu and gpu_model,gpu
-      # gpu_model (CPU version) should NOT be present.
+      # We expect cpu_model and gpu_model.
       model_ids = [m["id"] for m in res_body["data"]]
-      self.assertEqual(
-          model_ids, ["cpu_model", "cpu_model,gpu", "gpu_model,gpu"]
-      )
+      self.assertEqual(model_ids, ["cpu_model", "gpu_model"])
       for m in res_body["data"]:
         self.assertEqual(m["object"], "model")
         self.assertEqual(m["created"], 123456789)

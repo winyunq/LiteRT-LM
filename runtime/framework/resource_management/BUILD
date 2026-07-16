@@ -39,20 +39,16 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
+        "@litert//litert/cc:litert_environment",
         "//runtime/components:sampler",
         "//runtime/components:stop_token_detector",
+        "//runtime/components/logits_processor:repetition_penalty_config",
+        "//runtime/components/logits_processor/constrained_decoding:constraint",
         "//runtime/engine:engine_interface",
         "//runtime/engine:engine_settings",
         "//runtime/engine:io_types",
         "//runtime/framework/resource_management/context_handler",
-    ] + select({
-        "@litert//litert:litert_link_capi_so": [
-            "@litert//litert/cc:litert_api_with_dynamic_runtime",
-        ],
-        "//conditions:default": [
-            "@litert//litert/cc:litert_environment",
-        ],
-    }),
+    ],
 )
 
 cc_library(
@@ -74,12 +70,17 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
+        "@litert//litert/cc:litert_environment",
+        "@litert//litert/cc:litert_environment_options",
+        "@litert//litert/cc:litert_macros",
+        "@litert//litert/cc:litert_tensor_buffer",
+        "@litert//support/tokenizer",
         "//runtime/components:model_resources",
         "//runtime/components:sampler",
         "//runtime/components:sampler_factory",
         "//runtime/components:stop_token_detector",
-        "//runtime/components:tokenizer",
-        "//runtime/components/constrained_decoding:constraint",
+        "//runtime/components/logits_processor:repetition_penalty_config",
+        "//runtime/components/logits_processor/constrained_decoding:constraint",
         "//runtime/core:tasks",
         "//runtime/engine:engine_interface",
         "//runtime/engine:engine_settings",
@@ -94,17 +95,7 @@ cc_library(
         "//runtime/util:executor_data_util",
         "//runtime/util:litert_status_util",
         "//runtime/util:tensor_buffer_util",
-    ] + select({
-        "@litert//litert:litert_link_capi_so": [
-            "@litert//litert/cc:litert_api_with_dynamic_runtime",
-        ],
-        "//conditions:default": [
-            "@litert//litert/cc:litert_environment",
-            "@litert//litert/cc:litert_environment_options",
-            "@litert//litert/cc:litert_macros",
-            "@litert//litert/cc:litert_tensor_buffer",
-        ],
-    }),
+    ],
 )
 
 cc_library(
@@ -125,17 +116,23 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
+        "@litert//litert/cc:litert_environment",
+        "@litert//litert/cc:litert_environment_options",
+        "@litert//litert/cc:litert_macros",
+        "@litert//litert/cc:litert_tensor_buffer",
+        "@litert//support/tokenizer",
         "//runtime/components:model_resources",
         "//runtime/components:sampler",
         "//runtime/components:sampler_factory",
         "//runtime/components:stop_token_detector",
-        "//runtime/components:tokenizer",
-        "//runtime/components/constrained_decoding:constraint",
+        "//runtime/components/logits_processor:repetition_penalty_config",
+        "//runtime/components/logits_processor/constrained_decoding:constraint",
         "//runtime/core:tasks",
         "//runtime/engine:engine_settings",
         "//runtime/engine:io_types",
         "//runtime/executor:audio_executor",
         "//runtime/executor:audio_executor_settings",
+        "//runtime/executor:executor_settings_base",
         "//runtime/executor:llm_executor",
         "//runtime/executor:llm_executor_io_types",
         "//runtime/executor:vision_executor_settings",
@@ -143,17 +140,7 @@ cc_library(
         "//runtime/util:executor_data_util",
         "//runtime/util:litert_status_util",
         "//runtime/util:tensor_buffer_util",
-    ] + select({
-        "@litert//litert:litert_link_capi_so": [
-            "@litert//litert/cc:litert_api_with_dynamic_runtime",
-        ],
-        "//conditions:default": [
-            "@litert//litert/cc:litert_environment",
-            "@litert//litert/cc:litert_environment_options",
-            "@litert//litert/cc:litert_macros",
-            "@litert//litert/cc:litert_tensor_buffer",
-        ],
-    }),
+    ],
 )
 
 cc_test(
@@ -169,11 +156,13 @@ cc_test(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
         "@litert//litert/cc:litert_tensor_buffer",
+        "@litert//support/tokenizer",
         "//runtime/components:model_resources",
-        "//runtime/components:tokenizer",
-        "//runtime/components/constrained_decoding:fake_constraint",
+        "//runtime/components/logits_processor:repetition_penalty_config",
+        "//runtime/components/logits_processor/constrained_decoding:fake_constraint",
         "//runtime/engine:engine_settings",
         "//runtime/engine:io_types",
         "//runtime/executor:audio_executor",
@@ -225,16 +214,10 @@ cc_library(
     srcs = ["resource_manager.cc"],
     hdrs = ["resource_manager.h"],
     defines = ["LITERT_LM_EXCLUDE_LEGACY_EXECUTORS=1"],
-    deps = RESOURCE_MANAGER_DEPS +
-           select({
-               "@litert//litert:litert_link_capi_so": [
-                   "@litert//litert/cc:litert_api_with_dynamic_runtime",
-               ],
-               "//conditions:default": [
-                   "@litert//litert/cc:litert_environment",
-                   "@litert//litert/cc:litert_environment_options",
-                   "@litert//litert/cc:litert_macros",
-                   "@litert//litert/cc:litert_tensor_buffer",
-               ],
-           }),
+    deps = RESOURCE_MANAGER_DEPS + [
+        "@litert//litert/cc:litert_environment",
+        "@litert//litert/cc:litert_environment_options",
+        "@litert//litert/cc:litert_macros",
+        "@litert//litert/cc:litert_tensor_buffer",
+    ],
 )

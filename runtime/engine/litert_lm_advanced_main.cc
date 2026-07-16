@@ -187,6 +187,8 @@ absl::Status MainHelper(int argc, char** argv) {
            "[--litert_dispatch_lib_dir=<litert_dispatch_lib_dir>]"
            "[--sampler_handles_input=<true|false>]"
            "[--disable_cache=<true|false>]"
+           "[--disable_weight_cache=<true|false>]"
+           "[--disable_gpu_program_cache=<true|false>]"
            "[--cache_compiled_shader_only=<true|false>]"
            "[--conv_type=<auto|float|int8>]"
            "[--enable_speculative_decoding=<true|false>]";
@@ -243,6 +245,9 @@ absl::Status MainHelper(int argc, char** argv) {
   settings.gpu_madvise_original_shared_tensors =
       absl::GetFlag(FLAGS_gpu_madvise_original_shared_tensors);
   settings.disable_cache = absl::GetFlag(FLAGS_disable_cache);
+  settings.disable_weight_cache = absl::GetFlag(FLAGS_disable_weight_cache);
+  settings.disable_gpu_program_cache =
+      absl::GetFlag(FLAGS_disable_gpu_program_cache);
   settings.cache_dir = absl::GetFlag(FLAGS_cache_dir);
   settings.cache_compiled_shaders_only =
       absl::GetFlag(FLAGS_cache_compiled_shaders_only);

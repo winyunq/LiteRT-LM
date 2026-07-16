@@ -72,6 +72,7 @@ std::ostream& operator<<(std::ostream& os, const NpuConfig& config) {
   return os;
 }
 
+
 std::ostream& operator<<(std::ostream& os, const AdvancedSettings& settings) {
   os << "prefill_batch_sizes: ["
      << absl::StrJoin(settings.prefill_batch_sizes, ", ") << "]\n";

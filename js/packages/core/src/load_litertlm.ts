@@ -21,6 +21,7 @@ import {LiteRtLm} from './litertlm_web.js';
 import {load, LoadOptions} from './load.js';
 
 type UrlString = string;
+let globalLiteRtLmPath: UrlString|undefined = undefined;
 
 /**
  * Options for loading LiteRT-LM.
@@ -81,6 +82,7 @@ export function unloadLiteRtLm(): void {
   if (hasGlobalLiteRtLm()) {
     getGlobalLiteRtLm().delete();
     setGlobalLiteRtLm(undefined);
+    globalLiteRtLmPath = undefined;
   }
   setGlobalLiteRtLmPromise(undefined);
 }
@@ -88,6 +90,17 @@ export function unloadLiteRtLm(): void {
 /**
  * Get the global LiteRT-LM instance, or load it if it hasn't been loaded yet.
  */
-export function getOrLoadGlobalLiteRtLm(): Promise<LiteRtLm> {
-  return getGlobalLiteRtLmPromise() ?? loadLiteRtLm(LiteRtLm.DEFAULT_WASM_PATH);
+export function getOrLoadGlobalLiteRtLm(path?: UrlString): Promise<LiteRtLm> {
+  const liteRtLmPromise = getGlobalLiteRtLmPromise();
+  if (liteRtLmPromise) {
+    if (path && globalLiteRtLmPath !== path) {
+      throw new Error(
+          `LiteRT-LM is already loading / loaded with a different path ` +
+          `${globalLiteRtLmPath} but was requested to load ${path}. To ` +
+          `reload with a different path, call unloadLiteRtLm() first.`);
+    }
+    return liteRtLmPromise;
+  }
+  globalLiteRtLmPath = path ?? LiteRtLm.DEFAULT_WASM_PATH;
+  return liteRtLmPromise ?? loadLiteRtLm(globalLiteRtLmPath);
 }

@@ -22,6 +22,9 @@ import {supportsFeature} from './wasm_feature_detect.js';
 
 const WASM_JS_FILE_NAME = 'litertlm_wasm_internal.js';
 const WASM_JS_COMPAT_FILE_NAME = 'litertlm_wasm_compat_internal.js';
+const WASM_JS_ASYNCIFY_FILE_NAME = 'litertlm_wasm_asyncify_internal.js';
+const WASM_JS_COMPAT_ASYNCIFY_FILE_NAME =
+    'litertlm_wasm_compat_asyncify_internal.js';
 
 /**
  * Options for loading LiteRT-LM's Wasm module.
@@ -36,9 +39,13 @@ export async function load(
     path: UrlPath, options?: LoadOptions): Promise<LiteRtLm> {
   const pathString = pathToString(path);
   const relaxedSimd = await supportsFeature('relaxedSimd');
-  let fileName = WASM_JS_COMPAT_FILE_NAME;
+  const jspi = await supportsFeature('jspi');
+  let fileName = '';
   if (relaxedSimd) {
-    fileName = WASM_JS_FILE_NAME;
+    fileName = jspi ? WASM_JS_FILE_NAME : WASM_JS_ASYNCIFY_FILE_NAME;
+  } else {
+    fileName =
+        jspi ? WASM_JS_COMPAT_FILE_NAME : WASM_JS_COMPAT_ASYNCIFY_FILE_NAME;
   }
 
   let jsFilePath = path;

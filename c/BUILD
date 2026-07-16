@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# [Google-internal load of `cc_binary`]
 # [Google-internal load of `cc_library`]
 # [Google-internal load of `cc_test`]
 
@@ -42,6 +43,7 @@ ENGINE_COMMON_DEPS = [
     "@com_google_absl//absl/strings:string_view",
     "@com_google_absl//absl/time",
     "@nlohmann_json//:json",
+    "@litert//support/tokenizer",
     "//runtime/conversation",
     "//runtime/conversation:io_types",
     "//runtime/conversation/model_data_processor:config_registry",
@@ -58,7 +60,6 @@ ENGINE_COMMON_DEPS = [
     "//runtime/proto:token_cc_proto",
     "//runtime/util:logging",
     "//runtime/util:scoped_file",
-    "//runtime/components:tokenizer",
 ]
 
 cc_library(
@@ -117,4 +118,37 @@ cc_test(
         "//runtime/executor:executor_settings_base",
         "//runtime/executor:llm_executor_settings",
     ],
+)
+
+cc_binary(
+    name = "litert-lm",
+    srcs = [
+        "engine.cc",
+        "engine.h",
+    ],
+    copts = ["-fvisibility=hidden"],
+    features = ["-legacy_whole_archive"],
+    linkopts = select({
+        "@platforms//os:macos": [],
+        "@platforms//os:ios": [],
+        "@platforms//os:windows": [],
+        "//conditions:default": [
+            # Report unresolved symbol references as errors during linking.
+            "-Wl,--no-undefined",
+            # Strip all symbols to reduce library size (debug info is removed).
+            "-Wl,--strip-all",
+            # Remove unused sections/functions to further reduce library size.
+            "-Wl,--gc-sections",
+            # Ensure symbols are resolved internally first.
+            "-Wl,-Bsymbolic",
+            # Update the rpath
+            "-Wl,-rpath,$$ORIGIN",
+        ],
+    }),
+    linkshared = 1,
+    deps = ENGINE_COMMON_DEPS + [
+        "//runtime/core:engine_impl",
+    ] + select({
+        "//conditions:default": [],
+    }),
 )

@@ -157,7 +157,7 @@ export class Engine implements Deletable {
   }
 
   async createConversation(config?: ConversationConfig): Promise<Conversation> {
-    return this.mutexes.executor.acquireAndRun(() => {
+    return this.mutexes.executor.acquireAndRun(async () => {
       let wasmConfig: WasmConversationConfig;
       let wasmSessionConfig: WasmSessionConfig|undefined;
 
@@ -175,7 +175,7 @@ export class Engine implements Deletable {
       }
 
       const wasmConversation =
-          this.wasm.Conversation.create(this.engine, wasmConfig);
+          await this.wasm.Conversation.create(this.engine, wasmConfig);
 
       wasmConfig.delete();
       if (wasmSessionConfig) {
@@ -197,6 +197,9 @@ async function modelToStream(model: EngineSettings['model']):
     Promise<ReadableStream<Uint8Array>> {
   if (model instanceof ReadableStream) {
     return model;
+  }
+  if (model instanceof Blob) {
+    return model.stream();
   }
 
   const modelUrl = model;

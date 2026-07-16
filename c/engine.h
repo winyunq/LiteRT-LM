@@ -88,6 +88,10 @@ typedef struct LiteRtLmTokenUnion LiteRtLmTokenUnion;
 // Use `litert_lm_token_unions_delete` to free memory.
 typedef struct LiteRtLmTokenUnions LiteRtLmTokenUnions;
 
+// Opaque pointer for LiteRT LM Input Data.
+// Use `litert_lm_input_data_delete` to free memory.
+typedef struct LiteRtLmInputData LiteRtLmInputData;
+
 // Opaque pointer for LiteRT LM Session Config.
 typedef struct LiteRtLmSessionConfig LiteRtLmSessionConfig;
 
@@ -96,7 +100,6 @@ typedef struct LiteRtLmConversationConfig LiteRtLmConversationConfig;
 
 // Represents the type of sampler.
 typedef enum {
-  kLiteRtLmSamplerTypeUnspecified = 0,
   // Probabilistically pick among the top k tokens.
   kLiteRtLmSamplerTypeTopK = 1,
   // Probabilistically pick among the tokens such that the sum is greater
@@ -106,14 +109,45 @@ typedef enum {
   kLiteRtLmSamplerTypeGreedy = 3,
 } LiteRtLmSamplerType;
 
-// Parameters for the sampler.
-typedef struct {
-  LiteRtLmSamplerType type;
-  int32_t top_k;
-  float top_p;
-  float temperature;
-  int32_t seed;
-} LiteRtLmSamplerParams;
+// Opaque pointer for LiteRT LM Sampler Parameters.
+// Use `litert_lm_sampler_params_delete` to free memory.
+typedef struct LiteRtLmSamplerParams LiteRtLmSamplerParams;
+
+// Creates LiteRT LM Sampler Parameters with a specific sampler type.
+// The caller is responsible for destroying the parameters using
+// `litert_lm_sampler_params_delete`.
+//
+// @param type The sampler type to use.
+// @return A pointer to the created parameters, or NULL on failure.
+LITERT_LM_C_API_EXPORT
+LiteRtLmSamplerParams* litert_lm_sampler_params_create(
+    LiteRtLmSamplerType type);
+
+// Destroys LiteRT LM Sampler Parameters.
+//
+// @param params The parameters to destroy.
+LITERT_LM_C_API_EXPORT
+void litert_lm_sampler_params_delete(LiteRtLmSamplerParams* params);
+
+// Sets the top-k value.
+LITERT_LM_C_API_EXPORT
+void litert_lm_sampler_params_set_top_k(LiteRtLmSamplerParams* params,
+                                        int32_t top_k);
+
+// Sets the top-p value.
+LITERT_LM_C_API_EXPORT
+void litert_lm_sampler_params_set_top_p(LiteRtLmSamplerParams* params,
+                                        float top_p);
+
+// Sets the temperature.
+LITERT_LM_C_API_EXPORT
+void litert_lm_sampler_params_set_temperature(LiteRtLmSamplerParams* params,
+                                              float temperature);
+
+// Sets the seed.
+LITERT_LM_C_API_EXPORT
+void litert_lm_sampler_params_set_seed(LiteRtLmSamplerParams* params,
+                                       int32_t seed);
 
 // Creates a LiteRT LM Session Config.
 // The caller is responsible for destroying the config using
@@ -224,6 +258,15 @@ void litert_lm_conversation_config_set_filter_channel_content_from_kv_cache(
     LiteRtLmConversationConfig* config,
     bool filter_channel_content_from_kv_cache);
 
+// Sets whether to stream tool call tokens.
+// @param config The config to modify.
+// @param stream_tool_calls Whether to stream tool call tokens.
+// @param channel_name The channel name to use for tool call tokens.
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_config_set_stream_tool_calls(
+    LiteRtLmConversationConfig* config, bool stream_tool_calls,
+    const char* channel_name);
+
 // Destroys a LiteRT LM Conversation Config.
 // @param config The config to destroy.
 LITERT_LM_C_API_EXPORT
@@ -249,6 +292,13 @@ LITERT_LM_C_API_EXPORT
 void litert_lm_conversation_optional_args_set_visual_token_budget(
     LiteRtLmConversationOptionalArgs* optional_args, int visual_token_budget);
 
+// Sets the maximum number of output tokens for the conversation optional args.
+// @param optional_args The optional args to modify.
+// @param max_output_tokens The maximum number of output tokens.
+LITERT_LM_C_API_EXPORT
+void litert_lm_conversation_optional_args_set_max_output_tokens(
+    LiteRtLmConversationOptionalArgs* optional_args, int max_output_tokens);
+
 // Sets the minimum log level for the LiteRT LM library.
 // Log levels are: 0=VERBOSE, 1=DEBUG, 2=INFO, 3=WARNING, 4=ERROR, 5=FATAL,
 // 1000=SILENT.
@@ -264,16 +314,25 @@ typedef enum {
   kLiteRtLmInputDataTypeAudioEnd,
 } LiteRtLmInputDataType;
 
-// Represents a single piece of input data.
-typedef struct {
-  LiteRtLmInputDataType type;
-  // The data pointer. The interpretation depends on the `type`.
-  // For kInputText, it's a UTF-8 string.
-  // For kInputImage and kInputAudio, it's a pointer to the raw bytes.
-  const void* data;
-  // The size of the data in bytes.
-  size_t size;
-} LiteRtLmInputData;
+// Creates a LiteRT LM Input Data. The caller is responsible for destroying
+// the input data using `litert_lm_input_data_delete`.
+//
+// @param type The type of the input data.
+// @param data The data pointer. For kLiteRtLmInputDataTypeText, it's a UTF-8
+// string.
+//             For image/audio types, it's a pointer to the raw bytes.
+//             The data is copied internally.
+// @param size The size of the data in bytes.
+// @return A pointer to the created input data, or NULL on failure.
+LITERT_LM_C_API_EXPORT
+LiteRtLmInputData* litert_lm_input_data_create(LiteRtLmInputDataType type,
+                                               const void* data, size_t size);
+
+// Destroys a LiteRT LM Input Data.
+//
+// @param input_data The input data to destroy.
+LITERT_LM_C_API_EXPORT
+void litert_lm_input_data_delete(LiteRtLmInputData* input_data);
 
 // Creates LiteRT LM Engine Settings. The caller is responsible for destroying
 // the settings using `litert_lm_engine_settings_delete`.
@@ -288,6 +347,22 @@ LiteRtLmEngineSettings* litert_lm_engine_settings_create(
     const char* model_path, const char* backend_str,
     const char* vision_backend_str, const char* audio_backend_str);
 
+// Creates LiteRT LM Engine Settings from a raw file descriptor. The engine
+// takes ownership of the file descriptor and will close it when done.
+// The caller is responsible for destroying the settings using
+// `litert_lm_engine_settings_delete`.
+//
+// @param fd The file descriptor of the model.
+// @param backend_str The backend to use (e.g., "cpu", "gpu").
+// @param vision_backend_str The vision backend to use, or NULL if not set.
+// @param audio_backend_str The audio backend to use, or NULL if not set.
+// @return A pointer to the created settings, or NULL on failure.
+LITERT_LM_C_API_EXPORT
+LiteRtLmEngineSettings*
+litert_lm_engine_settings_create_from_raw_file_descriptor(
+    int fd, const char* backend_str, const char* vision_backend_str,
+    const char* audio_backend_str);
+
 // Destroys LiteRT LM Engine Settings.
 //
 // @param settings The settings to destroy.
@@ -301,6 +376,22 @@ void litert_lm_engine_settings_delete(LiteRtLmEngineSettings* settings);
 LITERT_LM_C_API_EXPORT
 void litert_lm_engine_settings_set_max_num_tokens(
     LiteRtLmEngineSettings* settings, int max_num_tokens);
+
+// Sets the number of threads for the CPU backend.
+//
+// @param settings The engine settings.
+// @param num_threads The number of threads.
+LITERT_LM_C_API_EXPORT
+void litert_lm_engine_settings_set_num_threads(LiteRtLmEngineSettings* settings,
+                                               int num_threads);
+
+// Sets the number of threads for the audio CPU backend.
+//
+// @param settings The engine settings.
+// @param num_threads The number of threads.
+LITERT_LM_C_API_EXPORT
+void litert_lm_engine_settings_set_audio_num_threads(
+    LiteRtLmEngineSettings* settings, int num_threads);
 
 // Sets whether the engine should load different sections of the litertlm file
 // in parallel. Defaults to true.
@@ -471,7 +562,7 @@ void litert_lm_session_cancel_process(LiteRtLmSession* session);
 // @return 0 on success, non-zero on failure.
 LITERT_LM_C_API_EXPORT
 int litert_lm_session_run_prefill(LiteRtLmSession* session,
-                                  const LiteRtLmInputData* inputs,
+                                  const LiteRtLmInputData* const* inputs,
                                   size_t num_inputs);
 
 // Starts the decoding process for the model to predict the response based
@@ -511,7 +602,7 @@ LiteRtLmResponses* litert_lm_session_run_text_scoring(LiteRtLmSession* session,
 //   responsible for deleting the responses using `litert_lm_responses_delete`.
 LITERT_LM_C_API_EXPORT
 LiteRtLmResponses* litert_lm_session_generate_content(
-    LiteRtLmSession* session, const LiteRtLmInputData* inputs,
+    LiteRtLmSession* session, const LiteRtLmInputData* const* inputs,
     size_t num_inputs);
 // Destroys a LiteRT LM Responses object.
 //
@@ -732,11 +823,9 @@ int litert_lm_session_run_decode_async(LiteRtLmSession* session,
 // callback.
 // @return 0 on success, non-zero on failure to start the stream.
 LITERT_LM_C_API_EXPORT
-int litert_lm_session_generate_content_stream(LiteRtLmSession* session,
-                                              const LiteRtLmInputData* inputs,
-                                              size_t num_inputs,
-                                              LiteRtLmStreamCallback callback,
-                                              void* callback_data);
+int litert_lm_session_generate_content_stream(
+    LiteRtLmSession* session, const LiteRtLmInputData* const* inputs,
+    size_t num_inputs, LiteRtLmStreamCallback callback, void* callback_data);
 
 // Creates a LiteRT LM Conversation. The caller is responsible for destroying
 // the conversation using `litert_lm_conversation_delete`.
@@ -831,6 +920,16 @@ int litert_lm_conversation_send_message_stream(
 LITERT_LM_C_API_EXPORT
 const char* litert_lm_conversation_render_message_to_string(
     LiteRtLmConversation* conversation, const char* message_json);
+
+// Renders the preface into a string according to the template.
+//
+// @param conversation The conversation instance.
+// @return A pointer to the rendered string, or NULL on failure. The returned
+//   string is owned by the `conversation` object and is valid until the next
+//   call to this function or until the conversation is deleted.
+LITERT_LM_C_API_EXPORT
+const char* litert_lm_conversation_render_preface_to_string(
+    LiteRtLmConversation* conversation);
 
 // Cancels the ongoing inference process, for asynchronous inference.
 //

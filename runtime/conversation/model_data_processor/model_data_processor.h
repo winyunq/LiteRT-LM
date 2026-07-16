@@ -25,13 +25,29 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
-#include "runtime/components/constrained_decoding/constraint.h"
+#include "support/preprocessor/audio_preprocessor.h"  // from @litert
+#include "support/preprocessor/audio_preprocessor_miniaudio.h"  // from @litert
+#include "support/preprocessor/image_preprocessor.h"  // from @litert
+#include "support/preprocessor/stb_image_preprocessor.h"  // from @litert
+#include "support/tokenizer/sentencepiece_tokenizer.h"  // from @litert
+#include "support/tokenizer/tokenizer.h"  // from @litert
+#include "runtime/components/logits_processor/constrained_decoding/constraint.h"
 #include "runtime/components/prompt_template.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/config_registry.h"
 #include "runtime/engine/io_types.h"
 
 namespace litert::lm {
+
+using ::litert::support::AudioPreprocessor;
+using ::litert::support::AudioPreprocessorConfig;
+using ::litert::support::AudioPreprocessorMiniAudio;
+using ::litert::support::ImagePreprocessor;
+using ::litert::support::ImagePreprocessParameter;
+using ::litert::support::SentencePieceTokenizer;
+using ::litert::support::StbImagePreprocessor;
+using ::litert::support::Tokenizer;
+using ::litert::support::TokenizerType;
 
 // ModelDataProcessor is a model-specific component that converts between the
 // generic Json messages and the Litert LM InputData type.

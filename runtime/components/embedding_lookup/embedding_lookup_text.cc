@@ -244,11 +244,14 @@ absl::Status EmbeddingLookupText::LookupPrefill(absl::Span<const int> tokens,
 }
 
 absl::StatusOr<std::unique_ptr<EmbeddingLookupText>>
-EmbeddingLookupText::Create(litert::Environment& env,
-                            const litert::Model* absl_nonnull model,
-                            std::optional<std::string> signature_key) {
-  auto handler = std::unique_ptr<EmbeddingLookupText>(
-      new EmbeddingLookupText(env, model, signature_key));
+EmbeddingLookupText::Create(
+    litert::Environment& env, const litert::Model* absl_nonnull model,
+    std::optional<std::string> signature_key,
+    std::optional<ScopedFile> external_weight_file,
+    litert::Options::ScopedWeightSectionMap external_weight_sections) {
+  auto handler = std::unique_ptr<EmbeddingLookupText>(new EmbeddingLookupText(
+      env, model, std::move(signature_key), std::move(external_weight_file),
+      std::move(external_weight_sections)));
   RETURN_IF_ERROR(handler->Initialize());
   return handler;
 }
@@ -261,6 +264,10 @@ absl::Status EmbeddingLookupText::Initialize() {
 #else
   options.SetHardwareAccelerators(litert::HwAccelerators::kCpu);
 #endif
+  if (external_weight_file_.has_value() && !external_weight_sections_.empty()) {
+    LITERT_RETURN_IF_ERROR(options.SetExternalWeightScopedFile(
+        *external_weight_file_, std::move(external_weight_sections_)));
+  }
 #if defined(__ANDROID__)
   LITERT_ASSIGN_OR_RETURN(::litert::qualcomm::QualcommOptions & qnn_opts,
                           options.GetQualcommOptions());

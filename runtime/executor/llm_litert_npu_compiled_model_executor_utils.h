@@ -15,19 +15,39 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_EXECUTOR_LLM_LITERT_NPU_COMPILED_MODEL_EXECUTOR_UTILS_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_EXECUTOR_LLM_LITERT_NPU_COMPILED_MODEL_EXECUTOR_UTILS_H_
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
+#include <vector>
 
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "litert/cc/litert_element_type.h"  // from @litert
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "litert/cc/litert_ranked_tensor_type.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
 
 namespace litert::lm {
+
+// Quantizes a float value to a quantized type T.
+template <typename T>
+T Quantize(float value, float scale, int32_t zero_point) {
+  int32_t qval = std::round(value / scale) + zero_point;
+  if constexpr (std::is_same_v<T, int16_t>) {
+    return static_cast<T>(std::clamp(qval, -32768, 32767));
+  } else if constexpr (std::is_same_v<T, int8_t>) {
+    return static_cast<T>(std::clamp(qval, -128, 127));
+  } else {
+    static_assert(std::is_same_v<T, int16_t> || std::is_same_v<T, int8_t>,
+                  "Unsupported quantization type.");
+  }
+}
+
 
 #if defined(__ANDROID__) && defined(__ARM_NEON)
 int FindMaxIndexFloatNeon(const float* data, int size);
@@ -128,14 +148,31 @@ struct HWQuantizationParams {
 // Performs manual per-layer embedding lookup.
 absl::Status HWPerLayerEmbeddingLookup(
     const int* token_ids, int num_tokens, const uint8_t* const* table_ptrs,
-    const HWQuantizationParams* quant_params, int num_tables, int col_size,
-    void* output_buffer, litert::ElementType output_type,
-    float final_scale = 1.0f, int32_t final_zero_point = 0);
+    const HWQuantizationParams* quant_params, int num_tables,
+    int ple_embedding_dim, void* output_buffer, litert::ElementType output_type,
+    litert::ElementType ple_table_element_type, float mul_scale = 1.0f,
+    float output_scale = 1.0f, int32_t final_zero_point = 0);
 
 // Dequantize logits to float32.
 absl::Status DequantizeLogits(const ::litert::TensorBuffer& src,
                               ::litert::TensorBuffer& dst, float scale,
                               int32_t zero_point, bool should_dump);
+
+// Writes PLE embeddings to the buffer, quantizing them to Int16 if needed.
+absl::Status WritePleEmbeddings(::litert::TensorBuffer& buffer,
+                                absl::Span<const float> ple_embeddings,
+                                litert::ElementType output_type,
+                                float final_scale, int32_t final_zero_point);
+
+// Writes PLE embeddings to the buffer, quantizing them to Int16 if needed,
+// and pads the remaining buffer space with a default embedding.
+absl::Status WriteAndPadPleEmbeddings(::litert::TensorBuffer& buffer,
+                                      absl::Span<const float> ple_embeddings,
+                                      size_t ple_dim, size_t seq_pos_size,
+                                      const std::vector<float>& default_ple_emb,
+                                      litert::ElementType output_type,
+                                      float final_scale,
+                                      int32_t final_zero_point);
 
 }  // namespace litert::lm
 

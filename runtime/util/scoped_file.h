@@ -15,12 +15,10 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_UTIL_SCOPED_FILE_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_UTIL_SCOPED_FILE_H_
 
-#include "litert/cc/internal/scoped_file.h"  // from @litert
+#include "support/util/scoped_file.h"  // from @litert
 
 namespace litert::lm {
-
-using ScopedFile = ::litert::ScopedFile;
-
-}  // namespace litert::lm
+using ScopedFile = ::litert::support::ScopedFile;
+}
 
 #endif  // THIRD_PARTY_ODML_LITERT_LM_RUNTIME_UTIL_SCOPED_FILE_H_

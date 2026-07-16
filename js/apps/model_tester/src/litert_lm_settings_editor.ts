@@ -125,7 +125,7 @@ export class LitertLmSettingsEditor extends LitElement {
       samplerBackend: Backend.GPU_ARTISAN,
       backendConfig: this.cpuConfig,
       advancedSettings: {
-        prefill_batch_sizes: new Set(),
+        prefill_batch_sizes: [],
         num_output_candidates: 1,
         configure_magic_numbers: true,
         verify_magic_numbers: false,
@@ -141,6 +141,7 @@ export class LitertLmSettingsEditor extends LitElement {
         share_constant_tensors: true,
       },
     },
+    benchmarkEnabled: false,
   };
 
   @state()
@@ -508,7 +509,7 @@ export class LitertLmSettingsEditor extends LitElement {
               const sizes = val.split(',')
                                 .map(s => Number(s.trim()))
                                 .filter(n => !isNaN(n));
-              this.updateAdvanced({prefill_batch_sizes: new Set(sizes)});
+              this.updateAdvanced({prefill_batch_sizes: sizes});
             },
             'Ordered set of the maximum number of prefill tokens processed at once when the graph has dynamic prefill lengths.')}
       ${

@@ -29,6 +29,7 @@
 #include "absl/types/span.h"  // from @com_google_absl
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
+#include "runtime/components/logits_processor/logits_processor.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/executor/llm_executor_settings.h"
@@ -41,15 +42,18 @@ namespace {
 // Converts the given ids to logits TensorBuffer in the shape of [batch_size,
 // vocab_size].
 void DecodeIdsToLogits(const std::vector<int>& ids, int vocab_size,
-                       ::litert::TensorBuffer& output_logits) {
+                       ::litert::TensorBuffer& output_logits,
+                       const FakeLlmExecutor::DecodeLogitsOptions& options) {
   auto logits_span = ReferTensorBufferAsSpan<float>(output_logits);
   for (int i = 0; i < ids.size(); ++i) {
     for (int j = 0; j < vocab_size; ++j) {
       int index = i * vocab_size + j;
       if (ids[i] == j) {
-        (*logits_span)[index] = std::numeric_limits<float>::max();
+        (*logits_span)[index] = options.match_value;
+      } else if (j == options.end_token_id) {
+        (*logits_span)[index] = options.mismatch_end_token_value;
       } else {
-        (*logits_span)[index] = std::numeric_limits<float>::lowest();
+        (*logits_span)[index] = options.mismatch_value;
       }
     }
   }
@@ -189,10 +193,10 @@ absl::StatusOr<std::vector<std::vector<int>>> FakeLlmExecutor::Decode(
         decode_times_));
   }
   std::vector<std::vector<int>> output_tokens;
-  if (decode_params.HasConstraintDecoder()) {
-    // If constraint decoder is set, we will decode logits and apply the mask
-    // from the constraint decoder to generate the final output tokens.
-    auto constraint_decoder = decode_params.GetConstraintDecoder();
+  if (!decode_params.GetLogitsProcessorList().empty()) {
+    // If the logits processor list is not empty, we will decode logits and
+    // apply the logits processor to the output logits.
+
     // Get the last token ids from the last prefill or decode call.
     LITERT_ASSIGN_OR_RETURN(auto last_token_ids,
                             CreateTensorBuffer<int>({batch_size_, 1}));
@@ -206,18 +210,23 @@ absl::StatusOr<std::vector<std::vector<int>>> FakeLlmExecutor::Decode(
       for (int i = 0; i < batch_size_; ++i) {
         (*last_token_ids_span)[i] = last_decode_tokens[i];
       }
-      // Update the constraint state with the last token ids.
-      RETURN_IF_ERROR(
-          constraint_decoder->UpdateConstraintState(last_token_ids));
+      // Update the logits processor state with the last token ids.
+      for (LogitsProcessor* logits_processor :
+           decode_params.GetLogitsProcessorList()) {
+        RETURN_IF_ERROR(logits_processor->UpdateState(last_token_ids));
+      }
     }
 
     LITERT_ASSIGN_OR_RETURN(
         auto output_logits,
         CreateTensorBuffer<float>({batch_size_, 1, vocab_size_}));
     DecodeIdsToLogits(decode_tokens_set_[decode_times_], vocab_size_,
-                      output_logits);
-    // Apply the mask from the constraint decoder to the logits.
-    RETURN_IF_ERROR(constraint_decoder->MaskLogits(output_logits));
+                      output_logits, decode_logits_options_);
+    // Apply the logits processor to the output logits.
+    for (LogitsProcessor* logits_processor :
+         decode_params.GetLogitsProcessorList()) {
+      RETURN_IF_ERROR(logits_processor->ProcessLogits(output_logits));
+    }
     output_tokens = DecodeLogitsToIds(batch_size_, vocab_size_, output_logits,
                                       decode_tokens_set_);
   } else {
@@ -254,7 +263,7 @@ absl::Status FakeLlmExecutor::Decode(const ExecutorInputs& inputs,
         absl::MakeSpan(decode_tokens_set_[decode_times_ - 1]), *input_span));
   }
   DecodeIdsToLogits(decode_tokens_set_[decode_times_], vocab_size_,
-                    output_logits);
+                    output_logits, decode_logits_options_);
   last_op_ = LastOp::kDecode;
   processed_tokens_.AddProcessedTokens(decode_tokens_set_[decode_times_]);
   decode_times_++;

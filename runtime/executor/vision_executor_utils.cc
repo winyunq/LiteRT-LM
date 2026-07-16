@@ -14,37 +14,72 @@
 
 #include "runtime/executor/vision_executor_utils.h"
 
+#include <optional>
+
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
+#include "absl/strings/string_view.h"  // from @com_google_absl
 #include "litert/cc/litert_macros.h"  // from @litert
+#include "litert/cc/litert_model.h"  // from @litert
+#include "litert/cc/litert_ranked_tensor_type.h"  // from @litert
 #include "runtime/components/model_resources.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/util/status_macros.h"
 
 namespace litert::lm {
 
+constexpr absl::string_view kFeatures = "features";
+
 absl::StatusOr<VisionExecutorProperties>
 GetVisionExecutorPropertiesFromModelResources(ModelResources& model_resources) {
   VisionExecutorProperties properties;
-  ASSIGN_OR_RETURN(
-      auto vision_adapter_model,
-      model_resources.GetTFLiteModel(ModelType::kTfLiteVisionAdapter));
-  LITERT_ASSIGN_OR_RETURN(auto adapter_output_tensor_type,
-                          vision_adapter_model->GetOutputTensorType(0, 0));
-  // Assume the adapter output tensor has shape [batch_size, num_tokens,
-  // embedding_size].
-  if (adapter_output_tensor_type.Layout().Dimensions().size() < 2) {
-    return absl::InvalidArgumentError(
-        absl::StrCat("The adapter output tensor has invalid dimensions: ",
-                     adapter_output_tensor_type.Layout().Dimensions().size()));
+  auto vision_adapter_model_or =
+      model_resources.GetTFLiteModel(ModelType::kTfLiteVisionAdapter);
+  const Model* vision_adapter_model = nullptr;
+  if (vision_adapter_model_or.ok()) {
+    vision_adapter_model = vision_adapter_model_or.value();
+  } else if (vision_adapter_model_or.status().code() !=
+             absl::StatusCode::kNotFound) {
+    return vision_adapter_model_or.status();
   }
-  properties.num_tokens_per_image =
-      adapter_output_tensor_type.Layout().Dimensions()
-          [adapter_output_tensor_type.Layout().Dimensions().size() - 2];
+
   ASSIGN_OR_RETURN(
       auto vision_encoder_model,
       model_resources.GetTFLiteModel(ModelType::kTfLiteVisionEncoder));
+
+  if (vision_adapter_model != nullptr) {
+    LITERT_ASSIGN_OR_RETURN(auto adapter_output_tensor_type,
+                            vision_adapter_model->GetOutputTensorType(0, 0));
+    if (adapter_output_tensor_type.Layout().Dimensions().size() < 2) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "The adapter output tensor has invalid dimensions: ",
+          adapter_output_tensor_type.Layout().Dimensions().size()));
+    }
+    properties.num_tokens_per_image =
+        adapter_output_tensor_type.Layout().Dimensions()
+            [adapter_output_tensor_type.Layout().Dimensions().size() - 2];
+  } else {
+    LITERT_ASSIGN_OR_RETURN(auto encoder_signature,
+                            vision_encoder_model->GetSignature(0));
+    auto features_output_or = encoder_signature.OutputTensorType(kFeatures);
+    std::optional<RankedTensorType> encoder_output_tensor_type;
+    if (features_output_or.HasValue()) {
+      encoder_output_tensor_type = features_output_or.Value();
+    } else {
+      LITERT_ASSIGN_OR_RETURN(auto fallback_output,
+                              encoder_signature.OutputTensorType(0));
+      encoder_output_tensor_type = fallback_output;
+    }
+    if (encoder_output_tensor_type->Layout().Dimensions().size() < 2) {
+      return absl::InvalidArgumentError(absl::StrCat(
+          "The encoder output tensor has invalid dimensions: ",
+          encoder_output_tensor_type->Layout().Dimensions().size()));
+    }
+    properties.num_tokens_per_image =
+        encoder_output_tensor_type->Layout().Dimensions()
+            [encoder_output_tensor_type->Layout().Dimensions().size() - 2];
+  }
 
   LITERT_ASSIGN_OR_RETURN(auto encoder_input_names,
                           vision_encoder_model->GetSignatureInputNames(0));

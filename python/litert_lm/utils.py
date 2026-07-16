@@ -15,24 +15,32 @@
 
 import ctypes
 from . import interfaces
-from ._ffi import LiteRtLmSamplerParams
 from ._ffi import SamplerType
 from ._ffi import TokenUnionType
 
 
 def _sampler_config_to_params(
+    lib,
     config: interfaces.SamplerConfig | None,
-) -> LiteRtLmSamplerParams:
-  """Converts a SamplerConfig to a LiteRtLmSamplerParams ctypes structure."""
-  params = LiteRtLmSamplerParams()
+) -> ctypes.c_void_p:
+  """Converts a SamplerConfig to a LiteRtLmSamplerParams opaque pointer."""
+  params = lib.litert_lm_sampler_params_create(SamplerType.TOP_P)
+  if not params:
+    raise RuntimeError("Failed to create LiteRtLmSamplerParams")
+
   if config is not None:
-    params.type = SamplerType.TOP_P
-    params.top_k = config.top_k if config.top_k is not None else 40
-    params.top_p = config.top_p if config.top_p is not None else 0.95
-    params.temperature = (
-        config.temperature if config.temperature is not None else 1.0
+    lib.litert_lm_sampler_params_set_top_k(
+        params, config.top_k if config.top_k is not None else 1
     )
-    params.seed = config.seed if config.seed is not None else 0
+    lib.litert_lm_sampler_params_set_top_p(
+        params, config.top_p if config.top_p is not None else 0.95
+    )
+    lib.litert_lm_sampler_params_set_temperature(
+        params, config.temperature if config.temperature is not None else 1.0
+    )
+    lib.litert_lm_sampler_params_set_seed(
+        params, config.seed if config.seed is not None else 0
+    )
   return params
 
 

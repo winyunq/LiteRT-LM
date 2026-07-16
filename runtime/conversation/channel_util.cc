@@ -62,12 +62,14 @@ ExtractChannelContent(const std::vector<Channel>& channels,
       std::string text_inside;
       std::string end_match;
 
+      bool matched = false;
       if (open_channel_name.has_value() &&
           *open_channel_name == channel.channel_name) {
         RE2 first_re("(?s)(.*?)(" + escaped_end + "|$)");
         if (RE2::Consume(&remaining_content, first_re, &text_inside,
                          &end_match)) {
           channel_content += text_inside;
+          matched = true;
         }
       }
 
@@ -75,10 +77,11 @@ ExtractChannelContent(const std::vector<Channel>& channels,
                           &end_match)) {
         new_content += text_before;
         channel_content += text_inside;
+        matched = true;
       }
       new_content += std::string(remaining_content);
 
-      if (!channel_content.empty()) {
+      if (matched) {
         content = new_content;
         extracted_fields[channel.channel_name] += channel_content;
       }

@@ -61,8 +61,8 @@
 #include "runtime/executor/vision_executor_settings.h"
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/file_util.h"
-#include "tflite/delegates/xnnpack/xnnpack_delegate.h"  // from @litert
 #include "runtime/util/status_macros.h"  // NOLINT
+#include "tflite/delegates/xnnpack/xnnpack_delegate.h"  // from @litert
 
 namespace litert::lm {
 
@@ -237,26 +237,14 @@ absl::Status VisionLiteRtCompiledModelExecutor::VisionEncoder::Initialize() {
     case Backend::GPU: {
       // TODO: b/403132820 - Add accelerator compilation options for ML_DRIFT.
       LITERT_ASSIGN_OR_RETURN(auto& gpu_options, options.GetGpuOptions());
-      ASSIGN_OR_RETURN(auto model_path,
-                       vision_executor_settings_.GetModelAssets().GetPath());
-      absl::string_view model_basename = Basename(model_path);
-      LITERT_ASSIGN_OR_RETURN(std::string metadata_id,
-                              GetFileCacheIdentifier(model_path));
-      std::string cache_key =
-          absl::StrCat(model_basename, VisionExecutorSettings::kEncoderName,
-                       "_", metadata_id);
-      ABSL_LOG(INFO) << "Vision cache key: " << cache_key;
-      auto program_cache_file = vision_executor_settings_.GetProgramCacheFile(
-          absl::StrCat(VisionExecutorSettings::kEncoderName,
-                       ExecutorSettingsBase::kMlDriftCacheSuffix),
-          /*check_and_clean=*/true);
-      auto weight_cache_file = vision_executor_settings_.GetWeightCacheFile(
-          absl::StrCat(VisionExecutorSettings::kEncoderName,
-                       ExecutorSettingsBase::kMlDriftCacheSuffix),
-          /*check_and_clean=*/true);
+      ASSIGN_OR_RETURN(
+          const auto cache_files,
+          GetGpuModelCacheData(vision_executor_settings_,
+                               VisionExecutorSettings::kEncoderName));
       RETURN_IF_ERROR(SetGpuOptions(vision_executor_settings_, gpu_options));
       RETURN_IF_ERROR(SetGpuCacheOptions(
-          weight_cache_file, program_cache_file, cache_key,
+          cache_files.weight_cache_file, cache_files.program_cache_file,
+          cache_files.cache_key,
           /*logging_prefix=*/VisionExecutorSettings::kEncoderName,
           /*cache_compiled_shaders_only=*/false, gpu_options));
       options.SetHardwareAccelerators(litert::HwAccelerators::kGpu);
@@ -328,25 +316,13 @@ absl::Status VisionLiteRtCompiledModelExecutor::VisionAdapter::Initialize() {
     }
     case Backend::GPU: {
       LITERT_ASSIGN_OR_RETURN(auto& gpu_options, options.GetGpuOptions());
-      LITERT_RETURN_IF_ERROR(
-          SetGpuOptions(vision_executor_settings_, gpu_options));
-      ASSIGN_OR_RETURN(auto model_path,
-                       vision_executor_settings_.GetModelAssets().GetPath());
-      absl::string_view model_basename = Basename(model_path);
-      auto program_cache_file = vision_executor_settings_.GetProgramCacheFile(
-          absl::StrCat(VisionExecutorSettings::kAdapterName,
-                       ExecutorSettingsBase::kMlDriftCacheSuffix),
-          /*check_and_clean=*/true);
-      auto weight_cache_file = vision_executor_settings_.GetWeightCacheFile(
-          absl::StrCat(VisionExecutorSettings::kAdapterName,
-                       ExecutorSettingsBase::kMlDriftCacheSuffix),
-          /*check_and_clean=*/true);
-      ASSIGN_OR_RETURN(std::string metadata_id,
-                       GetFileCacheIdentifier(model_path));
+      ASSIGN_OR_RETURN(
+          const auto cache_files,
+          GetGpuModelCacheData(vision_executor_settings_,
+                               VisionExecutorSettings::kAdapterName));
       RETURN_IF_ERROR(SetGpuCacheOptions(
-          weight_cache_file, program_cache_file,
-          absl::StrCat(model_basename, VisionExecutorSettings::kAdapterName,
-                       "_", metadata_id),
+          cache_files.weight_cache_file, cache_files.program_cache_file,
+          cache_files.cache_key,
           /*logging_prefix=*/VisionExecutorSettings::kAdapterName,
           /*cache_compiled_shaders_only=*/false, gpu_options));
 
@@ -409,10 +385,12 @@ litert::lm::VisionLiteRtCompiledModelExecutor::Create(
   if (!vision_encoder_model) {
     return absl::InternalError("Failed to build LiteRt encoder model.");
   }
-  ASSIGN_OR_RETURN(auto vision_adapter_model,
-                   resources->GetTFLiteModel(ModelType::kTfLiteVisionAdapter));
-  if (!vision_adapter_model) {
-    return absl::InternalError("Failed to build LiteRt adapter model.");
+  // Vision adapter is optional.
+  auto vision_adapter_model =
+      resources->GetTFLiteModel(ModelType::kTfLiteVisionAdapter);
+  if (!vision_adapter_model.ok() &&
+      vision_adapter_model.status().code() != absl::StatusCode::kNotFound) {
+    return vision_adapter_model.status();
   }
   ASSIGN_OR_RETURN(
       auto vision_executor_properties,
@@ -423,10 +401,13 @@ litert::lm::VisionLiteRtCompiledModelExecutor::Create(
       VisionEncoder::Create(env, vision_encoder_model, vision_executor_settings,
                             vision_executor_properties));
 
-  ASSIGN_OR_RETURN(
-      auto vision_adapter,
-      VisionAdapter::Create(env, vision_adapter_model, vision_executor_settings,
-                            vision_executor_properties));
+  std::unique_ptr<VisionAdapter> vision_adapter;
+  if (vision_adapter_model.ok()) {
+    ASSIGN_OR_RETURN(vision_adapter,
+                     VisionAdapter::Create(env, *vision_adapter_model,
+                                           vision_executor_settings,
+                                           vision_executor_properties));
+  }
 
   LITERT_ASSIGN_OR_RETURN(auto tensor_type,
                           vision_encoder_model->GetInputTensorType(0, 0));
@@ -453,6 +434,23 @@ litert::lm::VisionLiteRtCompiledModelExecutor::Create(
 
 absl::StatusOr<ExecutorVisionData> VisionLiteRtCompiledModelExecutor::Encode(
     const litert::TensorBuffer& input_image_tensor) {
+  LITERT_ASSIGN_OR_RETURN(auto input_image_data,
+                          ReferTensorBufferAsSpan<float>(input_image_tensor));
+  LITERT_RETURN_IF_ERROR(
+      vision_encoder_->GetMutableInputBuffers()[0].Write<float>(
+          input_image_data));
+
+  if (vision_adapter_ == nullptr) {
+    LITERT_ASSIGN_OR_RETURN(
+        auto encoder_outputs,
+        vision_encoder_->GetCompiledModel().CreateOutputBuffers(0));
+    LITERT_RETURN_IF_ERROR(vision_encoder_->GetCompiledModel().Run(
+        /*input_buffers=*/vision_encoder_->GetInputBuffers(),
+        /*output_buffers=*/encoder_outputs));
+    return ExecutorVisionData(std::move(encoder_outputs[0]),
+                              /*per_layer_embeddings=*/std::nullopt);
+  }
+
   LITERT_ASSIGN_OR_RETURN(
       auto output_tensor_buffers,
       vision_adapter_->GetCompiledModel().CreateOutputBuffers(0));
@@ -463,11 +461,6 @@ absl::StatusOr<ExecutorVisionData> VisionLiteRtCompiledModelExecutor::Encode(
                      output_tensor_buffers.size()));
   }
 
-  LITERT_ASSIGN_OR_RETURN(auto input_image_data,
-                          ReferTensorBufferAsSpan<float>(input_image_tensor));
-  LITERT_RETURN_IF_ERROR(
-      vision_encoder_->GetMutableInputBuffers()[0].Write<float>(
-          input_image_data));
   auto& encoder_outputs = vision_encoder_->GetMutableOutputBuffers();
   if (encoder_outputs[0].IsWebGpuMemory() ||
       encoder_outputs[0].IsMetalMemory()) {
@@ -518,10 +511,13 @@ absl::StatusOr<ExecutorVisionData> VisionLiteRtCompiledModelExecutor::Encode(
                    GetVitSignatureIndex(vision_encoder_->GetModel(),
                                         vision_executor_properties_,
                                         num_patches_from_input));
-  ASSIGN_OR_RETURN(auto adapter_signature_index,
-                   GetVitSignatureIndex(vision_adapter_->GetModel(),
-                                        vision_executor_properties_,
-                                        num_patches_from_input));
+  std::optional<int> adapter_signature_index;
+  if (vision_adapter_ != nullptr) {
+    ASSIGN_OR_RETURN(adapter_signature_index,
+                     GetVitSignatureIndex(vision_adapter_->GetModel(),
+                                          vision_executor_properties_,
+                                          num_patches_from_input));
+  }
   LITERT_ASSIGN_OR_RETURN(
       auto encoder_input_buffers,
       vision_encoder_->GetCompiledModel().CreateInputBuffers(
@@ -530,23 +526,28 @@ absl::StatusOr<ExecutorVisionData> VisionLiteRtCompiledModelExecutor::Encode(
   LITERT_ASSIGN_OR_RETURN(
       auto encoder_signature,
       vision_encoder_->GetModel().GetSignature(encoder_signature_index));
-  LITERT_ASSIGN_OR_RETURN(
-      auto adapter_signature,
-      vision_adapter_->GetModel().GetSignature(adapter_signature_index));
   ABSL_LOG(INFO) << "encoder_signature_index: " << encoder_signature_index
                  << " name: " << encoder_signature.Key();
-  ABSL_LOG(INFO) << "adapter_signature_index: " << adapter_signature_index
-                 << " name: " << adapter_signature.Key();
+  if (vision_adapter_ != nullptr) {
+    LITERT_ASSIGN_OR_RETURN(
+        auto adapter_signature,
+        vision_adapter_->GetModel().GetSignature(*adapter_signature_index));
+    ABSL_LOG(INFO) << "adapter_signature_index: " << *adapter_signature_index
+                   << " name: " << adapter_signature.Key();
+  }
 
-  LITERT_ASSIGN_OR_RETURN(
-      auto adapter_output_tensor_buffers,
-      vision_adapter_->GetCompiledModel().CreateOutputBuffers(
-          adapter_signature_index));
-  if (adapter_output_tensor_buffers.size() != 1) {
-    return absl::InternalError(
-        absl::StrCat("The Vision Adapter model must have exactly one output "
-                     "buffer but got ",
-                     adapter_output_tensor_buffers.size()));
+  std::vector<TensorBuffer> adapter_output_tensor_buffers;
+  if (vision_adapter_ != nullptr) {
+    LITERT_ASSIGN_OR_RETURN(
+        adapter_output_tensor_buffers,
+        vision_adapter_->GetCompiledModel().CreateOutputBuffers(
+            *adapter_signature_index));
+    if (adapter_output_tensor_buffers.size() != 1) {
+      return absl::InternalError(
+          absl::StrCat("The Vision Adapter model must have exactly one output "
+                       "buffer but got ",
+                       adapter_output_tensor_buffers.size()));
+    }
   }
 
   for (const auto& [key, value] : input_maps) {
@@ -650,56 +651,77 @@ absl::StatusOr<ExecutorVisionData> VisionLiteRtCompiledModelExecutor::Encode(
   LITERT_RETURN_IF_ERROR(encoder_output_buffers[features_index].Read<float>(
       absl::MakeSpan(encoder_output_data)));
 
-  LITERT_ASSIGN_OR_RETURN(
-      auto adapter_input_buffers,
-      vision_adapter_->GetCompiledModel().CreateInputBuffers(
-          adapter_signature_index));
-  adapter_input_buffers[0].Clear();
-  LITERT_RETURN_IF_ERROR(adapter_input_buffers[0].Write<float>(absl::MakeSpan(
-      encoder_output_data.data(), num_patches * encoder_output_dim)));
+  if (vision_adapter_ != nullptr) {
+    LITERT_ASSIGN_OR_RETURN(
+        auto adapter_input_buffers,
+        vision_adapter_->GetCompiledModel().CreateInputBuffers(
+            *adapter_signature_index));
+    adapter_input_buffers[0].Clear();
+    LITERT_RETURN_IF_ERROR(adapter_input_buffers[0].Write<float>(absl::MakeSpan(
+        encoder_output_data.data(), num_patches * encoder_output_dim)));
 
-  LITERT_RETURN_IF_ERROR(vision_adapter_->GetCompiledModel().Run(
-      adapter_signature_index,
-      /*input_buffers=*/adapter_input_buffers,
-      /*output_buffers=*/adapter_output_tensor_buffers));
+    LITERT_RETURN_IF_ERROR(vision_adapter_->GetCompiledModel().Run(
+        *adapter_signature_index,
+        /*input_buffers=*/adapter_input_buffers,
+        /*output_buffers=*/adapter_output_tensor_buffers));
 
-  // Create the final output tensor with the correct number of patches.
-  LITERT_ASSIGN_OR_RETURN(auto adapter_output_tensor_type,
-                          adapter_output_tensor_buffers[0].TensorType());
-  RankedTensorType output_tensor_type(
-      GetElementType<float>(),
-      Layout(
-          Dimensions({1, num_patches,
-                      adapter_output_tensor_type.Layout().Dimensions()[2]})));
-  LITERT_ASSIGN_OR_RETURN(
-      auto output_tensor,
-      TensorBuffer::CreateManaged(
-          env_, TensorBufferType::kHostMemory, output_tensor_type,
-          output_tensor_type.Layout().Dimensions()[1] *
-              output_tensor_type.Layout().Dimensions()[2] * sizeof(float)));
+    LITERT_ASSIGN_OR_RETURN(auto adapter_output_tensor_type,
+                            adapter_output_tensor_buffers[0].TensorType());
+    RankedTensorType output_tensor_type(
+        GetElementType<float>(),
+        Layout(
+            Dimensions({1, num_patches,
+                        adapter_output_tensor_type.Layout().Dimensions()[2]})));
+    LITERT_ASSIGN_OR_RETURN(
+        auto output_tensor,
+        TensorBuffer::CreateManaged(
+            env_, TensorBufferType::kHostMemory, output_tensor_type,
+            output_tensor_type.Layout().Dimensions()[1] *
+                output_tensor_type.Layout().Dimensions()[2] * sizeof(float)));
+
+    const int output_dim = output_tensor_type.Layout().Dimensions()[2];
+
 #if !defined(LITERT_DISABLE_NPU)
-  // This code runs if LITERT_DISABLE_NPU is NOT defined (i.e., NPU is ENABLED)
-  LITERT_ASSIGN_OR_RETURN(int adapter_output_num_elements,
-                          adapter_output_tensor_type.Layout().NumElements());
-  std::vector<float> adapter_output_data(adapter_output_num_elements);
-  LITERT_RETURN_IF_ERROR(adapter_output_tensor_buffers[0].Read<float>(
-      absl::MakeSpan(adapter_output_data)));
+    LITERT_ASSIGN_OR_RETURN(int adapter_output_num_elements,
+                            adapter_output_tensor_type.Layout().NumElements());
+    std::vector<float> adapter_output_data(adapter_output_num_elements);
+    LITERT_RETURN_IF_ERROR(adapter_output_tensor_buffers[0].Read<float>(
+        absl::MakeSpan(adapter_output_data)));
 
-  LITERT_RETURN_IF_ERROR(output_tensor.Write<float>(
-      absl::MakeConstSpan(adapter_output_data)
-          .subspan(0,
-                   num_patches * output_tensor_type.Layout().Dimensions()[2])));
+    LITERT_RETURN_IF_ERROR(
+        output_tensor.Write<float>(absl::MakeConstSpan(adapter_output_data)
+                                       .subspan(0, num_patches * output_dim)));
 #else
-  // This code runs if LITERT_DISABLE_NPU IS defined (i.e., NPU is DISABLED)
-  LITERT_ASSIGN_OR_RETURN(
-      auto adapter_output_data,
-      ReferTensorBufferAsSpan<float>(adapter_output_tensor_buffers[0]));
+    LITERT_ASSIGN_OR_RETURN(
+        auto adapter_output_data,
+        ReferTensorBufferAsSpan<float>(adapter_output_tensor_buffers[0]));
 
-  LITERT_RETURN_IF_ERROR(output_tensor.Write<float>(adapter_output_data.subspan(
-      0, num_patches * output_tensor_type.Layout().Dimensions()[2])));
+    LITERT_RETURN_IF_ERROR(output_tensor.Write<float>(
+        adapter_output_data.subspan(0, num_patches * output_dim)));
 #endif  // !defined(LITERT_DISABLE_NPU)
-  return ExecutorVisionData(std::move(output_tensor),
-                            /*per_layer_embeddings=*/std::nullopt);
+
+    return ExecutorVisionData(std::move(output_tensor),
+                              /*per_layer_embeddings=*/std::nullopt);
+  } else {
+    RankedTensorType output_tensor_type(
+        GetElementType<float>(),
+        Layout(Dimensions({1, num_patches, encoder_output_dim})));
+    LITERT_ASSIGN_OR_RETURN(
+        auto output_tensor,
+        TensorBuffer::CreateManaged(
+            env_, TensorBufferType::kHostMemory, output_tensor_type,
+            output_tensor_type.Layout().Dimensions()[1] *
+                output_tensor_type.Layout().Dimensions()[2] * sizeof(float)));
+
+    const int output_dim = output_tensor_type.Layout().Dimensions()[2];
+
+    LITERT_RETURN_IF_ERROR(
+        output_tensor.Write<float>(absl::MakeConstSpan(encoder_output_data)
+                                       .subspan(0, num_patches * output_dim)));
+
+    return ExecutorVisionData(std::move(output_tensor),
+                              /*per_layer_embeddings=*/std::nullopt);
+  }
 }
 
 absl::StatusOr<VisionExecutorProperties>

@@ -46,11 +46,12 @@
 #include "runtime/components/embedding_lookup/embedding_lookup_manager.h"
 #include "runtime/components/embedding_lookup/embedding_lookup_text.h"
 #include "runtime/components/model_resources.h"
-#include "runtime/components/model_resources_task.h"
 #include "runtime/components/model_resources_litert_lm.h"  // IWYU pragma: keep
+#include "runtime/components/model_resources_task.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/file_format_util.h"
+#include "runtime/util/file_util.h"
 #include "runtime/util/litert_lm_loader.h"
 #include "runtime/util/model_asset_bundle_resources.h"
 #include "runtime/util/scoped_file.h"
@@ -106,7 +107,8 @@ BuildModelResourcesFromTaskFormat(const ModelAssets& model_assets) {
 }
 
 absl::StatusOr<std::unique_ptr<ModelResources>>
-BuildModelResourcesFromLitertLmFormat(const ModelAssets& model_assets) {
+BuildModelResourcesFromLitertLmFormat(const ModelAssets& model_assets,
+                                      bool enable_file_backed_model_loading) {
   std::unique_ptr<LitertLmLoader> loader;
   if (model_assets.HasMemoryMappedFile()) {
     ASSIGN_OR_RETURN(auto memory_mapped_file,
@@ -120,7 +122,8 @@ BuildModelResourcesFromLitertLmFormat(const ModelAssets& model_assets) {
     ASSIGN_OR_RETURN(auto duplicate_file, scoped_file->Duplicate());
     ASSIGN_OR_RETURN(loader, LitertLmLoader::Create(std::move(duplicate_file)));
   }
-  return ModelResourcesLitertLm::Create(std::move(loader));
+  return ModelResourcesLitertLm::Create(
+      std::move(loader), enable_file_backed_model_loading);
 }
 
 }  // namespace
@@ -389,13 +392,15 @@ absl::Status FillAttentionMask(litert::TensorBuffer& mask, int start_timestep,
 }
 
 absl::StatusOr<std::unique_ptr<ModelResources>>
-BuildLiteRtCompiledModelResources(const ModelAssets& model_assets) {
+BuildLiteRtCompiledModelResources(const ModelAssets& model_assets,
+                                  bool enable_file_backed_model_loading) {
   ASSIGN_OR_RETURN(auto format, GetFileFormat(model_assets));
   switch (format) {
     case FileFormat::TASK:
       return BuildModelResourcesFromTaskFormat(model_assets);
     case FileFormat::LITERT_LM:
-      return BuildModelResourcesFromLitertLmFormat(model_assets);
+      return BuildModelResourcesFromLitertLmFormat(
+          model_assets, enable_file_backed_model_loading);
     default:
       return absl::InvalidArgumentError("Unsupported file format.");
   }
@@ -552,6 +557,54 @@ absl::Status SetGpuCacheOptions(
     gpu_options.SetSerializeProgramCache(false);
   }
   return absl::OkStatus();
+}
+
+absl::StatusOr<GpuModelCacheData> GetGpuModelCacheData(
+    const ExecutorSettingsBase& executor_settings,
+    absl::string_view cache_name) {
+  GpuModelCacheData cache_data;
+  // Skip if cache is explicitly disabled.
+  if (executor_settings.GetCacheDir() != ":nocache") {
+    auto model_path = executor_settings.GetModelAssets().GetPath().value_or("");
+    std::string model_basename = std::string(Basename(model_path));
+    cache_data.program_cache_file = executor_settings.GetProgramCacheFile(
+        absl::StrCat(cache_name, ExecutorSettingsBase::kMlDriftCacheSuffix),
+        /*check_and_clean=*/true);
+    cache_data.weight_cache_file = executor_settings.GetWeightCacheFile(
+        absl::StrCat(cache_name,
+                     ExecutorSettingsBase::kMlDriftWeightCacheSuffix),
+        /*check_and_clean=*/true);
+    if (!model_path.empty()) {
+      ASSIGN_OR_RETURN(std::string metadata_id,
+                       GetFileCacheIdentifier(model_path));
+      if (cache_data.program_cache_file.ok() ||
+          cache_data.weight_cache_file.ok()) {
+        cache_data.cache_key =
+            absl::StrCat(model_basename, cache_name, "_", metadata_id);
+      }
+    } else {
+      // If the model path is empty, we should still set a cache key. This
+      // cache key should include the file timestamp and size in order
+      // to be able to detect changes in the model files.
+      LITERT_ASSIGN_OR_RETURN(
+          auto scoped_file, executor_settings.GetModelAssets().GetScopedFile());
+      bool has_valid_program_cache_fd =
+          cache_data.program_cache_file.ok() &&
+          std::holds_alternative<std::shared_ptr<litert::lm::ScopedFile>>(
+              *cache_data.program_cache_file);
+      bool has_valid_weight_cache_fd =
+          cache_data.weight_cache_file.ok() &&
+          std::holds_alternative<std::shared_ptr<litert::lm::ScopedFile>>(
+              *cache_data.weight_cache_file);
+      if (scoped_file != nullptr &&
+          (has_valid_program_cache_fd || has_valid_weight_cache_fd)) {
+        LITERT_ASSIGN_OR_RETURN(std::string metadata_id,
+                                GetFileCacheIdentifier(*scoped_file));
+        cache_data.cache_key = absl::StrCat("fd_", metadata_id);
+      }
+    }
+  }
+  return cache_data;
 }
 
 }  // namespace litert::lm

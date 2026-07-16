@@ -47,11 +47,14 @@ EmbeddingLookupManager::Create(
     const litert::Model* absl_nonnull text_embedding_model,
     absl::flat_hash_map<int, const litert::Model*>&
         end_of_multi_modal_embedding_models,
-    bool fully_supports_multi_modal, std::optional<std::string> signature_key) {
+    bool fully_supports_multi_modal, std::optional<std::string> signature_key,
+    std::optional<ScopedFile> external_weight_file,
+    litert::Options::ScopedWeightSectionMap external_weight_sections) {
   auto embedding_lookup_manager = std::make_unique<EmbeddingLookupManager>();
   RETURN_IF_ERROR(embedding_lookup_manager->Initialize(
       env, text_embedding_model, end_of_multi_modal_embedding_models,
-      fully_supports_multi_modal, signature_key));
+      fully_supports_multi_modal, std::move(signature_key),
+      std::move(external_weight_file), std::move(external_weight_sections)));
   return std::move(embedding_lookup_manager);
 }
 
@@ -59,11 +62,15 @@ absl::StatusOr<std::unique_ptr<EmbeddingLookupManager>>
 EmbeddingLookupManager::Create(
     litert::Environment& env,
     const litert::Model* absl_nonnull text_embedding_model,
-    bool fully_supports_multi_modal, std::optional<std::string> signature_key) {
+    bool fully_supports_multi_modal, std::optional<std::string> signature_key,
+    std::optional<ScopedFile> external_weight_file,
+    litert::Options::ScopedWeightSectionMap external_weight_sections) {
   absl::flat_hash_map<int, const litert::Model*>
       end_of_multi_modal_embedding_models;
   return Create(env, text_embedding_model, end_of_multi_modal_embedding_models,
-                fully_supports_multi_modal, signature_key);
+                fully_supports_multi_modal, std::move(signature_key),
+                std::move(external_weight_file),
+                std::move(external_weight_sections));
 }
 
 absl::Status EmbeddingLookupManager::UpdateMultiModalEmbeddings(
@@ -243,7 +250,9 @@ absl::Status EmbeddingLookupManager::Initialize(
     const litert::Model* absl_nonnull text_embedding_model,
     absl::flat_hash_map<int, const litert::Model*>&
         end_of_multi_modal_embedding_models,
-    bool fully_supports_multi_modal, std::optional<std::string> signature_key) {
+    bool fully_supports_multi_modal, std::optional<std::string> signature_key,
+    std::optional<ScopedFile> external_weight_file,
+    litert::Options::ScopedWeightSectionMap external_weight_sections) {
   if (!fully_supports_multi_modal &&
       !end_of_multi_modal_embedding_models.empty()) {
     return absl::InvalidArgumentError(
@@ -251,9 +260,12 @@ absl::Status EmbeddingLookupManager::Initialize(
         "end_of_multi_modal_embedding_models must be empty.");
   }
   fully_supports_multi_modal_ = fully_supports_multi_modal;
-  ASSIGN_OR_RETURN(text_embedding_lookup_,
-                   EmbeddingLookupText::Create(
-                       env, std::move(text_embedding_model), signature_key));
+  ASSIGN_OR_RETURN(
+      text_embedding_lookup_,
+      EmbeddingLookupText::Create(env, std::move(text_embedding_model),
+                                  std::move(signature_key),
+                                  std::move(external_weight_file),
+                                  std::move(external_weight_sections)));
   for (const auto& [special_token, embedding_model] :
        end_of_multi_modal_embedding_models) {
     ASSIGN_OR_RETURN(auto end_of_multi_modal_embedding_lookup,

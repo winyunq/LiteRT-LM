@@ -90,7 +90,7 @@ fetch the latest prebuilt binaries.
 
 > Note: In order to run on GPU on all platforms, we need to take extra steps:
 >
-> 1.  Add `--define=litert_link_capi_so=true`
+> 1.  Add `--define=litert_runtime_link_mode=dynamic`
 >     `--define=resolve_symbols_in_exec=false` in the build command.
 > 1.  `mkdir -p <test_dir>; cp <your litert_lm_main> <test_dir>; cp
 >     ./prebuilt/<your OS>/<shared libaries> <test_dir>/` and make sure the

@@ -2,14 +2,14 @@
 
 workspace(name = "litert_lm")
 
-# UPDATED = 2026-06-01
-LITERT_REF = "a412f505023085780a098e777b8eb816c07347f2"
+# UPDATED = 2026-06-29
+LITERT_REF = "622f1f3c1352f4bc2925061b8cb72e9ce52874fe"
 
-LITERT_SHA256 = "ecf5c89b916b1736a2f6f043f68ef7a77886b99121afd7ddd4b3625d921de64b"
+LITERT_SHA256 = "f3fd51d1e1eb33472ba425462bf53b05ad02bddca9cd58c61209d4a8be7829d0"
 
-TENSORFLOW_REF = "f27f017d53a4e81e86d1a1926b9a16bb4df44c82"
+TENSORFLOW_REF = "f197d45528bb1dcf6e2d5409907c1352c30c0e5e"
 
-TENSORFLOW_SHA256 = "9f19b7868f33a1ec5b24f505e4672766540e93d6102e8b3dfbc2a8e160e394cb"
+TENSORFLOW_SHA256 = "0a877fd2a217030441a316a6a3404ba9d3e56d420fe80d9a9a5724f7781d1cc0"
 
 # buildifier: disable=load-on-top
 
@@ -77,6 +77,19 @@ http_archive(
     sha256 = "c26b4e69cf02fea24511a108d158188b9d8174426311aac59ce803a78d107648",
     strip_prefix = "bazel_features-1.43.0",
     url = "https://github.com/bazel-contrib/bazel_features/releases/download/v1.43.0/bazel_features-v1.43.0.tar.gz",
+)
+
+# Same version that tensorflow uses, but with patches to fix build errors.
+http_archive(
+    name = "com_google_absl",
+    patch_cmds = [
+        # Replace @googletest with @com_google_googletest.
+        "sed -i -e 's|@googletest|@com_google_googletest|g' absl/*/BUILD* absl/*/*/BUILD* absl/*/*/*/BUILD*",
+    ],
+    patches = ["@//:PATCH.abseil"],
+    sha256 = "6e1aee535473414164bf83e4ebc40240dec71a4701f8a642d906e95bea1aea0c",
+    strip_prefix = "abseil-cpp-20260526.0",
+    url = "https://github.com/abseil/abseil-cpp/archive/20260526.0.tar.gz",
 )
 
 # TensorFlow
@@ -378,6 +391,8 @@ http_archive(
     patch_cmds = [
         # Replace @//third_party with @litert//third_party in files under third_party/.
         "sed -i -e 's|\"@//third_party/|\"@litert//third_party/|g' third_party/*/*",
+        # Replace @stblib with @stb://stblib in support/*/BUILD files.
+        "sed -i -e 's|\"@stblib\"|\"@stb//:stblib\"|g' support/*/BUILD",
     ],
     sha256 = LITERT_SHA256,
     strip_prefix = "LiteRT-" + LITERT_REF,

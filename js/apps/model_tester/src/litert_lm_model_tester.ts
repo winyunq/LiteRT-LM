@@ -133,7 +133,7 @@ export class LitertLmModelTester extends LitElement {
     super.connectedCallback();
     try {
       this.statusMessage = 'Loading WASM module...';
-      await loadLiteRtLm('/wasm');
+      await loadLiteRtLm(trustedResourceUrl`/wasm`);
       this.statusMessage = 'WASM loaded. Please select a model file.';
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);

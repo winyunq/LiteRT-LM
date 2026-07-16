@@ -25,12 +25,13 @@
 namespace litert::lm {
 
 // Computes the top k token ids (a.k.a. indices of the given logits).
-//   - //   - logits: a 3D tensor (in a flattened buffer) of shape
+//   - logits: a 3D tensor (in a flattened buffer) of shape
 //     [batch_size, sequence_size, vocab_size].
 //   - k: the number of top k.
 //   - batch_size: the batch size of the logits.
+//   - sequence_size: the sequence length of the logits.
 // The output is a vector of token ids of shape
-//   [batch_size, sequence_size, k].
+//   [batch_size, sequence_size * k].
 absl::StatusOr<std::vector<std::vector<int>>> TopKTokenIds(
     absl::Span<const float> logits, int k, int batch_size = 1,
     int sequence_size = 1);

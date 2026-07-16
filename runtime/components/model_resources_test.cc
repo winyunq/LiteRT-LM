@@ -41,6 +41,28 @@ using ::litert::lm::ScopedFile;
 using ::litert::lm::StringToModelType;
 
 #ifdef ENABLE_SENTENCEPIECE_TOKENIZER
+TEST(ModelResourcesTest, InitializeWithFileBackedLiteRtModel) {
+  const auto model_path =
+      std::filesystem::path(::testing::SrcDir()) /
+      "litert_lm/runtime/testdata/test_lm.litertlm";
+  ASSERT_OK_AND_ASSIGN(auto model_file, ScopedFile::Open(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto loader,
+                       LitertLmLoader::Create(std::move(model_file)));
+
+  const auto expected_model_size =
+      loader->GetTFLiteModel(ModelType::kTfLitePrefillDecode).Size();
+  ASSERT_GT(expected_model_size, 0);
+
+  auto model_resources = ModelResourcesLitertLm::Create(
+      std::move(loader), /*enable_file_backed_model_loading=*/true);
+  ASSERT_OK(model_resources);
+
+  auto tflite_model =
+      model_resources.value()->GetTFLiteModel(ModelType::kTfLitePrefillDecode);
+  ASSERT_OK(tflite_model);
+  ASSERT_GT(tflite_model.value()->GetNumSignatures(), 0);
+}
+
 TEST(ModelResourcesTest, InitializeWithValidLitertLmLoader) {
   const auto model_path =
       std::filesystem::path(::testing::SrcDir()) /

@@ -63,10 +63,13 @@ class Engine(val engineConfig: EngineConfig) : AutoCloseable {
       check(!isInitialized()) { "Engine is already initialized." }
 
       val mainBackendNumThreads =
-        (engineConfig.backend as? Backend.CPU)?.numOfThreads?.let { if (it > 0) it else -1 } ?: -1
+        (engineConfig.backend as? Backend.CPU)
+          ?.let { it.threadCount ?: it.numOfThreads }
+          ?.let { if (it > 0) it else -1 } ?: -1
       val audioBackendNumThreads =
-        (engineConfig.audioBackend as? Backend.CPU)?.numOfThreads?.let { if (it > 0) it else -1 }
-          ?: -1
+        (engineConfig.audioBackend as? Backend.CPU)
+          ?.let { it.threadCount ?: it.numOfThreads }
+          ?.let { if (it > 0) it else -1 } ?: -1
 
       handle =
         LiteRtLmJni.nativeCreateEngine(

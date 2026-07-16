@@ -75,6 +75,7 @@ internal object LiteRtLmJni {
    * @param decodeTokens The number of tokens to decode.
    * @param cacheDir The directory for cache files.
    * @param mainNpuNativeLibraryDir The directory for the main backend NPU libraries.
+   * @param enableSpeculativeDecoding Whether to enable speculative decoding.
    * @return A pointer to the native engine instance.
    */
   external fun nativeCreateBenchmark(
@@ -84,6 +85,7 @@ internal object LiteRtLmJni {
     decodeTokens: Int,
     cacheDir: String,
     mainNpuNativeLibraryDir: String,
+    enableSpeculativeDecoding: Boolean?,
   ): Long
 
   /**
@@ -303,6 +305,14 @@ internal object LiteRtLmJni {
     messageJsonString: String,
     extraContextJsonString: String,
   ): String
+
+  /**
+   * Renders the preface into a string for testing purposes.
+   *
+   * @param conversationPointer A pointer to the native conversation instance.
+   * @return The rendered preface string.
+   */
+  external fun nativeConversationRenderPrefaceIntoString(conversationPointer: Long): String
 
   /**
    * Callback for the nativeSendMessageAsync.

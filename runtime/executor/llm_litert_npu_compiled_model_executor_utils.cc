@@ -27,6 +27,7 @@
 #include "absl/base/prefetch.h"  // from @com_google_absl
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "litert/c/litert_layout.h"  // from @litert
 #include "litert/cc/litert_layout.h"  // from @litert
 
@@ -531,14 +532,15 @@ absl::Status HWKVCacheUpdate(
             for (; h < hidden_dim; ++h) {
               c_ptr16[h * cache_seq + start_pos] = s_ptr16[h];
             }
-          } else
+          } else {
 #endif
-          {
             for (int64_t h = 0; h < hidden_dim; ++h) {
               std::memcpy(c_ptr + (h * cache_seq + start_pos) * element_size,
                           s_ptr + h * element_size, element_size);
             }
+#if defined(__ANDROID__) && defined(__ARM_NEON) && defined(__aarch64__)
           }
+#endif
         } else if (slice_is_transposed) {
           // Cache is [..., hidden, seq], Slice is [..., hidden, seq]
           for (int64_t h = 0; h < hidden_dim; ++h) {
@@ -742,7 +744,9 @@ namespace {
 template <typename T>
 void FillMasksInternal(T* mask_local, T* mask_global, int64_t seq_q,
                        int64_t seq_k, int32_t time_step,
-                       const int32_t* input_tokens, T valid_val, T masked_val) {
+                       const int32_t* input_tokens, int64_t input_tokens_size,
+                       const bool* valid_mask, int64_t valid_mask_size,
+                       T valid_val, T masked_val) {
   // Detection logic for capacity and batch_size.
   int64_t kv_cache_capacity = seq_k;
   bool has_batch_suffix = false;
@@ -803,8 +807,23 @@ void FillMasksInternal(T* mask_local, T* mask_global, int64_t seq_q,
         int64_t k = kv_cache_capacity + k_rel;
         if (k >= seq_k) break;
         // Causal + Validity check (for verify_mask).
-        if (k_rel <= q &&
-            (input_tokens == nullptr || input_tokens[k_rel] != -1)) {
+        bool is_valid = true;
+        if (valid_mask != nullptr) {
+          if (k_rel < valid_mask_size) {
+            is_valid = valid_mask[k_rel];
+          } else {
+            is_valid = true;
+          }
+        } else if (input_tokens != nullptr) {
+          if (seq_q > 1) {
+            if (k_rel < input_tokens_size) {
+              is_valid = (input_tokens[k_rel] != -1);
+            }
+          } else {
+            is_valid = true;
+          }
+        }
+        if (k_rel <= q && is_valid) {
           if (global_row) global_row[k] = valid_val;
           if (local_row)
             local_row[k] = valid_val;  // Current batch is always in window.
@@ -824,6 +843,7 @@ absl::Status HWMaskUpdate(
   static constexpr absl::string_view kMaskGlobal = "mask_global";
   static constexpr absl::string_view kInputTimeStep = "time_step";
   static constexpr absl::string_view kInputTokens = "input_tokens";
+  static constexpr absl::string_view kValidMask = "valid_mask";
 
   LITERT_ASSIGN_OR_RETURN(auto time_step_lock,
                           ::litert::TensorBufferScopedLock::Create(
@@ -831,13 +851,19 @@ absl::Status HWMaskUpdate(
                               ::litert::TensorBuffer::LockMode::kRead));
   int32_t time_step = static_cast<const int32_t*>(time_step_lock.second)[0];
 
+  int64_t input_tokens_size = 0;
+  std::optional<::litert::TensorBufferScopedLock> input_tokens_lock;
   const int32_t* input_tokens = nullptr;
   if (in_buffers.contains(kInputTokens)) {
-    LITERT_ASSIGN_OR_RETURN(auto input_tokens_lock,
+    auto& buf = in_buffers.at(kInputTokens);
+    LITERT_ASSIGN_OR_RETURN(auto type, buf.TensorType());
+    LITERT_ASSIGN_OR_RETURN(auto num_elements, type.Layout().NumElements());
+    input_tokens_size = num_elements;
+    LITERT_ASSIGN_OR_RETURN(auto lock,
                             ::litert::TensorBufferScopedLock::Create(
-                                in_buffers.at(kInputTokens),
-                                ::litert::TensorBuffer::LockMode::kRead));
-    input_tokens = static_cast<const int32_t*>(input_tokens_lock.second);
+                                buf, ::litert::TensorBuffer::LockMode::kRead));
+    input_tokens = static_cast<const int32_t*>(lock.second);
+    input_tokens_lock.emplace(std::move(lock.first));
   }
 
   // Get Outputs and Shapes
@@ -892,21 +918,43 @@ absl::Status HWMaskUpdate(
     global_ptr = lock.second;
   }
 
+  int64_t valid_mask_size = 0;
+  std::optional<::litert::TensorBufferScopedLock> valid_mask_lock;
+  const bool* valid_mask = nullptr;
+  if (in_buffers.contains(kValidMask)) {
+    auto& buf = in_buffers.at(kValidMask);
+    LITERT_ASSIGN_OR_RETURN(auto valid_mask_type, buf.TensorType());
+    LITERT_ASSIGN_OR_RETURN(auto num_elements,
+                            valid_mask_type.Layout().NumElements());
+    valid_mask_size = num_elements;
+    if (valid_mask_type.ElementType() != ::litert::ElementType::Bool) {
+      return absl::InvalidArgumentError("valid_mask must be Bool type");
+    }
+    LITERT_ASSIGN_OR_RETURN(auto lock,
+                            ::litert::TensorBufferScopedLock::Create(
+                                buf, ::litert::TensorBuffer::LockMode::kRead));
+    valid_mask = static_cast<const bool*>(lock.second);
+    valid_mask_lock.emplace(std::move(lock.first));
+  }
+
   // Dispatch by Dtype
   if (mask_type.ElementType() == ::litert::ElementType::Int8) {
     FillMasksInternal<int8_t>(static_cast<int8_t*>(local_ptr),
                               static_cast<int8_t*>(global_ptr), seq_q, seq_k,
-                              time_step, input_tokens,
+                              time_step, input_tokens, input_tokens_size,
+                              valid_mask, valid_mask_size,
                               /*valid_val=*/127, /*masked_val=*/-128);
   } else if (mask_type.ElementType() == ::litert::ElementType::Int16) {
     FillMasksInternal<int16_t>(static_cast<int16_t*>(local_ptr),
                                static_cast<int16_t*>(global_ptr), seq_q, seq_k,
-                               time_step, input_tokens,
+                               time_step, input_tokens, input_tokens_size,
+                               valid_mask, valid_mask_size,
                                /*valid_val=*/0, /*masked_val=*/-32767);
   } else if (mask_type.ElementType() == ::litert::ElementType::Float32) {
     FillMasksInternal<float>(static_cast<float*>(local_ptr),
                              static_cast<float*>(global_ptr), seq_q, seq_k,
-                             time_step, input_tokens,
+                             time_step, input_tokens, input_tokens_size,
+                             valid_mask, valid_mask_size,
                              /*valid_val=*/0.0f, /*masked_val=*/-1e9f);
   } else if (mask_type.ElementType() == ::litert::ElementType::Float16) {
     // Opaque uint16_t representation of IEEE 754 Float16.
@@ -914,6 +962,7 @@ absl::Status HWMaskUpdate(
     FillMasksInternal<uint16_t>(static_cast<uint16_t*>(local_ptr),
                                 static_cast<uint16_t*>(global_ptr), seq_q,
                                 seq_k, time_step, input_tokens,
+                                input_tokens_size, valid_mask, valid_mask_size,
                                 /*valid_val=*/0x0000, /*masked_val=*/0xFC00);
   } else if (mask_type.ElementType() == ::litert::ElementType::BFloat16) {
     // Opaque uint16_t representation of Brain Float16.
@@ -921,6 +970,7 @@ absl::Status HWMaskUpdate(
     FillMasksInternal<uint16_t>(static_cast<uint16_t*>(local_ptr),
                                 static_cast<uint16_t*>(global_ptr), seq_q,
                                 seq_k, time_step, input_tokens,
+                                input_tokens_size, valid_mask, valid_mask_size,
                                 /*valid_val=*/0x0000, /*masked_val=*/0xFF80);
   } else {
     return absl::InvalidArgumentError("Unsupported mask element type");
@@ -1023,17 +1073,36 @@ void UnpackInt4Row(const uint8_t* packed_data, float scale, int col_size,
   }
 }
 #endif
+
+void DequantizeInt8Row(const int8_t* packed_data, float scale, int col_size,
+                       float* output) {
+  for (int i = 0; i < col_size; ++i) {
+    output[i] = static_cast<float>(packed_data[i]) * scale;
+  }
+}
 }  // namespace
 
 absl::Status HWPerLayerEmbeddingLookup(
     const int* token_ids, int num_tokens, const uint8_t* const* table_ptrs,
-    const HWQuantizationParams* quant_params, int num_tables, int col_size,
-    void* output_buffer, litert::ElementType output_type, float final_scale,
-    int32_t final_zero_point) {
+    const HWQuantizationParams* quant_params, int num_tables,
+    int ple_embedding_dim, void* output_buffer, litert::ElementType output_type,
+    litert::ElementType ple_table_element_type, float mul_scale,
+    float output_scale, int32_t final_zero_point) {
   constexpr int kVocabSize = 262144;
   std::vector<float> row_float;
   if (output_type == litert::ElementType::Int16) {
-    row_float.resize(col_size);
+    row_float.resize(ple_embedding_dim);
+  }
+
+  int row_size_bytes = 0;
+  if (ple_table_element_type == litert::ElementType::Int4) {
+    row_size_bytes = ple_embedding_dim / 2;
+  } else if (ple_table_element_type == litert::ElementType::Int8) {
+    row_size_bytes = ple_embedding_dim;
+  } else {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Unsupported table element type: ",
+                     static_cast<int>(ple_table_element_type)));
   }
 
   for (int t = 0; t < num_tokens; ++t) {
@@ -1042,7 +1111,7 @@ absl::Status HWPerLayerEmbeddingLookup(
       id = 0;  // Default to 0 as in model
     }
 
-    size_t row_offset = id * (col_size / 2);
+    size_t row_offset = id * row_size_bytes;
 
     for (int table_idx = 0; table_idx < num_tables; ++table_idx) {
       const uint8_t* table = table_ptrs[table_idx];
@@ -1057,22 +1126,37 @@ absl::Status HWPerLayerEmbeddingLookup(
       if (qp.scales) {
         scale = qp.is_per_channel ? qp.scales[id] : qp.scales[0];
       }
+      scale *= mul_scale;
 
       if (output_type == litert::ElementType::Int16) {
-        UnpackInt4Row(row_data, scale, col_size, row_float.data());
+        if (ple_table_element_type == litert::ElementType::Int4) {
+          UnpackInt4Row(row_data, scale, ple_embedding_dim, row_float.data());
+        } else if (ple_table_element_type == litert::ElementType::Int8) {
+          DequantizeInt8Row(reinterpret_cast<const int8_t*>(row_data), scale,
+                            ple_embedding_dim, row_float.data());
+        }
         int16_t* int16_output = static_cast<int16_t*>(output_buffer) +
-                                t * num_tables * col_size +
-                                table_idx * col_size;
-        for (int i = 0; i < col_size; ++i) {
+                                t * num_tables * ple_embedding_dim +
+                                table_idx * ple_embedding_dim;
+        for (int i = 0; i < ple_embedding_dim; ++i) {
           float fval = row_float[i];
-          int32_t qval = std::round(fval / final_scale) + final_zero_point;
+          int32_t qval = std::round(fval / output_scale) + final_zero_point;
           qval = std::max(-32768, std::min(32767, qval));
           int16_output[i] = static_cast<int16_t>(qval);
         }
-      } else {
+      } else if (output_type == litert::ElementType::Float32) {
         float* float_output = static_cast<float*>(output_buffer) +
-                              t * num_tables * col_size + table_idx * col_size;
-        UnpackInt4Row(row_data, scale, col_size, float_output);
+                              t * num_tables * ple_embedding_dim +
+                              table_idx * ple_embedding_dim;
+        if (ple_table_element_type == litert::ElementType::Int4) {
+          UnpackInt4Row(row_data, scale, ple_embedding_dim, float_output);
+        } else if (ple_table_element_type == litert::ElementType::Int8) {
+          DequantizeInt8Row(reinterpret_cast<const int8_t*>(row_data), scale,
+                            ple_embedding_dim, float_output);
+        }
+      } else {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "Unsupported output type: ", static_cast<int>(output_type)));
       }
     }
   }
@@ -1115,16 +1199,129 @@ absl::Status DequantizeLogits(const ::litert::TensorBuffer& src,
                             static_cast<float>(zero_point));
     }
   } else if (src_elem_type == ::litert::ElementType::Float32) {
-      // This is for dealing with unquantized float 32 logits.
-      const float* src_ptr = static_cast<const float*>(src_raw_ptr);
-      for (size_t i = 0; i < num_elements; ++i) {
-        dst_ptr[i] = src_ptr[i];
-      }
-    } else {
+    // This is for dealing with unquantized float 32 logits.
+    const float* src_ptr = static_cast<const float*>(src_raw_ptr);
+    for (size_t i = 0; i < num_elements; ++i) {
+      dst_ptr[i] = src_ptr[i];
+    }
+  } else {
     return absl::InvalidArgumentError(absl::StrCat(
         "Unsupported source type for dequantization: ", (int)src_elem_type));
   }
 
+  return absl::OkStatus();
+}
+
+absl::Status WritePleEmbeddingsToPtr(void* dest_ptr,
+                                     absl::Span<const float> ple_embeddings,
+                                     litert::ElementType output_type,
+                                     float final_scale,
+                                     int32_t final_zero_point) {
+  if (output_type == litert::ElementType::Int16) {
+    int16_t* int16_ptr = static_cast<int16_t*>(dest_ptr);
+    for (size_t i = 0; i < ple_embeddings.size(); ++i) {
+      int16_ptr[i] =
+          Quantize<int16_t>(ple_embeddings[i], final_scale, final_zero_point);
+    }
+  } else if (output_type == litert::ElementType::Float32 ||
+             output_type == litert::ElementType::None) {
+    float* float_ptr = static_cast<float*>(dest_ptr);
+    std::memcpy(float_ptr, ple_embeddings.data(),
+                ple_embeddings.size() * sizeof(float));
+  } else {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Unsupported PLE output type: ", output_type));
+  }
+  return absl::OkStatus();
+}
+
+absl::Status WritePleEmbeddings(::litert::TensorBuffer& buffer,
+                                absl::Span<const float> ple_embeddings,
+                                litert::ElementType output_type,
+                                float final_scale, int32_t final_zero_point) {
+  LITERT_ASSIGN_OR_RETURN(size_t buffer_size, buffer.PackedSize());
+  size_t element_size = 0;
+  if (output_type == litert::ElementType::Int16) {
+    element_size = sizeof(int16_t);
+  } else if (output_type == litert::ElementType::Float32 ||
+             output_type == litert::ElementType::None) {
+    element_size = sizeof(float);
+  } else {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Unsupported PLE output type: ", output_type));
+  }
+  RET_CHECK_GE(buffer_size, ple_embeddings.size() * element_size);
+
+  LITERT_ASSIGN_OR_RETURN(
+      auto lock, ::litert::TensorBufferScopedLock::Create(
+                     buffer, ::litert::TensorBuffer::LockMode::kWrite));
+  return WritePleEmbeddingsToPtr(lock.second, ple_embeddings, output_type,
+                                 final_scale, final_zero_point);
+}
+
+absl::Status WriteAndPadPleEmbeddings(::litert::TensorBuffer& buffer,
+                                      absl::Span<const float> ple_embeddings,
+                                      size_t ple_dim, size_t seq_pos_size,
+                                      const std::vector<float>& default_ple_emb,
+                                      litert::ElementType output_type,
+                                      float final_scale,
+                                      int32_t final_zero_point) {
+  RET_CHECK_EQ(ple_embeddings.size(), seq_pos_size * ple_dim);
+  LITERT_ASSIGN_OR_RETURN(size_t buffer_size, buffer.PackedSize());
+  LITERT_ASSIGN_OR_RETURN(
+      auto lock_and_addr,
+      ::litert::TensorBufferScopedLock::Create(
+          buffer, ::litert::TensorBuffer::LockMode::kWrite));
+
+  size_t num_tokens_to_fill =
+      buffer_size /
+      (ple_dim * (output_type == litert::ElementType::Int16 ? sizeof(int16_t)
+                                                            : sizeof(float)));
+  RET_CHECK_LE(seq_pos_size, num_tokens_to_fill);
+
+  LITERT_RETURN_IF_ERROR(
+      WritePleEmbeddingsToPtr(lock_and_addr.second, ple_embeddings, output_type,
+                              final_scale, final_zero_point));
+
+  if (output_type == litert::ElementType::Int16) {
+    int16_t* int16_ptr = static_cast<int16_t*>(lock_and_addr.second);
+
+    // Quantize default PLE embedding. If not provided or size doesn't match
+    // ple_dim, pad with quantized zeros.
+    std::vector<int16_t> quantized_default_ple_emb(
+        ple_dim, Quantize<int16_t>(0.0f, final_scale, final_zero_point));
+    if (default_ple_emb.size() == ple_dim) {
+      for (size_t i = 0; i < ple_dim; ++i) {
+        quantized_default_ple_emb[i] = Quantize<int16_t>(
+            default_ple_emb[i], final_scale, final_zero_point);
+      }
+    }
+
+    // Pad the rest
+    int16_t* padding_ptr = int16_ptr + seq_pos_size * ple_dim;
+    for (size_t i = seq_pos_size; i < num_tokens_to_fill; ++i) {
+      std::memcpy(padding_ptr, quantized_default_ple_emb.data(),
+                  ple_dim * sizeof(int16_t));
+      padding_ptr += ple_dim;
+    }
+  } else if (output_type == litert::ElementType::Float32 ||
+             output_type == litert::ElementType::None) {
+    // Float32 path
+    float* float_ptr = static_cast<float*>(lock_and_addr.second);
+
+    float* padding_ptr = float_ptr + seq_pos_size * ple_dim;
+    if (default_ple_emb.size() == ple_dim) {
+      for (size_t i = seq_pos_size; i < num_tokens_to_fill; ++i) {
+        std::memcpy(padding_ptr, default_ple_emb.data(),
+                    ple_dim * sizeof(float));
+        padding_ptr += ple_dim;
+      }
+    } else {
+      std::memset(
+          padding_ptr, 0,
+          (num_tokens_to_fill - seq_pos_size) * ple_dim * sizeof(float));
+    }
+  }
   return absl::OkStatus();
 }
 

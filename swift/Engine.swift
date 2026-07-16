@@ -180,16 +180,17 @@ public actor Engine {
     defer { litert_lm_session_config_delete(cSessionConfig) }
 
     if let samplerParams = conversationConfig.samplerConfig {
-      var params = LiteRtLmSamplerParams(
-        // Based on the current engine implementation, when SamplerConfig is set, we must switch to
-        // the topP sampling type.
-        type: kLiteRtLmSamplerTypeTopP,
-        top_k: Int32(samplerParams.topK),
-        top_p: samplerParams.topP,
-        temperature: samplerParams.temperature,
-        seed: Int32(samplerParams.seed)
-      )
-      litert_lm_session_config_set_sampler_params(cSessionConfig, &params)
+      guard let cSamplerParams = litert_lm_sampler_params_create(kLiteRtLmSamplerTypeTopP) else {
+        throw LiteRTLMError.engine(.failedToCreateSessionConfig)
+      }
+      defer { litert_lm_sampler_params_delete(cSamplerParams) }
+
+      litert_lm_sampler_params_set_top_k(cSamplerParams, Int32(samplerParams.topK))
+      litert_lm_sampler_params_set_top_p(cSamplerParams, samplerParams.topP)
+      litert_lm_sampler_params_set_temperature(cSamplerParams, samplerParams.temperature)
+      litert_lm_sampler_params_set_seed(cSamplerParams, Int32(samplerParams.seed))
+
+      litert_lm_session_config_set_sampler_params(cSessionConfig, cSamplerParams)
     }
 
     if let loraPath = conversationConfig.loraPath {
@@ -223,6 +224,11 @@ public actor Engine {
     }
     litert_lm_conversation_config_set_enable_constrained_decoding(
       cConversationConfig, ExperimentalFlags.enableConversationConstrainedDecoding)
+    litert_lm_conversation_config_set_stream_tool_calls(
+      cConversationConfig,
+      conversationConfig.enableToolCallStreaming
+        && ExperimentalFlags.enableConversationToolCallStreaming,
+      ExperimentalFlags.conversationToolCallStreamingChannelName)
 
     guard
       let conversationHandle = litert_lm_conversation_create(

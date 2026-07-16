@@ -44,6 +44,8 @@ namespace {
 
 constexpr absl::string_view kTestAudioModelPath =
     "litert_lm/runtime/testdata/dummy_audio_only.litertlm";
+constexpr absl::string_view kTestAudioStreamingModelPath =
+    "litert_lm/runtime/testdata/dummy_audio_streaming.litertlm";
 constexpr absl::string_view kTestAudioNoMaskModelPath =
     "litert_lm/runtime/testdata/dummy_audio_no_mask.litertlm";
 constexpr int kNoMaskEmbeddingDimensions = 5;
@@ -416,6 +418,65 @@ TEST_F(AudioLiteRtCompiledModelExecutorTest, EncodeTest_NoMaskModel_WithMask) {
                        GetDataAsVector<float>(*audio_embeddings_ptr));
   EXPECT_EQ(audio_embeddings_data.size(), 3 * kNoMaskEmbeddingDimensions);
   EXPECT_EQ(executor_audio_data.GetValidTokens(), 3);
+}
+
+TEST_F(AudioLiteRtCompiledModelExecutorTest, EncodeTest_Streaming_LargeInput) {
+  ASSERT_OK_AND_ASSIGN(
+      auto audio_executor,
+      CreateAudioExecutor(*env_,
+                          (std::filesystem::path(::testing::SrcDir()) /
+                           std::string(kTestAudioStreamingModelPath))
+                              .string(),
+                          /*max_sequence_length=*/0, Backend::CPU));
+
+  // Input size 24.
+  // chunk_size = 10, overlap = 3, stride = 7.
+  // 3 chunks: [0, 10), [7, 17), [14, 24).
+  // Total output tokens: 3 * (10 / 2) = 15.
+  constexpr int kInputSequenceLength = 24;
+  constexpr int kExpectedOutputTokens = 15;
+
+  std::vector<float> mel_spectrogram_data(
+      kInputSequenceLength * kSpectrogramFrequencySlots, 1.0f);
+
+  ASSERT_OK_AND_ASSIGN(
+      auto mel_spectrogram_tensor_buffer,
+      CreateTensorBuffer<const float>(
+          mel_spectrogram_data,
+          RankedTensorType(GetElementType<float>(),
+                           Layout(Dimensions({1, kInputSequenceLength,
+                                              kSpectrogramFrequencySlots})))));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_audio_data,
+      audio_executor->Encode(mel_spectrogram_tensor_buffer));
+
+  ASSERT_OK_AND_ASSIGN(auto audio_embeddings_ptr,
+                       executor_audio_data.GetMutableEmbeddingsPtr());
+  auto audio_embeddings_type = audio_embeddings_ptr->TensorType();
+  ASSERT_TRUE(audio_embeddings_type.HasValue());
+  auto dims = audio_embeddings_type->Layout().Dimensions();
+  EXPECT_THAT(dims,
+              ElementsAre(1, kExpectedOutputTokens, kEmbeddingDimensions));
+
+  ASSERT_OK_AND_ASSIGN(auto audio_embeddings_data,
+                       GetDataAsVector<float>(*audio_embeddings_ptr));
+  EXPECT_EQ(audio_embeddings_data.size(),
+            kExpectedOutputTokens * kEmbeddingDimensions);
+
+  // Each output frame should be [1, 3, 6, 10, 15, 15] as derived.
+  std::vector<float> expected_frame = {1.f, 3.f, 6.f, 10.f, 15.f, 15.f};
+  std::vector<float> expected_embeddings_data;
+  expected_embeddings_data.reserve(kExpectedOutputTokens *
+                                   kEmbeddingDimensions);
+  for (int i = 0; i < kExpectedOutputTokens; ++i) {
+    expected_embeddings_data.insert(expected_embeddings_data.end(),
+                                    expected_frame.begin(),
+                                    expected_frame.end());
+  }
+
+  EXPECT_EQ(audio_embeddings_data, expected_embeddings_data);
+  EXPECT_EQ(executor_audio_data.GetValidTokens(), kExpectedOutputTokens);
 }
 #endif  // !defined(WIN32) && !defined(_WIN32) && !defined(__WIN32__) && \
         // !defined(__NT__) && !defined(_WIN64)

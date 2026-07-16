@@ -32,8 +32,8 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "litert/test/matchers.h"  // from @litert
-#include "runtime/components/sentencepiece_tokenizer.h"
-#include "runtime/components/tokenizer.h"
+#include "support/tokenizer/sentencepiece_tokenizer.h"  // from @litert
+#include "support/tokenizer/tokenizer.h"  // from @litert
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/proto/sampler_params.pb.h"
@@ -42,6 +42,11 @@
 #include "runtime/util/test_utils.h"  // IWYU pragma: keep
 
 namespace litert::lm {
+
+using SentencePieceTokenizer = ::litert::support::SentencePieceTokenizer;
+using Tokenizer = ::litert::support::Tokenizer;
+using TokenizerType = ::litert::support::TokenizerType;
+
 namespace {
 
 constexpr absl::string_view kTestdataDir =
@@ -116,6 +121,8 @@ class ExtendedTokenizer : public Tokenizer {
   std::vector<std::string> GetTokens() const override {
     return tokenizer_->GetTokens();
   }
+
+  int GetVocabSize() const override { return tokenizer_->GetVocabSize(); }
 
  private:
   explicit ExtendedTokenizer(std::unique_ptr<SentencePieceTokenizer> tokenizer)

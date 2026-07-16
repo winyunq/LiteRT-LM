@@ -21,8 +21,8 @@
 #include <gtest/gtest.h>
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "support/tokenizer/tokenizer.h"  // from @litert
 #include "runtime/components/prompt_template.h"
-#include "runtime/components/tokenizer.h"
 #include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/proto/llm_model_type.pb.h"
 #include "runtime/util/test_utils.h"  // NOLINT
@@ -32,6 +32,7 @@ namespace {
 
 using ::testing::NiceMock;
 using ::testing::Return;
+using TokenizerType = ::litert::support::TokenizerType;
 
 class MockTokenizer : public Tokenizer {
  public:
@@ -43,6 +44,7 @@ class MockTokenizer : public Tokenizer {
               (override));
   MOCK_METHOD(TokenizerType, GetTokenizerType, (), (const, override));
   MOCK_METHOD(std::vector<std::string>, GetTokens, (), (const, override));
+  MOCK_METHOD(int, GetVocabSize, (), (const, override));
 };
 
 TEST(ModelTypeUtilsTest, InferLlmModelTypeGemma3N) {

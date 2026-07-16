@@ -25,6 +25,7 @@ import urllib.request
 
 import click
 
+from litert_lm_cli import cli_helpers
 from litert_lm_cli import common
 from litert_lm_cli import help_formatter
 from litert_lm_cli import huggingface_download
@@ -92,8 +93,7 @@ def _copy_source(
 
   If the source is a local file (equal to model_file) and is not found, and a
   user_agent is provided, it attempts to download it as an experimental model
-  and
-  then copies it.
+  and then copies it.
 
   Args:
     source: The resolved source path (might be HF downloaded file or local
@@ -110,8 +110,7 @@ def _copy_source(
   Raises:
     click.ClickException: If the `source` file is not found and, if
       `user_agent` is provided, the attempt to download it as an experimental
-      model
-      also fails.
+      model also fails.
   """
   try:
     shutil.copy(source, dest)
@@ -159,14 +158,14 @@ def _copy_source(
     default=None,
     help="""The user agent used to download experimental models.""",
 )
-@click.argument("model_file")
-@click.argument("model_ref", required=False)
+@click.argument("model_file", required=False)
+@click.argument("import_as_model_id", required=False)
 def import_model(
     from_huggingface_repo: str | None,
     huggingface_token: str | None,
     user_agent: str | None,
-    model_file: str,
-    model_ref: str | None,
+    model_file: str | None,
+    import_as_model_id: str | None,
 ) -> None:
   """Imports a model from a local path or HuggingFace hub.
 
@@ -176,22 +175,31 @@ def import_model(
     user_agent: The user agent used to download experimental models (internal).
     model_file: The path in the repo (if from-huggingface-repo is set) or local
       path.
-    model_ref: The reference ID to store the model as. Defaults to the filename
-      of MODEL_FILE.
+    import_as_model_id: The model ID to store the model as. Defaults to the
+      filename of MODEL_FILE.
   """
-  effective_model_ref = model_ref or os.path.basename(model_file)
   temporary_file = None
+
+  if not model_file and not from_huggingface_repo:
+    raise click.UsageError("Missing argument 'MODEL_FILE'.")
+
+  resolved_file = model_file or cli_helpers.resolve_model_file(
+      from_huggingface_repo,
+      huggingface_token,
+  )
 
   if from_huggingface_repo:
     source = huggingface_download.download_from_huggingface(
         repo_id=from_huggingface_repo,
-        filename=model_file,
+        filename=resolved_file,
         token=huggingface_token,
     )
   else:
-    source = model_file
+    source = resolved_file
 
-  model_obj = model.Model.from_model_id(effective_model_ref)
+  effective_model_id = import_as_model_id or os.path.basename(resolved_file)
+
+  model_obj = model.Model.from_model_id(effective_model_id)
   model_path = model_obj.model_path
   model_dir = os.path.dirname(model_path)
 
@@ -203,7 +211,7 @@ def import_model(
     temporary_file = _copy_source(
         source,
         model_path,
-        model_file=model_file,
+        model_file=resolved_file,
         user_agent=user_agent,
         ssl_context=ssl_context,
     )
@@ -213,7 +221,7 @@ def import_model(
     click.echo(
         click.style(
             "You can now run the model with 'litert-lm run"
-            f" {effective_model_ref}'",
+            f" {effective_model_id}'",
             fg="green",
         )
     )

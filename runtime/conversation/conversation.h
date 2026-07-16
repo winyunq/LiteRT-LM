@@ -30,9 +30,10 @@
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "nlohmann/json_fwd.hpp"  // from @nlohmann_json
-#include "runtime/components/constrained_decoding/constraint.h"
-#include "runtime/components/constrained_decoding/constraint_provider.h"
-#include "runtime/components/constrained_decoding/constraint_provider_config.h"
+#include "runtime/components/logits_processor/constrained_decoding/constraint.h"
+#include "runtime/components/logits_processor/constrained_decoding/constraint_provider.h"
+#include "runtime/components/logits_processor/constrained_decoding/constraint_provider_config.h"
+#include "runtime/components/logits_processor/repetition_penalty_config.h"
 #include "runtime/components/prompt_template.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/config_registry.h"
@@ -95,6 +96,27 @@ class ConversationConfig {
   // Returns whether to return an error status when a tool call fails to parse.
   bool return_error_on_parse_failure() const {
     return return_error_on_parse_failure_;
+  }
+
+  // Returns whether to return an error status when max num tokens reached.
+  bool return_error_on_max_tokens_reached() const {
+    return return_error_on_max_tokens_reached_;
+  }
+
+  // Returns whether thinking/reasoning generation is enabled.
+  bool enable_thinking() const { return enable_thinking_; }
+
+  // Returns whether to stream tool call tokens.
+  bool stream_tool_calls() const { return stream_tool_calls_; }
+
+  // Returns the channel name for tool call tokens if they are streamed.
+  const std::string& stream_tool_calls_channel_name() const {
+    return stream_tool_calls_channel_name_;
+  }
+
+  // Returns the repetition penalty config for the repetition penalty processor.
+  const RepetitionPenaltyConfig& repetition_penalty_config() const {
+    return repetition_penalty_config_;
   }
 
  public:
@@ -187,13 +209,43 @@ class ConversationConfig {
       return *this;
     }
 
+    // Sets whether to return an error status when max num tokens reached.
+    Builder& SetReturnErrorOnMaxTokensReached(
+        bool return_error_on_max_tokens_reached) {
+      return_error_on_max_tokens_reached_ = return_error_on_max_tokens_reached;
+      return *this;
+    }
+
+    // Sets whether thinking/reasoning generation is enabled.
+    Builder& SetEnableThinking(bool enable_thinking) {
+      enable_thinking_ = enable_thinking;
+      return *this;
+    }
+
+    // Sets whether to stream tool call tokens.
+    Builder& SetStreamToolCalls(bool stream_tool_calls,
+                                const std::string& channel_name = "tool_call") {
+      stream_tool_calls_ = stream_tool_calls;
+      stream_tool_calls_channel_name_ = channel_name;
+      return *this;
+    }
+
+    // Sets the repetition penalty config for the repetition penalty processor.
+    Builder& SetRepetitionPenaltyConfig(
+        const RepetitionPenaltyConfig& repetition_penalty_config) {
+      repetition_penalty_config_ = repetition_penalty_config;
+      return *this;
+    }
+
     absl::StatusOr<ConversationConfig> Build(const Engine& engine) {
       return ConversationConfig::CreateInternal(
           engine, session_config_, preface_, overwrite_prompt_template_,
           overwrite_processor_config_, enable_constrained_decoding_,
           prefill_preface_on_init_, constraint_provider_config_, channels_,
-          filter_channel_content_from_kv_cache_,
-          return_error_on_parse_failure_);
+          filter_channel_content_from_kv_cache_, return_error_on_parse_failure_,
+          return_error_on_max_tokens_reached_, enable_thinking_,
+          stream_tool_calls_, stream_tool_calls_channel_name_,
+          repetition_penalty_config_);
     }
 
     // Returns a unique pointer to a ConversationConfig.
@@ -214,6 +266,12 @@ class ConversationConfig {
     std::optional<std::vector<Channel>> channels_ = std::nullopt;
     bool filter_channel_content_from_kv_cache_ = false;
     bool return_error_on_parse_failure_ = true;
+    bool return_error_on_max_tokens_reached_ = false;
+    bool enable_thinking_ = false;
+    bool stream_tool_calls_ = false;
+    std::string stream_tool_calls_channel_name_ = "tool_call";
+    RepetitionPenaltyConfig repetition_penalty_config_ =
+        RepetitionPenaltyConfig::Default();
   };
 
   // Returns the constrained decoding config.
@@ -248,6 +306,8 @@ class ConversationConfig {
   //     true, the preface will be prefilled on init, which will make the first
   //     response faster, but take longer to initialize.
   // - `channels`: The channels configured for the conversation.
+  // - `repetition_penalty_config`: The configuration for the repetition penalty
+  //     processor.
   static absl::StatusOr<ConversationConfig> CreateInternal(
       const Engine& engine, const SessionConfig& session_config,
       std::optional<Preface> preface = std::nullopt,
@@ -260,18 +320,28 @@ class ConversationConfig {
           std::nullopt,
       std::optional<std::vector<Channel>> channels = std::nullopt,
       bool filter_channel_content_from_kv_cache = false,
-      bool return_error_on_parse_failure = true);
+      bool return_error_on_parse_failure = true,
+      bool return_error_on_max_tokens_reached = false,
+      bool enable_thinking = false, bool stream_tool_calls = false,
+      const std::string& stream_tool_calls_channel_name = "tool_call",
+      RepetitionPenaltyConfig repetition_penalty_config =
+          RepetitionPenaltyConfig::Default());
 
-  explicit ConversationConfig(SessionConfig session_config, Preface preface,
-                              PromptTemplate prompt_template,
-                              DataProcessorConfig processor_config,
-                              bool constrained_decoding_enabled = false,
-                              bool prefill_preface_on_init = false,
-                              std::optional<ConstraintProviderConfig>
-                                  constraint_provider_config = std::nullopt,
-                              std::vector<Channel> channels = {},
-                              bool filter_channel_content_from_kv_cache = false,
-                              bool return_error_on_parse_failure = true)
+  explicit ConversationConfig(
+      SessionConfig session_config, Preface preface,
+      PromptTemplate prompt_template, DataProcessorConfig processor_config,
+      bool constrained_decoding_enabled = false,
+      bool prefill_preface_on_init = false,
+      std::optional<ConstraintProviderConfig> constraint_provider_config =
+          std::nullopt,
+      std::vector<Channel> channels = {},
+      bool filter_channel_content_from_kv_cache = false,
+      bool return_error_on_parse_failure = true,
+      bool return_error_on_max_tokens_reached = false,
+      bool enable_thinking = false, bool stream_tool_calls = false,
+      const std::string& stream_tool_calls_channel_name = "tool_call",
+      RepetitionPenaltyConfig repetition_penalty_config =
+          RepetitionPenaltyConfig::Default())
       : session_config_(std::move(session_config)),
         preface_(std::move(preface)),
         prompt_template_(std::move(prompt_template)),
@@ -282,7 +352,12 @@ class ConversationConfig {
         channels_(std::move(channels)),
         filter_channel_content_from_kv_cache_(
             filter_channel_content_from_kv_cache),
-        return_error_on_parse_failure_(return_error_on_parse_failure) {}
+        return_error_on_parse_failure_(return_error_on_parse_failure),
+        return_error_on_max_tokens_reached_(return_error_on_max_tokens_reached),
+        enable_thinking_(enable_thinking),
+        stream_tool_calls_(stream_tool_calls),
+        stream_tool_calls_channel_name_(stream_tool_calls_channel_name),
+        repetition_penalty_config_(std::move(repetition_penalty_config)) {}
 
   SessionConfig session_config_;
   Preface preface_;
@@ -294,6 +369,11 @@ class ConversationConfig {
   std::vector<Channel> channels_;
   bool filter_channel_content_from_kv_cache_;
   bool return_error_on_parse_failure_;
+  bool return_error_on_max_tokens_reached_;
+  bool enable_thinking_;
+  bool stream_tool_calls_;
+  std::string stream_tool_calls_channel_name_;
+  RepetitionPenaltyConfig repetition_penalty_config_;
 };
 
 // Optional arguments for sending a message to the LLM.
@@ -361,6 +441,10 @@ struct OptionalArgs {
   // context only applies to a single message and is merged with the extra
   // context provided in the Preface, overwriting existing keys.
   std::optional<nlohmann::ordered_json> extra_context = std::nullopt;
+
+  // Whether to enable thinking/reasoning generation. If provided, this value
+  // overrides the default value in `ConversationConfig`.
+  std::optional<bool> enable_thinking = std::nullopt;
 };
 
 // A multi-turn centric stateful Conversation API for high-level user
@@ -554,8 +638,13 @@ class Conversation {
   absl::StatusOr<std::string> RenderMessageIntoString(
       const Message& message, OptionalArgs optional_args);
 
-  // 暴露底层 Session 指针以允许直接 KV 缓存操作
+  // Internal compatibility escape hatch used by the legacy wrapper's KV
+  // cache migration helpers. New callers should keep state in Conversation.
   Engine::Session* GetSession() const { return session_.get(); }
+
+  // Renders the preface into a string for testing and logging purposes.
+  absl::StatusOr<std::string> RenderPrefaceIntoString(
+      OptionalArgs optional_args);
 
  private:
   explicit Conversation(
@@ -636,6 +725,10 @@ class Conversation {
   // and return the input data vector for all messages from that point onward.
   absl::StatusOr<std::vector<InputData>> RewindAndGetInputDataVector(
       const OptionalArgs& optional_args = OptionalArgs());
+
+  // Applies the prompt template to the given input. This function will strip
+  // heavy blobs from the input before applying the template.
+  absl::StatusOr<std::string> ApplyTemplate(PromptTemplateInput& input);
 
   // Keep a reference to the creator engine to enable access to the shared
   // resources that might be required for features like cloning.

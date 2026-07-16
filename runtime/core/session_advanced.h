@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/base/attributes.h"  // from @com_google_absl
 #include "absl/base/nullability.h"  // from @com_google_absl
 #include "absl/base/thread_annotations.h"  // from @com_google_absl
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
@@ -32,7 +33,7 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
-#include "runtime/components/tokenizer.h"
+#include "support/tokenizer/tokenizer.h"  // from @litert
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
@@ -83,7 +84,8 @@ class SessionAdvanced : public SessionInterface {
   // Creates a SessionAdvanced object.
   static absl::StatusOr<std::unique_ptr<SessionAdvanced>> Create(
       std::weak_ptr<ExecutionManager> execution_manager,
-      Tokenizer* absl_nonnull tokenizer, const SessionConfig& session_config,
+      support::Tokenizer* absl_nonnull tokenizer,
+      const SessionConfig& session_config,
       std::optional<BenchmarkInfo> benchmark_info,
       std::atomic<int>* living_sessions_count = nullptr);
 
@@ -91,11 +93,20 @@ class SessionAdvanced : public SessionInterface {
   // done and release the session from the execution manager.
   ~SessionAdvanced() override;
 
+  ABSL_DEPRECATED(
+      "Prefer Conversation API for chat/context management, or RunPrefill and "
+      "RunDecode for fine-grained execution control.")
   absl::StatusOr<Responses> GenerateContent(
       const std::vector<InputData>& contents) override;
+  ABSL_DEPRECATED(
+      "Prefer Conversation API for chat/context management, or RunPrefill and "
+      "RunDecode for fine-grained execution control.")
   absl::Status GenerateContentStream(
       const std::vector<InputData>& contents,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) override;
+  ABSL_DEPRECATED(
+      "Prefer Conversation API for chat/context management, or RunPrefill and "
+      "RunDecode for fine-grained execution control.")
   absl::Status GenerateContentStream(
       const std::vector<InputData>& contents,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback,
@@ -129,6 +140,11 @@ class SessionAdvanced : public SessionInterface {
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) override
       ABSL_LOCKS_EXCLUDED(mutex_);
 
+  absl::StatusOr<std::unique_ptr<TaskController>> PrefillPreprocessedContents(
+      std::vector<InputData> preprocessed_contents,
+      absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) override
+      ABSL_LOCKS_EXCLUDED(mutex_);
+
   absl::StatusOr<Responses> RunDecode() override;
 
   absl::StatusOr<Responses> RunDecode(
@@ -153,9 +169,11 @@ class SessionAdvanced : public SessionInterface {
   // step number.
   absl::Status SaveCheckpoint(absl::string_view label) override;
 
-  // Rewinds the session to the given checkpoint and then returns the current
-  // step.
+  // Rewinds the session to the given checkpoint.
   absl::Status RewindToCheckpoint(absl::string_view label) override;
+
+  // Rewinds the session to a specific step number.
+  absl::Status RewindToStep(int step) override;
 
   // Get the current step of the session.
   absl::StatusOr<int> GetCurrentStep() const override;
@@ -217,7 +235,7 @@ class SessionAdvanced : public SessionInterface {
 
   explicit SessionAdvanced(SessionId session_id,
                            std::weak_ptr<ExecutionManager> execution_manager,
-                           Tokenizer* absl_nonnull tokenizer,
+                           support::Tokenizer* absl_nonnull tokenizer,
                            std::shared_ptr<const SessionInfo> session_info,
                            SessionState session_state = SessionState::kFresh,
                            absl::flat_hash_set<TaskId> last_task_ids = {},
@@ -246,7 +264,7 @@ class SessionAdvanced : public SessionInterface {
   std::weak_ptr<ExecutionManager> execution_manager_;
 
   // The tokenizer used for the session.
-  Tokenizer* absl_nonnull tokenizer_;
+  support::Tokenizer* absl_nonnull tokenizer_;
 
   // The session info used for the session.
   std::shared_ptr<const SessionInfo> session_info_;
@@ -260,6 +278,7 @@ class SessionAdvanced : public SessionInterface {
   struct CheckpointInfo {
     int step;
     SessionState state;
+    absl::flat_hash_set<TaskId> last_task_ids;
   };
 
   // The checkpoint map for the session.

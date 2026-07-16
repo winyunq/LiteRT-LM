@@ -30,15 +30,20 @@
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/types/optional.h"  // from @com_google_absl
 #include "litert/cc/internal/scoped_file.h"  // from @litert  // IWYU pragma: keep
-#include "runtime/components/tokenizer.h"
+#include "support/tokenizer/tokenizer.h"  // from @litert
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/proto/engine.pb.h"
 #include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/proto/llm_model_type.pb.h"
+#include "runtime/proto/sampler_params.pb.h"
 #include "runtime/proto/token.pb.h"
 #include "runtime/util/test_utils.h"  // IWYU pragma: keep
 
 namespace litert::lm {
+
+using Tokenizer = ::litert::support::Tokenizer;
+using TokenizerType = ::litert::support::TokenizerType;
+
 namespace {
 
 using ::litert::lm::EngineSettings;
@@ -58,6 +63,7 @@ class MockTokenizer : public Tokenizer {
               (override));
   MOCK_METHOD(TokenizerType, GetTokenizerType, (), (const, override));
   MOCK_METHOD(std::vector<std::string>, GetTokens, (), (const, override));
+  MOCK_METHOD(int, GetVocabSize, (), (const, override));
 };
 
 proto::LlmMetadata CreateLlmMetadata() {
@@ -1027,6 +1033,91 @@ TEST(SessionConfigTest, MaybeUpdateAndValidatePickGpuAsSamplerBackend) {
   // The validation should pass now.
   EXPECT_OK(session_config.MaybeUpdateAndValidate(*settings));
   EXPECT_EQ(session_config.GetSamplerBackend(), Backend::GPU);
+}
+
+TEST(SessionConfigTest, MaybeUpdateAndValidateSamplerBackendFromMetadata) {
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create("test_model_path_1"));
+  ASSERT_OK_AND_ASSIGN(auto settings,
+                       EngineSettings::CreateDefault(model_assets));
+  EXPECT_EQ(settings.GetMainExecutorSettings().GetBackend(), Backend::CPU);
+
+  auto session_config = SessionConfig::CreateDefault();
+
+  MockTokenizer tokenizer;
+  EXPECT_CALL(tokenizer, TokenIdsToText).WillRepeatedly(Return("fake_text"));
+  EXPECT_CALL(tokenizer, TokenToId).WillRepeatedly(Return(1));
+  EXPECT_CALL(tokenizer, TextToTokenIds)
+      .WillRepeatedly(Return(std::vector<int>{1}));
+  proto::LlmMetadata llm_metadata = CreateLlmMetadata();
+  llm_metadata.mutable_sampler_params()->set_backend(
+      proto::SamplerParameters::GPU);
+
+  EXPECT_OK(settings.MaybeUpdateAndValidate(&tokenizer, &llm_metadata));
+  EXPECT_OK(session_config.MaybeUpdateAndValidate(settings));
+  EXPECT_EQ(session_config.GetSamplerBackend(), Backend::GPU);
+}
+
+TEST(SessionConfigTest,
+     MaybeUpdateAndValidateSamplerBackendNotOverwrittenFromCreation) {
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create("test_model_path_1"));
+  ASSERT_OK_AND_ASSIGN(
+      auto settings,
+      EngineSettings::CreateDefault(model_assets, /*backend=*/Backend::CPU));
+  EXPECT_EQ(settings.GetMainExecutorSettings().GetBackend(), Backend::CPU);
+
+  auto session_config = SessionConfig::CreateDefault();
+  // Explicitly set the sampler backend to CPU during session config creation
+  // from user.
+  session_config.SetSamplerBackend(Backend::CPU);
+
+  MockTokenizer tokenizer;
+  EXPECT_CALL(tokenizer, TokenIdsToText).WillRepeatedly(Return("fake_text"));
+  EXPECT_CALL(tokenizer, TokenToId).WillRepeatedly(Return(1));
+  EXPECT_CALL(tokenizer, TextToTokenIds)
+      .WillRepeatedly(Return(std::vector<int>{1}));
+  proto::LlmMetadata llm_metadata = CreateLlmMetadata();
+  llm_metadata.mutable_sampler_params()->set_backend(
+      proto::SamplerParameters::GPU);
+
+  EXPECT_OK(settings.MaybeUpdateAndValidate(&tokenizer, &llm_metadata));
+  EXPECT_OK(session_config.MaybeUpdateAndValidate(settings));
+  // When the user explicitly sets the sampler backend during engine creation,
+  // the sampler backend from metadata should not overwrite it.
+  EXPECT_EQ(session_config.GetSamplerBackend(), Backend::CPU);
+}
+
+TEST(SessionConfigTest,
+     MaybeUpdateAndValidateSamplerBackendFromMetadataWithCustomParams) {
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create("test_model_path_1"));
+  ASSERT_OK_AND_ASSIGN(auto settings,
+                       EngineSettings::CreateDefault(model_assets));
+  EXPECT_EQ(settings.GetMainExecutorSettings().GetBackend(), Backend::CPU);
+
+  auto session_config = SessionConfig::CreateDefault();
+  session_config.GetMutableSamplerParams().set_type(
+      proto::SamplerParameters::TOP_P);
+  session_config.GetMutableSamplerParams().set_p(0.5f);
+
+  MockTokenizer tokenizer;
+  EXPECT_CALL(tokenizer, TokenIdsToText).WillRepeatedly(Return("fake_text"));
+  EXPECT_CALL(tokenizer, TokenToId).WillRepeatedly(Return(1));
+  EXPECT_CALL(tokenizer, TextToTokenIds)
+      .WillRepeatedly(Return(std::vector<int>{1}));
+  proto::LlmMetadata llm_metadata = CreateLlmMetadata();
+  llm_metadata.mutable_sampler_params()->set_backend(
+      proto::SamplerParameters::GPU);
+
+  EXPECT_OK(settings.MaybeUpdateAndValidate(&tokenizer, &llm_metadata));
+  EXPECT_OK(session_config.MaybeUpdateAndValidate(settings));
+  // The users provided custom sampler params are retained, and the sampler
+  // backend from metadata is used.
+  EXPECT_EQ(session_config.GetSamplerBackend(), Backend::GPU);
+  EXPECT_EQ(session_config.GetSamplerParams().type(),
+            proto::SamplerParameters::TOP_P);
+  EXPECT_EQ(session_config.GetSamplerParams().p(), 0.5f);
 }
 
 TEST(SessionConfigTest, MaybeUpdateAndValidateMaxNumTokens) {

@@ -24,7 +24,6 @@
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "runtime/components/prompt_template.h"
-#include "runtime/components/tokenizer.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/config_registry.h"
 #include "runtime/conversation/model_data_processor/fastvlm_data_processor.h"
@@ -295,13 +294,185 @@ absl::StatusOr<DataProcessorConfig> CreateGenericDataProcessorConfig(
         "GenericDataProcessorConfig.");
   }
   GenericDataProcessorConfig config;
-  if (model_type.generic_model().has_model_role()) {
-    config.model_role = model_type.generic_model().model_role();
+  proto::GenericModel generic_model = model_type.generic_model();
+
+  if (generic_model.has_model_role()) {
+    config.model_role = generic_model.model_role();
   }
-  if (model_type.generic_model().has_force_string_content()) {
-    config.force_string_content =
-        model_type.generic_model().force_string_content();
+  if (generic_model.has_force_string_content()) {
+    config.force_string_content = generic_model.force_string_content();
   }
+
+  // Parse multimodal config if enabled
+  if (generic_model.image_enabled() || generic_model.audio_enabled()) {
+    MultimodalConfig multi_config;
+    multi_config.image_enabled = generic_model.image_enabled();
+    multi_config.audio_enabled = generic_model.audio_enabled();
+
+    if (generic_model.has_delimiter_regex()) {
+      multi_config.processing_config.delimiter_regex =
+          generic_model.delimiter_regex();
+    }
+    if (generic_model.has_image_token_regex()) {
+      multi_config.processing_config.image_token_regex =
+          generic_model.image_token_regex();
+    }
+    if (generic_model.has_audio_token_regex()) {
+      multi_config.processing_config.audio_token_regex =
+          generic_model.audio_token_regex();
+    }
+
+    // Image config
+    int height = 0;
+    int width = 0;
+    if (generic_model.has_image_tensor_height()) {
+      height = generic_model.image_tensor_height();
+    }
+    if (generic_model.has_image_tensor_width()) {
+      width = generic_model.image_tensor_width();
+    }
+    multi_config.image_preprocess_parameter.SetTargetDimensions(
+        Dimensions({1, height, width, 3}));
+
+    // Patchify config
+    if (generic_model.has_patch_width() || generic_model.has_patch_height() ||
+        generic_model.has_max_num_patches() ||
+        generic_model.has_pooling_kernel_size()) {
+      multi_config.image_preprocess_parameter.SetPatchifyConfig(
+          ImagePreprocessParameter::PatchifyConfig{
+              .patch_width = generic_model.patch_width(),
+              .patch_height = generic_model.patch_height(),
+              .max_num_patches = generic_model.max_num_patches(),
+              .pooling_kernel_size = generic_model.pooling_kernel_size(),
+          });
+    }
+
+    // Image formatting
+    if (generic_model.has_start_of_image_token()) {
+      ASSIGN_OR_RETURN(multi_config.processing_config.boi_token,
+                       GetTokenString(generic_model.start_of_image_token()));
+    }
+    if (generic_model.has_end_of_image_token()) {
+      ASSIGN_OR_RETURN(multi_config.processing_config.eoi_token,
+                       GetTokenString(generic_model.end_of_image_token()));
+    }
+    if (generic_model.has_image_prefix()) {
+      multi_config.processing_config.image_prefix =
+          generic_model.image_prefix();
+    }
+    if (generic_model.has_image_suffix()) {
+      multi_config.processing_config.image_suffix =
+          generic_model.image_suffix();
+    }
+    multi_config.processing_config.add_image_end =
+        generic_model.add_image_end();
+
+    // Audio config
+    int sample_rate_hz = 16000;
+    int num_channels = 1;
+    int frame_length = 512;
+    int hop_length = 160;
+    int fft_length = 1024;
+    float input_scale = 32768.0;
+    float pre_emphasis_factor = 0.97;
+    int num_mel_bins = 128;
+    float mel_low_hz = 125.0;
+    float mel_high_hz = 7500.0;
+    float mel_floor = 1e-6;
+    bool normalize_mel = true;
+    bool add_floor_to_mel_before_log = false;
+    bool semicausal_padding = false;
+    bool non_zero_hanning = true;
+    bool periodic_hanning = true;
+    AudioPreprocessorConfig::FftPaddingType fft_padding_type =
+        AudioPreprocessorConfig::FftPaddingType::kRight;
+    bool skip_mel_spectrogram_extraction = false;
+    bool buffer_last_frame = false;
+
+    if (generic_model.has_audio_sample_rate_hz()) {
+      sample_rate_hz = generic_model.audio_sample_rate_hz();
+    }
+    if (generic_model.has_audio_num_channels()) {
+      num_channels = generic_model.audio_num_channels();
+    }
+    if (generic_model.has_audio_frame_length()) {
+      frame_length = generic_model.audio_frame_length();
+    }
+    if (generic_model.has_audio_hop_length()) {
+      hop_length = generic_model.audio_hop_length();
+    }
+    if (generic_model.has_audio_fft_length()) {
+      fft_length = generic_model.audio_fft_length();
+    }
+    if (generic_model.has_audio_input_scale()) {
+      input_scale = generic_model.audio_input_scale();
+    }
+    if (generic_model.has_audio_pre_emphasis_factor()) {
+      pre_emphasis_factor = generic_model.audio_pre_emphasis_factor();
+    }
+    if (generic_model.has_audio_num_mel_bins()) {
+      num_mel_bins = generic_model.audio_num_mel_bins();
+    }
+    if (generic_model.has_audio_mel_low_hz()) {
+      mel_low_hz = generic_model.audio_mel_low_hz();
+    }
+    if (generic_model.has_audio_mel_high_hz()) {
+      mel_high_hz = generic_model.audio_mel_high_hz();
+    }
+    if (generic_model.has_audio_mel_floor()) {
+      mel_floor = generic_model.audio_mel_floor();
+    }
+    normalize_mel = generic_model.audio_normalize_mel();
+    add_floor_to_mel_before_log =
+        generic_model.audio_add_floor_to_mel_before_log();
+    semicausal_padding = generic_model.audio_semicausal_padding();
+    non_zero_hanning = generic_model.audio_non_zero_hanning();
+    periodic_hanning = generic_model.audio_periodic_hanning();
+    skip_mel_spectrogram_extraction =
+        generic_model.skip_mel_spectrogram_extraction();
+    if (generic_model.has_audio_fft_padding_type()) {
+      switch (generic_model.audio_fft_padding_type()) {
+        case litert::lm::proto::FFT_PADDING_TYPE_RIGHT:
+          fft_padding_type = AudioPreprocessorConfig::FftPaddingType::kRight;
+          break;
+        case litert::lm::proto::FFT_PADDING_TYPE_CENTER:
+          fft_padding_type = AudioPreprocessorConfig::FftPaddingType::kCenter;
+          break;
+        default:
+          break;
+      }
+    }
+
+    multi_config.audio_preprocessor_config = AudioPreprocessorConfig::Create(
+        sample_rate_hz, num_channels, frame_length, hop_length, fft_length,
+        input_scale, pre_emphasis_factor, num_mel_bins, mel_low_hz, mel_high_hz,
+        mel_floor, normalize_mel, add_floor_to_mel_before_log,
+        semicausal_padding, non_zero_hanning, periodic_hanning,
+        fft_padding_type, skip_mel_spectrogram_extraction, buffer_last_frame);
+
+    // Audio formatting
+    if (generic_model.has_start_of_audio_token()) {
+      ASSIGN_OR_RETURN(multi_config.processing_config.boa_token,
+                       GetTokenString(generic_model.start_of_audio_token()));
+    }
+    if (generic_model.has_end_of_audio_token()) {
+      ASSIGN_OR_RETURN(multi_config.processing_config.eoa_token,
+                       GetTokenString(generic_model.end_of_audio_token()));
+    }
+    if (generic_model.has_audio_prefix()) {
+      multi_config.processing_config.audio_prefix =
+          generic_model.audio_prefix();
+    }
+    if (generic_model.has_audio_suffix()) {
+      multi_config.processing_config.audio_suffix =
+          generic_model.audio_suffix();
+    }
+    multi_config.processing_config.add_audio_end =
+        generic_model.add_audio_end();
+
+    config.multimodal = multi_config;
+  }
+
   return config;
 }
 

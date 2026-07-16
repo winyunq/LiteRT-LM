@@ -26,7 +26,7 @@
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "litert/cc/internal/litert_detail.h"  // from @litert
-#include "runtime/components/tokenizer.h"
+#include "support/tokenizer/tokenizer.h"  // from @litert
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/util/status_macros.h"  // IWYU pragma: keep
@@ -34,7 +34,7 @@
 namespace litert::lm {
 
 absl::StatusOr<std::string> MaybeGetBosString(
-    const SessionConfig& session_config, Tokenizer& tokenizer) {
+    const SessionConfig& session_config, support::Tokenizer& tokenizer) {
   auto bos_token_id = session_config.GetStartTokenId();
   std::string bos_string = "";
   if (bos_token_id >= 0) {
@@ -45,7 +45,8 @@ absl::StatusOr<std::string> MaybeGetBosString(
 
 absl::StatusOr<InputText> StringToProcessedInputText(
     absl::string_view text, const SessionConfig& session_config,
-    Tokenizer& tokenizer, const std::optional<BenchmarkInfo>& benchmark_info) {
+    support::Tokenizer& tokenizer,
+    const std::optional<BenchmarkInfo>& benchmark_info) {
   auto bos_token_id = session_config.GetStartTokenId();
   std::string bos_string = "";
   if (bos_token_id >= 0) {
@@ -83,7 +84,7 @@ absl::StatusOr<InputText> StringToProcessedInputText(
 
 absl::StatusOr<std::vector<InputData>> ApplyPromptTemplates(
     const std::vector<InputData>& contents, ContentType content_type,
-    const SessionConfig& session_config, Tokenizer& tokenizer,
+    const SessionConfig& session_config, support::Tokenizer& tokenizer,
     bool is_first_turn) {
   ASSIGN_OR_RETURN(std::string bos_string,
                    MaybeGetBosString(session_config, tokenizer));
@@ -167,7 +168,8 @@ absl::StatusOr<std::vector<InputData>> ApplyPromptTemplates(
 
 absl::StatusOr<std::vector<InputData>> PreprocessContents(
     const std::vector<InputData>& contents, const SessionConfig& session_config,
-    Tokenizer& tokenizer, const std::optional<BenchmarkInfo>& benchmark_info) {
+    support::Tokenizer& tokenizer,
+    const std::optional<BenchmarkInfo>& benchmark_info) {
   std::vector<InputData> preprocessed_contents;
   for (int i = 0; i < contents.size(); ++i) {
     const auto& content = contents[i];

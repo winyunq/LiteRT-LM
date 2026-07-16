@@ -24,9 +24,9 @@
 #include <random>
 #include <string>
 #include <utility>
-#include <variant>
 #include <vector>
 
+#include "absl/cleanup/cleanup.h"  // from @com_google_absl
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/memory/memory.h"  // from @com_google_absl
@@ -49,6 +49,7 @@
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer_types.h"  // from @litert
 #include "runtime/components/embedding_lookup/embedding_lookup_manager.h"
+#include "runtime/components/logits_processor/logits_processor.h"
 #include "runtime/components/model_resources.h"
 #include "runtime/components/sampler_factory.h"
 #include "runtime/executor/common_utils.h"
@@ -113,10 +114,26 @@ absl::Status InitializeEmbeddingLookups(
   auto per_layer_embedder_model =
       resources.GetTFLiteModel(ModelType::kTfLitePerLayerEmbedder);
   if (per_layer_embedder_model.ok()) {
-    ASSIGN_OR_RETURN(
-        per_layer_embedding_lookup,
-        EmbeddingLookupManager::Create(env, *per_layer_embedder_model,
-                                       /*fully_supports_multi_modal=*/false));
+    std::optional<ScopedFile> per_layer_external_weight_file;
+    Options::ScopedWeightSectionMap per_layer_external_weight_sections;
+    auto section_offset =
+        resources.GetWeightsSectionOffset(ModelType::kTfLitePerLayerEmbedder);
+    if (section_offset.ok()) {
+      per_layer_external_weight_sections["tflite_weights"] = {
+          section_offset.value().first,
+          section_offset.value().second - section_offset.value().first};
+      LITERT_ASSIGN_OR_RETURN(auto scoped_file, resources.GetScopedFile());
+      LITERT_ASSIGN_OR_RETURN(auto duplicated_scoped_file,
+                              scoped_file.get().Duplicate());
+      per_layer_external_weight_file = std::move(duplicated_scoped_file);
+    }
+    ASSIGN_OR_RETURN(per_layer_embedding_lookup,
+                     EmbeddingLookupManager::Create(
+                         env, *per_layer_embedder_model,
+                         /*fully_supports_multi_modal=*/false,
+                         /*signature_key=*/std::nullopt,
+                         std::move(per_layer_external_weight_file),
+                         std::move(per_layer_external_weight_sections)));
   }
   return absl::OkStatus();
 }
@@ -608,6 +625,8 @@ absl::Status LlmLiteRtCompiledModelExecutorBase::PrefillInternal(
         RETURN_IF_ERROR(llm_context_->processed_context()
                             .processed_tokens()
                             .MarkPendingInputTokenAsProcessed());
+        llm_context_->runtime_state().current_step = internal_start_step + 1;
+
         ++prefill_input_pos_ptr;
         ++input_idx;
       }
@@ -1149,7 +1168,8 @@ absl::StatusOr<TensorBuffer> LlmLiteRtCompiledModelExecutorBase::DecodeLogits(
   RETURN_IF_ERROR(DecodeInternal(step_and_token.token, output_logits));
   RETURN_IF_ERROR(ConsumePendingOrAddProcessedToken(step_and_token.token));
 
-  if (decode_params.HasConstraintDecoder() && !step_and_token.token.empty()) {
+  if (!decode_params.GetLogitsProcessorList().empty() &&
+      !step_and_token.token.empty()) {
     int output_heads = 1;
     if (llm_context_->runtime_config().output_heads.has_value()) {
       output_heads = llm_context_->runtime_config().output_heads.value();
@@ -1163,9 +1183,11 @@ absl::StatusOr<TensorBuffer> LlmLiteRtCompiledModelExecutorBase::DecodeLogits(
     }
     // Update constraint state only with decode ids.
     if (last_run_is_decode) {
-      RETURN_IF_ERROR(
-          decode_params.GetConstraintDecoder()->UpdateConstraintState(
-              absl::MakeSpan(current_token_ids)));
+      for (LogitsProcessor* logits_processor :
+           decode_params.GetLogitsProcessorList()) {
+        RETURN_IF_ERROR(
+            logits_processor->UpdateState(absl::MakeSpan(current_token_ids)));
+      }
     }
 
     LITERT_ASSIGN_OR_RETURN(auto output_logits_buffer_type,
@@ -1173,9 +1195,11 @@ absl::StatusOr<TensorBuffer> LlmLiteRtCompiledModelExecutorBase::DecodeLogits(
     // If the output logits are already on the host memory, use the buffer
     // directly.
     if (output_logits_buffer_type == TensorBufferType::kHostMemory) {
-      // Mask logits based on the current constraint state.
-      RETURN_IF_ERROR(
-          decode_params.GetConstraintDecoder()->MaskLogits(output_logits));
+      // Process logits based on the current constraint state.
+      for (LogitsProcessor* logits_processor :
+           decode_params.GetLogitsProcessorList()) {
+        RETURN_IF_ERROR(logits_processor->ProcessLogits(output_logits));
+      }
     } else {
       // For GPU, we always copy the logits to CPU and mask them, then write
       // them back to GPU.
@@ -1185,11 +1209,14 @@ absl::StatusOr<TensorBuffer> LlmLiteRtCompiledModelExecutorBase::DecodeLogits(
         // Copy the logits from the tensor buffer to a vector.
         LITERT_ASSIGN_OR_RETURN(auto logits_vector,
                                 CopyFromTensorBuffer<float>(output_logits));
-        // Mask logits based on the current constraint state.
-        RETURN_IF_ERROR(decode_params.GetConstraintDecoder()->MaskLogits(
-            absl::MakeSpan(logits_vector.data(), logits_vector.size()),
-            logits_tensor_type.Layout().Dimensions()));
-        // Write the masked logits back to the tensor buffer.
+        // Process the logits using the logits processor.
+        for (LogitsProcessor* logits_processor :
+             decode_params.GetLogitsProcessorList()) {
+          RETURN_IF_ERROR(logits_processor->ProcessLogits(
+              absl::MakeSpan(logits_vector.data(), logits_vector.size()),
+              logits_tensor_type.Layout().Dimensions()));
+        }
+        // Write the processed logits back to the tensor buffer.
         output_logits.Write(
             absl::MakeConstSpan(logits_vector.data(), logits_vector.size()));
       } else if (logits_tensor_type.ElementType() ==
@@ -1199,11 +1226,14 @@ absl::StatusOr<TensorBuffer> LlmLiteRtCompiledModelExecutorBase::DecodeLogits(
             auto logits_vector,
             CopyFromTensorBuffer<tflite::half>(output_logits));
 
-        // Mask logits based on the current constraint state.
-        RETURN_IF_ERROR(decode_params.GetConstraintDecoder()->MaskLogits(
-            absl::MakeSpan(logits_vector.data(), logits_vector.size()),
-            logits_tensor_type.Layout().Dimensions()));
-        // Write the masked logits back to the tensor buffer.
+        // Process the logits using the logits processor.
+        for (LogitsProcessor* logits_processor :
+             decode_params.GetLogitsProcessorList()) {
+          RETURN_IF_ERROR(logits_processor->ProcessLogits(
+              absl::MakeSpan(logits_vector.data(), logits_vector.size()),
+              logits_tensor_type.Layout().Dimensions()));
+        }
+        // Write the processed logits back to the tensor buffer.
         output_logits.Write(
             absl::MakeConstSpan(logits_vector.data(), logits_vector.size()));
       } else {
@@ -1629,11 +1659,6 @@ LlmLiteRtCompiledModelExecutorStatic::Create(
   auto section_offset =
       resources.GetWeightsSectionOffset(ModelType::kTfLitePrefillDecode);
   if (section_offset.ok()) {
-    if (backend != Backend::GPU) {
-      return absl::InvalidArgumentError(
-          "Weights section offset is only "
-          "supported for GPU backend.");
-    }
     Options::ScopedWeightSectionMap section_map;
     section_map["tflite_weights"] = {
         section_offset.value().first,
@@ -1641,7 +1666,9 @@ LlmLiteRtCompiledModelExecutorStatic::Create(
     ABSL_LOG(INFO) << "section_map: " << section_map["tflite_weights"].offset
                    << " " << section_map["tflite_weights"].length;
     LITERT_ASSIGN_OR_RETURN(auto scoped_file, resources.GetScopedFile());
-    compilation_options.SetExternalWeightScopedFile(scoped_file.get(),
+    LITERT_ASSIGN_OR_RETURN(auto duplicated_scoped_file,
+                            scoped_file.get().Duplicate());
+    compilation_options.SetExternalWeightScopedFile(duplicated_scoped_file,
                                                     section_map);
   };
 
@@ -1844,6 +1871,15 @@ absl::Status LlmLiteRtCompiledModelExecutorDynamic::Prefill(
   // Only accept batch size 1 for now.
   LITERT_RETURN_IF_ERROR(PrepareFirstPrefillAfterDecode(0));
 
+  if (embedding_lookup_ != nullptr) {
+    RETURN_IF_ERROR(embedding_lookup_->UpdateMultiModalEmbeddings(inputs));
+  }
+  auto cleanup = absl::MakeCleanup([this]() {
+    if (embedding_lookup_ != nullptr) {
+      embedding_lookup_->CleanupMultiModalEmbeddings().IgnoreError();
+    }
+  });
+
   LITERT_ASSIGN_OR_RETURN(auto token_ids_buffer, inputs.GetTextTokenIdsPtr());
   LITERT_ASSIGN_OR_RETURN(auto tensor_type, token_ids_buffer->TensorType());
   RET_CHECK_EQ(tensor_type.Layout().Dimensions()[0], 1);
@@ -1880,10 +1916,19 @@ absl::Status LlmLiteRtCompiledModelExecutorDynamic::PrefillInternal(
   // If there is no pending input token and no input token to prefill, we can
   // return early by storing the token as a pending input token.
   if (!has_pending_input_token && prefill_length == 0) {
-    RETURN_IF_ERROR(
-        llm_context_->processed_context()
-            .processed_tokens()
-            .AddPendingInputToken({std::make_shared<TokenData>(ids[0])}));
+    auto pending_token = std::make_shared<TokenData>(ids[0]);
+    if (embedding_lookup_ != nullptr) {
+      RETURN_IF_ERROR(embedding_lookup_->LookupPrefill(
+          pending_token->id(), pending_token->mutable_embedding()));
+      if (per_layer_embedding_lookup_ != nullptr) {
+        RETURN_IF_ERROR(per_layer_embedding_lookup_->LookupPrefill(
+            pending_token->id(), pending_token->mutable_per_layer_embedding()));
+      }
+    }
+    RETURN_IF_ERROR(llm_context_->processed_context()
+                        .processed_tokens()
+                        .AddPendingInputToken({std::move(pending_token)}));
+    ++llm_context_->runtime_state().current_step;
     return absl::OkStatus();
   }
 

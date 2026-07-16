@@ -29,6 +29,27 @@
 #include "runtime/util/status_macros.h"
 
 namespace litert::lm {
+namespace {
+
+void StripBlobs(nlohmann::ordered_json& json) {
+  if (json.is_array()) {
+    for (auto& item : json) {
+      StripBlobs(item);
+    }
+  } else if (json.is_object()) {
+    if (json.contains("type") && json["type"].is_string()) {
+      std::string type = json["type"].get<std::string>();
+      if (type == "image" || type == "audio") {
+        json.erase("blob");
+      }
+    }
+    for (auto& [key, value] : json.items()) {
+      StripBlobs(value);
+    }
+  }
+}
+
+}  // namespace
 
 absl::Status FillPrefaceForPromptTemplateInput(
     const Preface& preface, const ModelDataProcessor* model_data_processor,
@@ -106,6 +127,7 @@ RenderSingleTurnTemplateCommon(
       closing_tmpl_input.extra_context["is_first_part"] = false;
       closing_tmpl_input.extra_context["is_last_part"] = true;
       closing_tmpl_input.add_generation_prompt = false;
+      StripBlobsFromTemplateInput(closing_tmpl_input);
       ASSIGN_OR_RETURN(std::string closing_text,
                        prompt_template.Apply(closing_tmpl_input));
       prefill_text += closing_text;
@@ -128,6 +150,7 @@ RenderSingleTurnTemplateCommon(
         }
       }
 
+      StripBlobsFromTemplateInput(preface_tmpl_input);
       ASSIGN_OR_RETURN(std::string preface_text,
                        prompt_template.Apply(preface_tmpl_input));
       prefill_text += preface_text;
@@ -149,11 +172,19 @@ RenderSingleTurnTemplateCommon(
       }
     }
 
+    StripBlobsFromTemplateInput(tmpl_input);
     ASSIGN_OR_RETURN(std::string new_text, prompt_template.Apply(tmpl_input));
     prefill_text += new_text;
   }
   return ModelDataProcessor::SingleTurnTemplateRenderResult{
       prefill_text, new_is_appending_message};
+}
+
+void StripBlobsFromTemplateInput(PromptTemplateInput& input) {
+  StripBlobs(input.messages);
+  if (input.extra_context.contains("message")) {
+    StripBlobs(input.extra_context["message"]);
+  }
 }
 
 }  // namespace litert::lm

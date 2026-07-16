@@ -17,7 +17,9 @@
 import http.server
 import socket
 import sys
+import threading
 from unittest import mock
+import urllib.request
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -68,8 +70,9 @@ mock_litert_lm.Engine = mock_engine.Engine
 mock_litert_lm.set_min_log_severity = mock_ffi.set_min_log_severity
 
 mock_model_mod = mock.Mock(spec_set=["Model", "parse_backend"])
-mock_model_mod.Model = mock.Mock(spec_set=["from_model_id"])
+mock_model_mod.Model = mock.Mock(spec_set=["from_model_id", "get_all_models"])
 mock_model_mod.Model.from_model_id = mock.Mock()
+mock_model_mod.Model.get_all_models = mock.Mock()
 mock_model_mod.parse_backend = mock.Mock()
 sys.modules["litert_lm_cli.model"] = (
     mock_model_mod
@@ -94,6 +97,8 @@ class ServeTest(parameterized.TestCase):
     mock_litert_lm.Engine.reset_mock()  # pytype: disable=attribute-error
     mock_model_mod.Model.from_model_id.reset_mock()
     mock_model_mod.Model.from_model_id.side_effect = None
+    mock_model_mod.Model.get_all_models.reset_mock()
+    mock_model_mod.Model.get_all_models.side_effect = None
     mock_model_mod.parse_backend.reset_mock()
     mock_model_mod.parse_backend.return_value = interfaces.Backend.CPU()
 
@@ -340,236 +345,7 @@ class ServeTest(parameterized.TestCase):
     self.assertEqual(server.model_id, "B")
     mock_engine_a.__exit__.assert_called_once_with(None, None, None)
 
-  def test_get_engine_backend_switching_reinitializes(self):
-    mock_model = mock.Mock(spec_set=["exists", "model_path"])
-    mock_model.exists.return_value = True
-    mock_model.model_path = "/path/to/model"
-    mock_model_mod.Model.from_model_id.return_value = mock_model
 
-    mock_engine_instance = mock.MagicMock(spec=interfaces.AbstractEngine)
-    mock_engine_instance.__enter__.return_value = mock_engine_instance
-    mock_litert_lm.Engine.return_value = mock_engine_instance
-
-    server = mock.MagicMock(spec=serve_util.LiteRTLMServer)
-    server.litert_lm_engine = None
-    server.model_id = None
-    server.backend = None
-    server.max_num_tokens = None
-
-    # Initialize with the CPU backend.
-    serve_util.get_or_initialize_server_engine(
-        server, model_id="model", backend=interfaces.Backend.CPU()
-    )
-    self.assertEqual(server.backend, interfaces.Backend.CPU())
-    mock_engine_instance.__exit__.assert_not_called()
-
-    # Switching to the GPU backend re-initializes.
-    serve_util.get_or_initialize_server_engine(
-        server, model_id="model", backend=interfaces.Backend.GPU()
-    )
-    self.assertEqual(server.backend, interfaces.Backend.GPU())
-    mock_engine_instance.__exit__.assert_called_once_with(None, None, None)
-
-  @parameterized.named_parameters(
-      dict(
-          testcase_name="model_only",
-          model_spec="gemma",
-          want_model="gemma",
-          want_backend=None,
-          want_max_tokens=None,
-          want_error=None,
-      ),
-      dict(
-          testcase_name="model_and_gpu",
-          model_spec="gemma,gpu",
-          want_model="gemma",
-          want_backend=interfaces.Backend.GPU(),
-          want_max_tokens=None,
-          want_error=None,
-      ),
-      dict(
-          testcase_name="model_cpu_and_tokens",
-          model_spec="gemma,cpu,1024",
-          want_model="gemma",
-          want_backend=interfaces.Backend.CPU(),
-          want_max_tokens=1024,
-          want_error=None,
-      ),
-      dict(
-          testcase_name="model_and_tokens_without_backend",
-          model_spec="gemma,,1024",
-          want_model="gemma",
-          want_backend=None,
-          want_max_tokens=1024,
-          want_error=None,
-      ),
-      dict(
-          testcase_name="invalid_trailing_comma",
-          model_spec="gemma,",
-          want_model=None,
-          want_backend=None,
-          want_max_tokens=None,
-          want_error="Trailing comma in model spec: gemma,",
-      ),
-      dict(
-          testcase_name="invalid_backend",
-          model_spec="gemma,invalid_backend",
-          want_model=None,
-          want_backend=None,
-          want_max_tokens=None,
-          want_error="Unavailable backend 'invalid_backend'",
-      ),
-      dict(
-          testcase_name="invalid_tokens",
-          model_spec="gemma,gpu,invalid_tokens",
-          want_model=None,
-          want_backend=None,
-          want_max_tokens=None,
-          want_error="Invalid max_tokens: invalid_tokens",
-      ),
-      dict(
-          testcase_name="invalid_extra_parameter",
-          model_spec="gemma,gpu,1024,extra",
-          want_model=None,
-          want_backend=None,
-          want_max_tokens=None,
-          want_error="Too many parameters in model spec: gemma,gpu,1024,extra",
-      ),
-  )
-  def test_parse_model_spec(
-      self, model_spec, want_model, want_backend, want_max_tokens, want_error
-  ):
-    if want_error is not None:
-      with self.assertRaisesRegex(ValueError, want_error):
-        serve_util.parse_model_spec(model_spec)
-    else:
-      spec = serve_util.parse_model_spec(model_spec)
-      self.assertEqual(spec.model_id, want_model)
-      self.assertEqual(spec.backend, want_backend)
-      self.assertEqual(spec.max_num_tokens, want_max_tokens)
-
-  @parameterized.named_parameters(
-      dict(
-          testcase_name="model_only",
-          path="/v1beta/models/gemma3-1b:generateContent",
-          want_model="gemma3-1b",
-          want_backend=None,
-          want_max_tokens=None,
-          want_stream=False,
-          want_error=None,
-      ),
-      dict(
-          testcase_name="model_and_backend_cpu",
-          path="/v1beta/models/gemma3-1b,cpu:generateContent",
-          want_model="gemma3-1b",
-          want_backend=interfaces.Backend.CPU(),
-          want_max_tokens=None,
-          want_stream=False,
-          want_error=None,
-      ),
-      dict(
-          testcase_name="model_and_backend_gpu",
-          path="/v1beta/models/gemma3-1b,gpu:generateContent",
-          want_model="gemma3-1b",
-          want_backend=interfaces.Backend.GPU(),
-          want_max_tokens=None,
-          want_stream=False,
-          want_error=None,
-      ),
-      dict(
-          testcase_name="model_backend_and_max_tokens",
-          path="/v1beta/models/gemma3-1b,cpu,8192:generateContent",
-          want_model="gemma3-1b",
-          want_backend=interfaces.Backend.CPU(),
-          want_max_tokens=8192,
-          want_stream=False,
-          want_error=None,
-      ),
-      dict(
-          testcase_name="model_max_tokens_without_backend",
-          path="/v1beta/models/gemma3-1b,,8192:generateContent",
-          want_model="gemma3-1b",
-          want_backend=None,
-          want_max_tokens=8192,
-          want_stream=False,
-          want_error=None,
-      ),
-      dict(
-          testcase_name="invalid_max_tokens",
-          path="/v1beta/models/gemma3-1b,cpu,abc:generateContent",
-          want_model="",
-          want_backend=None,
-          want_max_tokens=None,
-          want_stream=False,
-          want_error="Invalid max_tokens: abc",
-      ),
-      dict(
-          testcase_name="invalid_format_trailing_comma",
-          path="/v1beta/models/gemma3-1b,:generateContent",
-          want_model="",
-          want_backend=None,
-          want_max_tokens=None,
-          want_stream=False,
-          want_error="Trailing comma in model spec: gemma3-1b,",
-      ),
-      dict(
-          testcase_name="invalid_format_extra_slashes",
-          path="/v1beta/models/gemma3-1b/gpu:generateContent",
-          want_model="",
-          want_backend=None,
-          want_max_tokens=None,
-          want_stream=False,
-          want_error="Not Found",
-      ),
-      dict(
-          testcase_name="unsupported_backend_rejects_gracefully",
-          path="/v1beta/models/gemma3-1b,tpu:generateContent",
-          want_model="",
-          want_backend=None,
-          want_max_tokens=None,
-          want_stream=False,
-          want_error=(
-              "Unavailable backend 'tpu', available backends are 'cpu' and"
-              " 'gpu'"
-          ),
-      ),
-      dict(
-          testcase_name="valid_stream_endpoint",
-          path="/v1beta/models/gemma3-1b:streamGenerateContent",
-          want_model="gemma3-1b",
-          want_backend=None,
-          want_max_tokens=None,
-          want_stream=True,
-          want_error=None,
-      ),
-      dict(
-          testcase_name="invalid_endpoint",
-          path="/v1beta/models/gemma3-1b:unknownEndpoint",
-          want_model="",
-          want_backend=None,
-          want_max_tokens=None,
-          want_stream=False,
-          want_error="Not Found",
-      ),
-  )
-  def test_parse_model_and_backend_from_path(
-      self,
-      path,
-      want_model,
-      want_backend,
-      want_max_tokens,
-      want_stream,
-      want_error,
-  ):
-    req = gemini_handler.parse_model_and_backend(path)
-    if want_error is not None:
-      self.assertEqual(req.error_msg, want_error)
-    else:
-      self.assertIsNone(req.error_msg)
-      self.assertEqual(req.model_id, want_model)
-      self.assertEqual(req.backend, want_backend)
-      self.assertEqual(req.max_num_tokens, want_max_tokens)
-      self.assertEqual(req.is_stream, want_stream)
 
   @parameterized.named_parameters(
       dict(
@@ -711,6 +487,120 @@ class ServeTest(parameterized.TestCase):
         ValueError, "No matching tool call found for tool_call_id"
     ):
       openai_handler._translate_openai_message(message, None)
+
+  def test_cors_headers_disabled_by_default(self):
+    server = serve_util.LiteRTLMServer(
+        ("127.0.0.1", 0), openai_handler.OpenAIHandler
+    )
+    port = server.server_port
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+      # Test OPTIONS
+      req = urllib.request.Request(
+          f"http://127.0.0.1:{port}/v1/chat/completions",
+          method="OPTIONS",
+      )
+      with urllib.request.urlopen(req) as resp:
+        self.assertEqual(resp.status, 200)
+        self.assertIsNone(resp.headers.get("Access-Control-Allow-Origin"))
+        self.assertIsNone(resp.headers.get("Access-Control-Allow-Methods"))
+
+      # Test GET
+      mock_model_mod.Model.get_all_models.return_value = []
+      req = urllib.request.Request(
+          f"http://127.0.0.1:{port}/v1/models", method="GET"
+      )
+      with urllib.request.urlopen(req) as resp:
+        self.assertEqual(resp.status, 200)
+        self.assertIsNone(resp.headers.get("Access-Control-Allow-Origin"))
+
+    finally:
+      server.shutdown()
+      thread.join()
+
+  def test_cors_headers_wildcard(self):
+    server = serve_util.LiteRTLMServer(
+        ("127.0.0.1", 0), openai_handler.OpenAIHandler, allowed_origins=("*",)
+    )
+    port = server.server_port
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+      # Test OPTIONS
+      req = urllib.request.Request(
+          f"http://127.0.0.1:{port}/v1/chat/completions",
+          method="OPTIONS",
+      )
+      with urllib.request.urlopen(req) as resp:
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.headers.get("Access-Control-Allow-Origin"), "*")
+        self.assertEqual(
+            resp.headers.get("Access-Control-Allow-Methods"),
+            "GET, POST, OPTIONS",
+        )
+
+      # Test GET
+      mock_model_mod.Model.get_all_models.return_value = []
+      req = urllib.request.Request(
+          f"http://127.0.0.1:{port}/v1/models", method="GET"
+      )
+      with urllib.request.urlopen(req) as resp:
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(resp.headers.get("Access-Control-Allow-Origin"), "*")
+
+    finally:
+      server.shutdown()
+      thread.join()
+
+  def test_cors_headers_restricted(self):
+    allowed = ("http://localhost:3000", "http://example.com")
+    server = serve_util.LiteRTLMServer(
+        ("127.0.0.1", 0), openai_handler.OpenAIHandler, allowed_origins=allowed
+    )
+    port = server.server_port
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+      # Test matched origin
+      req = urllib.request.Request(
+          f"http://127.0.0.1:{port}/v1/models",
+          method="GET",
+          headers={"Origin": "http://localhost:3000"},
+      )
+      mock_model_mod.Model.get_all_models.return_value = []
+      with urllib.request.urlopen(req) as resp:
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(
+            resp.headers.get("Access-Control-Allow-Origin"),
+            "http://localhost:3000",
+        )
+        self.assertEqual(resp.headers.get("Vary"), "Origin")
+        self.assertEqual(
+            resp.headers.get("Access-Control-Allow-Methods"),
+            "GET, POST, OPTIONS",
+        )
+        self.assertEqual(
+            resp.headers.get("Access-Control-Allow-Headers"),
+            "Content-Type, Authorization, X-Requested-With",
+        )
+
+      # Test unmatched origin
+      req = urllib.request.Request(
+          f"http://127.0.0.1:{port}/v1/models",
+          method="GET",
+          headers={"Origin": "http://evil.com"},
+      )
+      with urllib.request.urlopen(req) as resp:
+        self.assertEqual(resp.status, 200)
+        self.assertIsNone(resp.headers.get("Access-Control-Allow-Origin"))
+
+    finally:
+      server.shutdown()
+      thread.join()
 
 
 if __name__ == "__main__":

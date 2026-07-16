@@ -57,7 +57,7 @@ ENGINE_IMPL_COMMON_DEPS = [
     "@com_google_absl//absl/time",
     "@litert//litert/cc:litert_macros",
     "//runtime/components:model_resources",
-    "//runtime/components:tokenizer",
+    "@litert//support/tokenizer",
     "//runtime/engine:engine_factory",
     "//runtime/engine:engine_interface",
     "//runtime/engine:engine_settings",
@@ -87,15 +87,9 @@ ENGINE_IMPL_COMMON_DEPS = [
     "//runtime/util:litert_status_util",
     "//runtime/util:litert_util",
     "//runtime/util:logging",
-] + select({
-    "@litert//litert:litert_link_capi_so": [
-        "@litert//litert/cc:litert_api_with_dynamic_runtime",
-    ],
-    "//conditions:default": [
-        "@litert//litert/cc:litert_environment",
-        "@litert//litert/cc:litert_environment_options",
-    ],
-})
+    "@litert//litert/cc:litert_environment",
+    "@litert//litert/cc:litert_environment_options",
+]
 
 cc_library(
     name = "engine_advanced_impl",
@@ -172,13 +166,16 @@ cc_library(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/types:span",
+        "@litert//litert/cc:litert_macros",
+        "@litert//litert/cc:litert_tensor_buffer",
+        "@litert//support/tokenizer",
         "//runtime/components:sampler",
         "//runtime/components:scoring_cpu_util",
         "//runtime/components:stop_token_detector",
         "//runtime/components:token_id_util",
-        "//runtime/components:tokenizer",
         "//runtime/components:top_p_cpu_sampler",
-        "//runtime/components/constrained_decoding:constraint",
+        "//runtime/components/logits_processor:repetition_penalty_config",
+        "//runtime/components/logits_processor/constrained_decoding:constraint",
         "//runtime/engine:io_types",
         "//runtime/executor:executor_settings_base",
         "//runtime/executor:llm_executor",
@@ -186,15 +183,7 @@ cc_library(
         "//runtime/proto:sampler_params_cc_proto",
         "//runtime/util:convert_tensor_buffer",
         "//runtime/util:litert_status_util",
-    ] + select({
-        "@litert//litert:litert_link_capi_so": [
-            "@litert//litert/cc:litert_api_with_dynamic_runtime",
-        ],
-        "//conditions:default": [
-            "@litert//litert/cc:litert_macros",
-            "@litert//litert/cc:litert_tensor_buffer",
-        ],
-    }),
+    ],
 )
 
 cc_test(
@@ -209,11 +198,12 @@ cc_test(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/time",
-        "//runtime/components:sentencepiece_tokenizer",
+        "@litert//support/tokenizer",
+        "@litert//support/tokenizer:sentencepiece_tokenizer",
         "//runtime/components:stop_token_detector",
-        "//runtime/components:tokenizer",
         "//runtime/components:top_p_cpu_sampler",
-        "//runtime/components/constrained_decoding:fake_constraint",
+        "//runtime/components/logits_processor:repetition_penalty_config",
+        "//runtime/components/logits_processor/constrained_decoding:fake_constraint",
         "//runtime/engine:io_types",
         "//runtime/executor:fake_llm_executor",
         "//runtime/executor:llm_executor_io_types",
@@ -244,11 +234,10 @@ cc_library(
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/synchronization",
         "@com_google_absl//absl/time",
-        "//runtime/components:tokenizer",
+        "@litert//support/tokenizer",
         "//runtime/engine:engine_interface",
         "//runtime/engine:engine_settings",
         "//runtime/engine:io_types",
-        "//runtime/executor:llm_executor_io_types",
         "//runtime/framework/resource_management:execution_manager",
         "//runtime/proto:sampler_params_cc_proto",
         "//runtime/util:litert_status_util",
@@ -265,6 +254,7 @@ cc_test(
     tags = ["requires-mac-inputs:hard"],  # Required for running on Forge on Mac.
     deps = [
         ":session_advanced",
+        ":session_utils",
         "@com_google_googletest//:gtest_main",
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/functional:any_invocable",
@@ -274,12 +264,14 @@ cc_test(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/time",
+        "@litert//litert/cc:litert_environment",
+        "@litert//litert/cc:litert_environment_options",
         "@litert//litert/cc:litert_tensor_buffer",
         "@litert//litert/test:matchers",
+        "@litert//support/tokenizer",
+        "@litert//support/tokenizer:sentencepiece_tokenizer",
         "//runtime/components:model_resources",
-        "//runtime/components:sentencepiece_tokenizer",
-        "//runtime/components:tokenizer",
-        "//runtime/components/constrained_decoding:fake_constraint",
+        "//runtime/components/logits_processor/constrained_decoding:fake_constraint",
         "//runtime/engine:engine_settings",
         "//runtime/engine:io_types",
         "//runtime/executor:audio_executor_settings",
@@ -295,15 +287,7 @@ cc_test(
         "//runtime/util:scoped_file",
         "//runtime/util:tensor_buffer_util",
         "//runtime/util:test_utils",
-    ] + select({
-        "@litert//litert:litert_link_capi_so": [
-            "@litert//litert/cc:litert_api_with_dynamic_runtime",
-        ],
-        "//conditions:default": [
-            "@litert//litert/cc:litert_environment",
-            "@litert//litert/cc:litert_environment_options",
-        ],
-    }),
+    ],
 )
 
 cc_library(
@@ -316,7 +300,7 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@litert//litert/cc/internal:litert_detail",
-        "//runtime/components:tokenizer",
+        "@litert//support/tokenizer",
         "//runtime/engine:engine_settings",
         "//runtime/engine:io_types",
         "//runtime/util:litert_status_util",
@@ -338,9 +322,10 @@ cc_test(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
+        "@litert//litert/cc:litert_tensor_buffer",
         "@litert//litert/test:matchers",
-        "//runtime/components:sentencepiece_tokenizer",
-        "//runtime/components:tokenizer",
+        "@litert//support/tokenizer",
+        "@litert//support/tokenizer:sentencepiece_tokenizer",
         "//runtime/engine:engine_settings",
         "//runtime/engine:io_types",
         "//runtime/proto:sampler_params_cc",
@@ -348,14 +333,7 @@ cc_test(
         "//runtime/util:litert_status_util",
         "//runtime/util:tensor_buffer_util",
         "//runtime/util:test_utils",
-    ] + select({
-        "@litert//litert:litert_link_capi_so": [
-            "@litert//litert/cc:litert_api_with_dynamic_runtime",
-        ],
-        "//conditions:default": [
-            "@litert//litert/cc:litert_tensor_buffer",
-        ],
-    }),
+    ],
 )
 
 cc_library(
@@ -371,12 +349,18 @@ cc_library(
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_absl//absl/types:span",
+        "@litert//litert/cc:litert_element_type",
+        "@litert//litert/cc:litert_macros",
+        "@litert//litert/cc:litert_tensor_buffer",
+        "@litert//support/tokenizer",
         "//runtime/components:sampler",
         "//runtime/components:scoring_cpu_util",
         "//runtime/components:stop_token_detector",
-        "//runtime/components:tokenizer",
-        "//runtime/components/constrained_decoding:constrained_decoder",
-        "//runtime/components/constrained_decoding:constraint",
+        "//runtime/components/logits_processor",
+        "//runtime/components/logits_processor:repetition_penalty_config",
+        "//runtime/components/logits_processor:repetition_penalty_processor",
+        "//runtime/components/logits_processor/constrained_decoding:constrained_decoder",
+        "//runtime/components/logits_processor/constrained_decoding:constraint",
         "//runtime/engine:io_types",
         "//runtime/executor:llm_executor",
         "//runtime/executor:llm_executor_io_types",
@@ -386,16 +370,7 @@ cc_library(
         "//runtime/util:convert_tensor_buffer",
         "//runtime/util:litert_status_util",
         "@litert//tflite/types:half",
-    ] + select({
-        "@litert//litert:litert_link_capi_so": [
-            "@litert//litert/cc:litert_api_with_dynamic_runtime",
-        ],
-        "//conditions:default": [
-            "@litert//litert/cc:litert_element_type",
-            "@litert//litert/cc:litert_macros",
-            "@litert//litert/cc:litert_tensor_buffer",
-        ],
-    }),
+    ],
 )
 
 cc_test(
@@ -410,11 +385,12 @@ cc_test(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_absl//absl/time",
-        "//runtime/components:sentencepiece_tokenizer",
+        "@litert//support/tokenizer",
+        "@litert//support/tokenizer:sentencepiece_tokenizer",
         "//runtime/components:stop_token_detector",
-        "//runtime/components:tokenizer",
         "//runtime/components:top_p_cpu_sampler",
-        "//runtime/components/constrained_decoding:fake_constraint",
+        "//runtime/components/logits_processor:repetition_penalty_config",
+        "//runtime/components/logits_processor/constrained_decoding:fake_constraint",
         "//runtime/engine:io_types",
         "//runtime/executor:fake_llm_executor",
         "//runtime/executor:llm_executor_io_types",

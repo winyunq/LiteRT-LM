@@ -29,28 +29,26 @@ def parse_speculative_decoding(unused_ctx, unused_param, value):
   Args:
     unused_ctx: The click context.
     unused_param: The click parameter.
-    value: The value to parse ("auto", "true", or "false").
+    value: The value to parse ("true" or "false").
 
   Returns:
-    True for "true", False for "false", and None for "auto".
+    True for "true", False for "false", and None if not set.
   """
   if value is None:
     return None
   value_lower = value.lower()
-  if value_lower == "auto":
-    return None
-  elif value_lower == "true":
+  if value_lower == "true":
     return True
   elif value_lower == "false":
     return False
   return value
 
 
-def cache_dir_value_from_cache_mode(cache: str) -> str:
+def cache_dir_value_from_cache_mode(cache: str | None) -> str:
   """Returns the cache directory value for the given cache mode.
 
   Args:
-    cache: The cache mode. Valid values are "disk", "memory", "no".
+    cache: The cache mode. Valid values are "disk", "memory", "no", or None.
 
   Returns:
     The cache directory value as a string.
@@ -58,6 +56,8 @@ def cache_dir_value_from_cache_mode(cache: str) -> str:
   Raises:
     ValueError: If the cache mode is invalid.
   """
+  if cache is None:
+    return ""
   if cache == "disk":
     return ""
   elif cache == "memory":
@@ -100,10 +100,11 @@ def common_inference_options(f):
   f = click.option(
       "--cache",
       type=click.Choice(["disk", "memory", "no"]),
-      default="disk",
+      default=None,
       help=textwrap.dedent("""\
           \b
-          Caching mode for compiled model artifacts to speed up startup.
+          Caching mode for compiled model artifacts to speed up startup. If not
+          set, use the model's configured value.
             - disk: Persists compiled artifacts to a file next to the model.
             - memory: Caches compiled artifacts in RAM (CPU backend only, not available on Windows).
             - no: Disables caching (recompiles on every run).
@@ -111,13 +112,12 @@ def common_inference_options(f):
   )(f)
   f = click.option(
       "--enable-speculative-decoding",
-      type=click.Choice(["auto", "true", "false"], case_sensitive=False),
-      default="auto",
+      type=click.Choice(["true", "false"], case_sensitive=False),
+      default=None,
       callback=parse_speculative_decoding,
       help=textwrap.dedent("""\
           \b
-          Speculative decoding mode ("auto", "true", "false").
-            - auto: Automatically determine the speculative decoding behavior from the model metadata.
+          Speculative decoding mode ("true", "false"). If not set, use the model's configured value.
             - true: Force enable speculative decoding. It will throw an error if the model does not support it.
             - false: Force disable speculative decoding.
           """),
@@ -125,8 +125,31 @@ def common_inference_options(f):
   f = click.option(
       "--backend",
       type=click.Choice(["cpu", "gpu", "npu"], case_sensitive=False),
-      default="cpu",
-      help="The backend to use.",
+      default=None,
+      help="The backend to use. If not set, use the model's configured value.",
+  )(f)
+  f = click.option(
+      "--cpu-thread-count",
+      type=click.IntRange(min=1),
+      default=None,
+      help=(
+          "The number of threads to use for the CPU backend. Only takes effect"
+          " when the main 'backend' is 'cpu'."
+      ),
+  )(f)
+  f = click.option(
+      "--activation-data-type",
+      type=click.Choice(
+          ["fp32", "fp16", "int16", "int8"], case_sensitive=False
+      ),
+      default=None,
+      hidden=True,
+      help=(
+          "The activation data type to use for inference. If not set, use the"
+          " default from the engine. Note: This option is experimental and may"
+          " not always work.  Currently, it can be used to force FP32 mode when"
+          " using a GPU backend."
+      ),
   )(f)
   return f
 

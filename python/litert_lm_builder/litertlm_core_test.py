@@ -24,6 +24,7 @@ litertlm_core library. These tests cover the following aspects:
 
 from absl.testing import absltest
 from absl.testing import parameterized
+
 from litert_lm_builder import litertlm_core
 from litert_lm_builder import litertlm_header_schema_py_generated as schema
 

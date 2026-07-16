@@ -183,6 +183,8 @@ class ExecutorSettingsBase {
   static constexpr absl::string_view kXnnpackCacheSuffix = ".xnnpack_cache";
   static constexpr absl::string_view kMlDriftCacheSuffix =
       "_mldrift_program_cache.bin";
+  static constexpr absl::string_view kMlDriftWeightCacheSuffix =
+      "_mldrift_weight_cache.bin";
   static constexpr absl::string_view kMtpDrafterCacheSuffix = ".mtp_drafter";
 
   // Dynamically generates cache suffix and keys systematically.
@@ -223,9 +225,7 @@ class ExecutorSettingsBase {
   }
 
   // Mixed precision APIs.
-  bool IsMixedPrecisionEnabled() const {
-    return enable_mixed_precision_;
-  }
+  bool IsMixedPrecisionEnabled() const { return enable_mixed_precision_; }
   void SetEnableMixedPrecision(bool enable) {
     enable_mixed_precision_ = enable;
   }
@@ -236,10 +236,22 @@ class ExecutorSettingsBase {
   //   2. the file path of the weight cache file, based on the given cache
   //      directory and/or model path. Will append `suffix`.
   //   3. an error if a weight cache file could not be determined.
+  virtual absl::StatusOr<
+      std::variant<std::string, std::shared_ptr<litert::lm::ScopedFile>>>
+  GetWeightCacheFile(absl::string_view suffix, bool check_and_clean) const;
+
   absl::StatusOr<
       std::variant<std::string, std::shared_ptr<litert::lm::ScopedFile>>>
-  GetWeightCacheFile(absl::string_view suffix = ".cache",
-                     bool check_and_clean = false) const;
+  GetWeightCacheFile() const {
+    return GetWeightCacheFile(".cache", false);
+  }
+
+  absl::StatusOr<
+      std::variant<std::string, std::shared_ptr<litert::lm::ScopedFile>>>
+  GetWeightCacheFile(absl::string_view suffix) const {
+    return GetWeightCacheFile(suffix, false);
+  }
+
   // Prefer to use `GetWeightCacheFile()` if possible.
   const std::string& GetCacheDir() const { return cache_dir_; }
   // Prefer to use `GetWeightCacheFile()` if possible.
@@ -256,10 +268,21 @@ class ExecutorSettingsBase {
   //   2. the file path of the program cache file, based on the given cache
   //      directory and/or model path. Will append `suffix`.
   //   3. an error if a program cache file could not be determined.
+  virtual absl::StatusOr<
+      std::variant<std::string, std::shared_ptr<litert::lm::ScopedFile>>>
+  GetProgramCacheFile(absl::string_view suffix, bool check_and_clean) const;
+
   absl::StatusOr<
       std::variant<std::string, std::shared_ptr<litert::lm::ScopedFile>>>
-  GetProgramCacheFile(absl::string_view suffix = ".program_cache",
-                      bool check_and_clean = false) const;
+  GetProgramCacheFile() const {
+    return GetProgramCacheFile(".program_cache", false);
+  }
+
+  absl::StatusOr<
+      std::variant<std::string, std::shared_ptr<litert::lm::ScopedFile>>>
+  GetProgramCacheFile(absl::string_view suffix) const {
+    return GetProgramCacheFile(suffix, false);
+  }
   // Prefer to use `GetProgramCacheFile()` if possible.
   std::shared_ptr<litert::lm::ScopedFile> GetScopedProgramCacheFile() const {
     return scoped_program_cache_file_;
@@ -278,6 +301,13 @@ class ExecutorSettingsBase {
       std::shared_ptr<litert::lm::ScopedFile> cache_file) {
     scoped_program_cache_file_ = std::move(cache_file);
   }
+
+  void SetDisableWeightCache(bool disable) { disable_weight_cache_ = disable; }
+  void SetDisableProgramCache(bool disable) {
+    disable_program_cache_ = disable;
+  }
+  bool IsWeightCacheDisabled() const { return disable_weight_cache_; }
+  bool IsProgramCacheDisabled() const { return disable_program_cache_; }
 
  protected:
   explicit ExecutorSettingsBase(ModelAssets model_assets)
@@ -321,6 +351,9 @@ class ExecutorSettingsBase {
   // LiteRT dispatch library directory. If not set, the runtime will look for
   // the library in the path defined as the environment variables.
   std::string litert_dispatch_lib_dir_;
+
+  bool disable_weight_cache_ = false;
+  bool disable_program_cache_ = false;
 };
 
 }  // namespace litert::lm

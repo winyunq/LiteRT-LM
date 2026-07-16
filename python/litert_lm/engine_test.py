@@ -68,12 +68,61 @@ class EngineTest(LiteRtLmTestBase):
     ):
       litert_lm.Engine("/non/existent/path")
 
+  def test_backend_cpu_equality(self):
+    cpu_default = litert_lm.Backend.CPU()
+    cpu_default_explicit = litert_lm.Backend.CPU(thread_count=None)
+    cpu_4 = litert_lm.Backend.CPU(thread_count=4)
+    cpu_2 = litert_lm.Backend.CPU(thread_count=2)
+    gpu = litert_lm.Backend.GPU()
+
+    with self.subTest("CPU default equality"):
+      self.assertEqual(cpu_default, cpu_default_explicit)
+    with self.subTest("CPU default vs thread count inequality"):
+      self.assertNotEqual(cpu_default, cpu_4)
+    with self.subTest("Different CPU thread counts inequality"):
+      self.assertNotEqual(cpu_4, cpu_2)
+    with self.subTest("CPU vs GPU inequality"):
+      self.assertNotEqual(cpu_4, gpu)
+
+  def test_engine_init_with_cpu_thread_counts(self):
+    lib = litert_lm._ffi._get_lib()
+    orig_set_num_threads = lib.litert_lm_engine_settings_set_num_threads
+    orig_set_audio_num_threads = (
+        lib.litert_lm_engine_settings_set_audio_num_threads
+    )
+
+    mock_set_num_threads = self.enter_context(
+        mock.patch.object(
+            lib,
+            "litert_lm_engine_settings_set_num_threads",
+            autospec=True,
+            side_effect=orig_set_num_threads,
+        )
+    )
+    mock_set_audio_num_threads = self.enter_context(
+        mock.patch.object(
+            lib,
+            "litert_lm_engine_settings_set_audio_num_threads",
+            autospec=True,
+            side_effect=orig_set_audio_num_threads,
+        )
+    )
+
+    litert_lm.Engine(
+        self.model_path,
+        backend=litert_lm.Backend.CPU(thread_count=4),
+        audio_backend=litert_lm.Backend.CPU(thread_count=2),
+        cache_dir=":nocache",
+    )
+
+    mock_set_num_threads.assert_called_once_with(mock.ANY, 4)
+    mock_set_audio_num_threads.assert_called_once_with(mock.ANY, 2)
+
   @mock.patch("sys.platform", "win32")
   def test_engine_init_with_npu_backend(self):
     lib = litert_lm._ffi._get_lib()
     if hasattr(lib, "litert_lm_engine_settings_set_litert_dispatch_lib_dir"):
       orig_set_dir = lib.litert_lm_engine_settings_set_litert_dispatch_lib_dir
-      mock_set_dir = mock.MagicMock(side_effect=orig_set_dir)
 
       mock_ov = mock.MagicMock()
       mock_ov.__file__ = "path/to/openvino/__init__.py"
@@ -82,24 +131,24 @@ class EngineTest(LiteRtLmTestBase):
       with mock.patch.object(
           lib,
           "litert_lm_engine_settings_set_litert_dispatch_lib_dir",
-          mock_set_dir,
-      ):
+          autospec=True,
+          side_effect=orig_set_dir,
+      ) as mock_set_dir:
         with mock.patch.dict("sys.modules", {"openvino": mock_ov}):
-          with mock.patch("importlib.resources.files") as mock_files:
+          with mock.patch("importlib.resources.files") as unused_mock_files:
             try:
-              npu = litert_lm.Backend.NPU()
-              npu.litert_dispatch_lib_dir = "my_custom_dir"
+              npu = litert_lm.Backend.NPU(
+                  litert_dispatch_lib_dir="my_custom_dir"
+              )
               litert_lm.Engine(
                   self.model_path,
                   npu,
                   cache_dir=":nocache",
               )
-            except Exception:  # pylint: disable=broad-exception-caught
+            except RuntimeError:
               pass
 
-            mock_set_dir.assert_called_once()
-            args, _ = mock_set_dir.call_args
-            self.assertEqual(args[1], "my_custom_dir")
+            mock_set_dir.assert_called_once_with(mock.ANY, "my_custom_dir")
 
   @mock.patch("sys.platform", "linux")
   def test_npu_backend_non_windows(self):
@@ -292,6 +341,26 @@ class EngineTest(LiteRtLmTestBase):
     self.assertGreater(result.last_decode_token_count, 0)
     self.assertGreater(result.last_decode_tokens_per_second, 0)
 
+  def test_benchmark_class_with_thread_count(self):
+    lib = litert_lm._ffi._get_lib()
+    orig_set_num_threads = lib.litert_lm_engine_settings_set_num_threads
+    with mock.patch.object(
+        lib,
+        "litert_lm_engine_settings_set_num_threads",
+        autospec=True,
+        side_effect=orig_set_num_threads,
+    ) as mock_set_num_threads:
+      benchmark = litert_lm.Benchmark(
+          self.model_path,
+          litert_lm.Backend.CPU(thread_count=4),
+          prefill_tokens=10,
+          decode_tokens=10,
+          cache_dir=":nocache",
+      )
+      benchmark.run()
+
+      mock_set_num_threads.assert_called_once_with(mock.ANY, 4)
+
   def test_engine_abc_inheritance(self):
     with self._create_engine() as engine:
       self.assertIsInstance(engine, litert_lm.AbstractEngine)
@@ -345,6 +414,29 @@ class EngineTest(LiteRtLmTestBase):
         engine.create_conversation(messages=messages) as conversation,
     ):
       self.assertEqual(conversation.messages, messages)
+
+  def test_create_conversation_with_max_output_tokens(self):
+    with (
+        self._create_engine() as engine,
+        engine.create_conversation(max_output_tokens=1) as conversation,
+    ):
+      self.assertEqual(conversation.max_output_tokens, 1)
+      message = conversation.send_message("Hello world!")
+      self.assertEqual(message["role"], "assistant")
+      # Response should be shorter because of max_output_tokens=1 default in
+      # conversation
+      text = "".join([c.get("text", "") for c in message.get("content", [])])
+      self.assertLess(len(text), 10)
+
+  def test_create_conversation_with_max_output_tokens_async(self):
+    with (
+        self._create_engine() as engine,
+        engine.create_conversation(max_output_tokens=1) as conversation,
+    ):
+      stream = conversation.send_message_async("Hello world!")
+      text_pieces = self._extract_text(stream)
+      self.assertLen(text_pieces, 1)
+      self.assertLess(len("".join(text_pieces)), 10)
 
   def test_conversation_send_message_object(self):
     with (
@@ -498,6 +590,30 @@ class EngineTest(LiteRtLmTestBase):
       # NOTE: We don't assert len(responses) < 6 here because on fast machines
       # (like Mac arm64) the generation might complete before the cancellation
       # signal is processed by the background thread.
+
+  def test_conversation_send_message_with_max_output_tokens(self):
+    with (
+        self._create_engine() as engine,
+        engine.create_conversation() as conversation,
+    ):
+      message = conversation.send_message("Hello world!", max_output_tokens=1)
+      self.assertIn("role", message)
+      self.assertEqual(message["role"], "assistant")
+      # Response should be shorter because of max_output_tokens=1
+      text = "".join([c.get("text", "") for c in message.get("content", [])])
+      self.assertLess(len(text), 10)
+
+  def test_conversation_send_message_async_with_max_output_tokens(self):
+    with (
+        self._create_engine() as engine,
+        engine.create_conversation() as conversation,
+    ):
+      stream = conversation.send_message_async(
+          "Hello world!", max_output_tokens=1
+      )
+      text_pieces = self._extract_text(stream)
+      self.assertLen(text_pieces, 1)
+      self.assertLess(len("".join(text_pieces)), 10)
 
   @parameterized.parameters(True, False)
   def test_session_api_apply_prompt_template(self, apply_prompt_template):

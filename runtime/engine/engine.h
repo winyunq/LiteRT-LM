@@ -18,13 +18,14 @@
 #include <memory>
 #include <vector>
 
+#include "absl/base/attributes.h"  // from @com_google_absl
 #include "absl/functional/any_invocable.h"  // from @com_google_absl
 #include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
-#include "runtime/components/tokenizer.h"
+#include "support/tokenizer/tokenizer.h"  // from @litert
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
 
@@ -111,12 +112,25 @@ class SessionInterface {
   // function will handle the prefill and decode processes internally and
   // the usage is similar to the Gemini Text Generation API
   // (https://ai.google.dev/gemini-api/docs/text-generation).
+  //
+  // DEPRECATED: Prefer using the Conversation API (Conversation::SendMessage /
+  // SendMessageStream) for chat and context management. For fine-grained
+  // control over execution steps or single-turn inference, use RunPrefill and
+  // RunDecode.
   // - contents: The input data for generation.
+  ABSL_DEPRECATED(
+      "Prefer Conversation API for chat/context management, or RunPrefill and "
+      "RunDecode for fine-grained execution control.")
   virtual absl::StatusOr<Responses> GenerateContent(
       const std::vector<InputData>& contents) = 0;
 
   // This is a not blocking call and the function will return right away. The
   // result will be streamed through the callback.
+  //
+  // DEPRECATED: Prefer using the Conversation API (Conversation::SendMessage /
+  // SendMessageStream) for chat and context management. For fine-grained
+  // control over execution steps or single-turn inference, use RunPrefill and
+  // RunDecode.
   //
   // - contents: The input data for generation.
   // - callback: Callback to receive streamed results.
@@ -128,12 +142,23 @@ class SessionInterface {
   //       sent.
   //     - If the generation is cancelled, the callback will be called
   //       with a Cancellation error.
+  ABSL_DEPRECATED(
+      "Prefer Conversation API for chat/context management, or RunPrefill and "
+      "RunDecode for fine-grained execution control.")
   virtual absl::Status GenerateContentStream(
       const std::vector<InputData>& contents,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) = 0;
 
   // Same as above, but with a custom decode config.
+  //
+  // DEPRECATED: Prefer using the Conversation API (Conversation::SendMessage /
+  // SendMessageStream) for chat and context management. For fine-grained
+  // control over execution steps or single-turn inference, use RunPrefill and
+  // RunDecode.
   // - decode_config: configuration for the model decode process.
+  ABSL_DEPRECATED(
+      "Prefer Conversation API for chat/context management, or RunPrefill and "
+      "RunDecode for fine-grained execution control.")
   virtual absl::Status GenerateContentStream(
       const std::vector<InputData>& contents,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback,
@@ -180,6 +205,19 @@ class SessionInterface {
   // processing status will be signaled through the callback.
   virtual absl::StatusOr<std::unique_ptr<TaskController>> RunPrefillAsync(
       const std::vector<InputData>& contents,
+      absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) {
+    return absl::UnimplementedError("Not implemented.");
+  }
+
+  // Similar to RunPrefillAsync, but accepts preprocessed (e.g., tokenized)
+  // contents.
+  // This is a non-blocking call and the function will return right away. The
+  // processing status will be signaled through the callback.
+  // - preprocessed_contents: The preprocessed input data.
+  // - callback: Callback to receive the prefill results.
+  virtual absl::StatusOr<std::unique_ptr<TaskController>>
+  PrefillPreprocessedContents(
+      std::vector<InputData> preprocessed_contents,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) {
     return absl::UnimplementedError("Not implemented.");
   }
@@ -281,6 +319,11 @@ class SessionInterface {
     return absl::UnimplementedError("RewindToCheckpoint not implemented.");
   }
 
+  // Rewinds the session to a specific step number.
+  virtual absl::Status RewindToStep(int step) {
+    return absl::UnimplementedError("RewindToStep not implemented.");
+  }
+
   // Get the current step of the session.
   virtual absl::StatusOr<int> GetCurrentStep() const {
     return absl::UnimplementedError("GetCurrentStep not implemented.");
@@ -334,7 +377,7 @@ class EngineT {
   virtual const EngineSettings& GetEngineSettings() const = 0;
 
   // Get the reference to the tokenizer for the engine.
-  virtual const Tokenizer& GetTokenizer() const = 0;
+  virtual const support::Tokenizer& GetTokenizer() const = 0;
 
   // Get the audio model properties for the session. This is only available
   // if the engine is created with audio modality enabled.

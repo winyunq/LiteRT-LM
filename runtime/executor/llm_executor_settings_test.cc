@@ -221,7 +221,7 @@ TEST(LlmExecutorConfigTest, LlmExecutorSettings) {
 
   std::stringstream oss;
   oss << settings;
-  const std::string expected_output = absl::StrCat(
+  std::string expected_output = absl::StrCat(
       R"(backend: GPU_ARTISAN
 backend_config:
 num_output_candidates: 1
@@ -250,7 +250,7 @@ model_assets: model_path: )",
 fake_weights_mode: FAKE_WEIGHTS_NONE
 
 advanced_settings: Not set
-)");
+)");  // Original output string.
   EXPECT_EQ(oss.str(), expected_output);
 }
 
@@ -292,7 +292,7 @@ TEST(LlmExecutorConfigTest, LlmExecutorSettingsWithAdvancedSettings) {
 
   std::stringstream oss;
   oss << settings;
-  const std::string expected_output = absl::StrCat(
+  std::string expected_output = absl::StrCat(
       R"(backend: GPU_ARTISAN
 backend_config:
 num_output_candidates: 1
@@ -344,7 +344,7 @@ enable_speculative_decoding: 0
 disable_delegate_clustering: 0
 hint_kernel_batch_size: 10
 
-)");
+)");  // Original output string.
   EXPECT_EQ(oss.str(), expected_output);
 }
 

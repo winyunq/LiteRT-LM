@@ -17,6 +17,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/log/absl_log.h"  // from @com_google_absl
@@ -24,11 +25,13 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "nlohmann/json_fwd.hpp"  // from @nlohmann_json
+#include "support/preprocessor/audio_preprocessor.h"  // from @litert
+#include "support/preprocessor/image_preprocessor.h"  // from @litert
+#include "support/util/io_types.h"  // from @litert
 #include "runtime/components/prompt_template.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/generic_data_processor_config.h"
 #include "runtime/conversation/model_data_processor/model_data_processor.h"
-#include "runtime/engine/io_types.h"
 
 namespace litert::lm {
 
@@ -67,9 +70,15 @@ class GenericDataProcessor
   }
 
  private:
-  explicit GenericDataProcessor(GenericDataProcessorConfig config,
-                                const PromptTemplateCapabilities& capabilities)
-      : config_(config), capabilities_(capabilities) {};
+  explicit GenericDataProcessor(
+      GenericDataProcessorConfig config,
+      const PromptTemplateCapabilities& capabilities,
+      std::unique_ptr<ImagePreprocessor> image_preprocessor = nullptr,
+      std::unique_ptr<AudioPreprocessor> audio_preprocessor = nullptr)
+      : config_(config),
+        capabilities_(capabilities),
+        image_preprocessor_(std::move(image_preprocessor)),
+        audio_preprocessor_(std::move(audio_preprocessor)) {};
 
   absl::StatusOr<std::vector<InputData>> ToInputDataVectorImpl(
       const std::string& rendered_template_prompt,
@@ -83,13 +92,12 @@ class GenericDataProcessor
   absl::Status CloneStateImpl(
       const TypeSafeModelDataProcessor<GenericDataProcessorConfig,
                                        GenericDataProcessorArguments>& other)
-      override {
-    ABSL_LOG(INFO) << "GenericDataProcessor::CloneStateImpl is a no-op.";
-    return absl::OkStatus();
-  }
+      override;
 
   GenericDataProcessorConfig config_;
   PromptTemplateCapabilities capabilities_;
+  std::unique_ptr<ImagePreprocessor> image_preprocessor_;
+  std::unique_ptr<AudioPreprocessor> audio_preprocessor_;
 };
 
 }  // namespace litert::lm
