@@ -21,6 +21,7 @@ from absl.testing import absltest
 
 from litert_lm_builder import litertlm_core
 from litert_lm_builder import litertlm_peek
+from runtime.proto import executor_metadata_pb2
 from runtime.proto import llm_metadata_pb2
 
 from python import runfiles
@@ -133,6 +134,30 @@ class LiteRTLMBuilderCLITest(absltest.TestCase):
     self.assertTrue(os.path.exists(output_path))
     ss = self._peek_litertlm_file(output_path)
     self.assertIn("max_num_tokens: 123", ss)
+    self.assertIn("Sections (1)", ss)
+
+  def test_executor_metadata(self):
+    """Tests that executor metadata can be added via the CLI."""
+    executor_metadata = executor_metadata_pb2.ExecutorMetadata(
+        llm_executor_metadata=executor_metadata_pb2.LlmExecutorMetadata(
+            max_history_size=5
+        )
+    )
+    bin_proto = executor_metadata.SerializeToString()
+    metadata_path = self._create_placeholder_file("executor.pb", bin_proto)
+    args = [
+        "system_metadata",
+        "--int",
+        "my_key",
+        "23",
+        "executor_metadata",
+        "--path",
+        metadata_path,
+    ]
+    output_path = self._run_command(*args)
+    self.assertTrue(os.path.exists(output_path))
+    ss = self._peek_litertlm_file(output_path)
+    self.assertIn("max_history_size: 5", ss)
     self.assertIn("Sections (1)", ss)
 
   def test_tflite_model(self):
@@ -366,6 +391,149 @@ class LiteRTLMBuilderCLITest(absltest.TestCase):
         " file.",
         stdout,
     )
+
+  def test_unpack_command(self):
+    """Tests that a LiteRT-LM file can be unpacked via CLI."""
+    args = ["system_metadata", "--str", "author", "ODML Team"]
+    litertlm_path = self._run_command(*args)
+    self.assertTrue(os.path.exists(litertlm_path))
+
+    unpack_dir = os.path.join(self.temp_dir, "unpacked_cli")
+    command = [
+        self._get_command_path(),
+        "unpack",
+        "--input",
+        litertlm_path,
+        "--output",
+        unpack_dir,
+    ]
+    subprocess.run(command, check=True, capture_output=True)
+    toml_path = os.path.join(unpack_dir, "model.toml")
+    self.assertTrue(os.path.exists(toml_path))
+
+  def test_cns_output_paths_rejected(self):
+    """Tests that outputting or unpacking directly to /cns/ is rejected."""
+
+  def test_sp_tokenizer_with_model_type(self):
+    """Tests that a SentencePiece tokenizer with model_type can be added."""
+    sp_path = self._create_placeholder_file("sp.model", b"dummy sp content")
+    args = [
+        "system_metadata",
+        "--int",
+        "my_key",
+        "23",
+        "sp_tokenizer",
+        "--path",
+        sp_path,
+        "--model_type",
+        "prefill_decode",
+    ]
+    output_path = self._run_command(*args)
+    self.assertTrue(os.path.exists(output_path))
+    ss = self._peek_litertlm_file(output_path)
+    self.assertIn("Sections (1)", ss)
+    self.assertIn("Data Type:    SP_Tokenizer", ss)
+    self.assertIn("Key: model_type, Value (String): tf_lite_prefill_decode", ss)
+
+  def test_validate_metadata_cli(self):
+    """Tests that --validate-metadata fails for invalid metadata and succeeds for valid."""
+    # Invalid: LLM model missing supports_thinking / supports_function_calling
+    tflite_path = self._create_placeholder_file(
+        "model.tflite", b"dummy tflite content"
+    )
+    llm_metadata = llm_metadata_pb2.LlmMetadata(max_num_tokens=123)
+    metadata_path = self._create_placeholder_file(
+        "llm.pb", llm_metadata.SerializeToString()
+    )
+    output_path = os.path.join(self.temp_dir, "invalid.litertlm")
+    invalid_command = [
+        self._get_command_path(),
+        "tflite_model",
+        "--path",
+        tflite_path,
+        "--model_type",
+        "prefill_decode",
+        "llm_metadata",
+        "--path",
+        metadata_path,
+        "output",
+        "--path",
+        output_path,
+        "--validate-metadata",
+    ]
+    result = subprocess.run(invalid_command, check=False, capture_output=True)
+    self.assertNotEqual(result.returncode, 0)
+    self.assertIn(b"supports_thinking", result.stderr)
+
+    # Valid: LLM metadata with thinking and function calling
+    valid_llm_metadata = llm_metadata_pb2.LlmMetadata(
+        max_num_tokens=123,
+        supports_thinking=True,
+        supports_function_calling=True,
+    )
+    valid_meta_path = self._create_placeholder_file(
+        "valid_llm.pb", valid_llm_metadata.SerializeToString()
+    )
+    valid_output_path = os.path.join(self.temp_dir, "valid.litertlm")
+    valid_command = [
+        self._get_command_path(),
+        "tflite_model",
+        "--path",
+        tflite_path,
+        "--model_type",
+        "prefill_decode",
+        "llm_metadata",
+        "--path",
+        valid_meta_path,
+        "output",
+        "--path",
+        valid_output_path,
+        "--validate-metadata",
+    ]
+    subprocess.run(valid_command, check=True, capture_output=True)
+    self.assertTrue(os.path.exists(valid_output_path))
+
+  def test_validate_metadata_cli_gemma3n_vision(self):
+    """Tests that --validate-metadata succeeds for Gemma3N vision model."""
+    tflite_path = self._create_placeholder_file(
+        "model.tflite", b"dummy tflite content"
+    )
+    vision_adapter_path = self._create_placeholder_file(
+        "vision_adapter.tflite", b"dummy vision adapter"
+    )
+    gemma3n_metadata = llm_metadata_pb2.LlmMetadata(
+        max_num_tokens=1024,
+        supports_thinking=True,
+        supports_function_calling=False,
+    )
+    gemma3n_metadata.llm_model_type.gemma3n.image_tensor_height = 768
+    gemma3n_metadata.llm_model_type.gemma3n.image_tensor_width = 768
+    metadata_path = self._create_placeholder_file(
+        "gemma3n_llm.pb", gemma3n_metadata.SerializeToString()
+    )
+    output_path = os.path.join(self.temp_dir, "gemma3n.litertlm")
+    command = [
+        self._get_command_path(),
+        "tflite_model",
+        "--path",
+        tflite_path,
+        "--model_type",
+        "prefill_decode",
+        "tflite_model",
+        "--path",
+        vision_adapter_path,
+        "--model_type",
+        "vision_adapter",
+        "llm_metadata",
+        "--path",
+        metadata_path,
+        "output",
+        "--path",
+        output_path,
+        "--validate-metadata",
+    ]
+    subprocess.run(command, check=True, capture_output=True)
+    self.assertTrue(os.path.exists(output_path))
 
 
 if __name__ == "__main__":

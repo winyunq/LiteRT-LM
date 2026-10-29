@@ -30,21 +30,28 @@
 #include "absl/log/log.h"  // from @com_google_absl
 #include "absl/memory/memory.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
-#include "support/tokenizer/tokenizer.h"  // from @litert
+#include "litert/cc/litert_environment.h"  // from @litert  // IWYU pragma: keep
 #include "runtime/core/session_utils.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
+#include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/framework/resource_management/execution_manager.h"
 #include "runtime/proto/sampler_params.pb.h"
 #include "runtime/util/status_macros.h"  // IWYU pragma: keep
 #include "runtime/executor/llm_processed_context.h"
 #include "litert/cc/litert_tensor_buffer.h"
 #include "runtime/executor/llm_executor_io_types.h"
+#include "support/tokenizer/tokenizer.h"
+
+#if defined(LITERT_LM_DEBUGGER_ENABLED)
+#include "runtime/util/runtime_debugger.h"
+#endif
 
 namespace litert::lm {
 namespace {
@@ -59,30 +66,39 @@ absl::StatusOr<std::unique_ptr<SessionAdvanced>> SessionAdvanced::Create(
     support::Tokenizer* absl_nonnull tokenizer,
     const SessionConfig& session_config,
     std::optional<BenchmarkInfo> benchmark_info,
-    std::atomic<int>* living_sessions_count) {
+    std::atomic<int>* living_sessions_count, const Engine* engine) {
   auto execution_manager_lock = execution_manager.lock();
   if (execution_manager_lock == nullptr) {
     return absl::FailedPreconditionError("Execution manager is not available.");
   }
-  ASSIGN_OR_RETURN(auto session_id, execution_manager_lock->RegisterNewSession(
-                                        session_config, benchmark_info));
-  ASSIGN_OR_RETURN(auto session_info_,
-                   execution_manager_lock->GetSessionInfo(session_id));
+  SessionConfig config = session_config;
+  if (benchmark_info.has_value() &&
+      benchmark_info->GetBenchmarkParams().num_prefill_tokens() > 0 &&
+      config.GetApplyPromptTemplateInSession()) {
+    ABSL_LOG(INFO) << "Benchmark has num_prefill_tokens > 0; forcing "
+                      "apply_prompt_template_in_session to false.";
+    config.SetApplyPromptTemplateInSession(false);
+  }
+  ABSL_ASSIGN_OR_RETURN(
+      auto session_id,
+      execution_manager_lock->RegisterNewSession(config, benchmark_info));
+  ABSL_ASSIGN_OR_RETURN(auto session_info_,
+                        execution_manager_lock->GetSessionInfo(session_id));
   return absl::WrapUnique(new SessionAdvanced(
       session_id, execution_manager, tokenizer, session_info_,
       /*session_state=*/SessionState::kFresh,
-      /*last_task_ids=*/{}, living_sessions_count));
+      /*last_task_ids=*/{}, living_sessions_count, engine));
 }
 
 absl::Status SessionAdvanced::RunPrefill(
     const std::vector<InputData>& contents) {
   absl::Status status = absl::OkStatus();
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       auto task_controller,
       RunPrefillAsync(contents, [&status](absl::StatusOr<Responses> responses) {
         status = responses.status();
       }));
-  RETURN_IF_ERROR(task_controller->WaitUntilDone(Engine::kDefaultTimeout));
+  ABSL_RETURN_IF_ERROR(task_controller->WaitUntilDone(Engine::kDefaultTimeout));
   return status;
 }
 
@@ -105,7 +121,7 @@ SessionAdvanced::RunPrefillAsync(
   if (session_info_->benchmark_info.has_value() &&
       session_info_->benchmark_info->GetBenchmarkParams().num_prefill_tokens() >
           0) {
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         preprocessed_contents,
         PreprocessContents(contents, session_info_->session_config, *tokenizer_,
                            session_info_->benchmark_info));
@@ -119,17 +135,17 @@ SessionAdvanced::RunPrefillAsync(
     } else {
       content_type = ContentType::kNA;
     }
-    ASSIGN_OR_RETURN(std::vector<InputData> templated_contents,
-                     ApplyPromptTemplates(contents, content_type,
-                                          session_info_->session_config,
-                                          *tokenizer_, is_first_turn));
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(std::vector<InputData> templated_contents,
+                          ApplyPromptTemplates(contents, content_type,
+                                               session_info_->session_config,
+                                               *tokenizer_, is_first_turn));
+    ABSL_ASSIGN_OR_RETURN(
         preprocessed_contents,
         PreprocessContents(templated_contents, session_info_->session_config,
                            *tokenizer_, session_info_->benchmark_info));
   }
-  ASSIGN_OR_RETURN(auto task_id, execution_manager_lock->GetNewTaskId());
-  RETURN_IF_ERROR(execution_manager_lock->AddPrefillTask(
+  ABSL_ASSIGN_OR_RETURN(auto task_id, execution_manager_lock->GetNewTaskId());
+  ABSL_RETURN_IF_ERROR(execution_manager_lock->AddPrefillTask(
       session_id_, task_id, std::move(preprocessed_contents), last_task_ids_,
       cancelled, std::move(callback)));
   session_state_ = SessionState::kPrefilled;
@@ -150,8 +166,8 @@ SessionAdvanced::PrefillPreprocessedContents(
     return absl::FailedPreconditionError("Execution manager is not available.");
   }
 
-  ASSIGN_OR_RETURN(auto task_id, execution_manager_lock->GetNewTaskId());
-  RETURN_IF_ERROR(execution_manager_lock->AddPrefillTask(
+  ABSL_ASSIGN_OR_RETURN(auto task_id, execution_manager_lock->GetNewTaskId());
+  ABSL_RETURN_IF_ERROR(execution_manager_lock->AddPrefillTask(
       session_id_, task_id, std::move(preprocessed_contents), last_task_ids_,
       cancelled, std::move(callback)));
   session_state_ = SessionState::kPrefilled;
@@ -235,10 +251,10 @@ absl::StatusOr<Responses> SessionAdvanced::RunDecode(
     }
   };
 
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       auto task_controller,
       RunDecodeAsync(std::move(decode_sync_callback), decode_config));
-  RETURN_IF_ERROR(task_controller->WaitUntilDone(Engine::kDefaultTimeout));
+  ABSL_RETURN_IF_ERROR(task_controller->WaitUntilDone(Engine::kDefaultTimeout));
   return collected_responses;
 }
 
@@ -267,19 +283,20 @@ absl::StatusOr<std::unique_ptr<TaskController>> SessionAdvanced::RunDecodeAsync(
   if (session_info_->session_config.GetApplyPromptTemplateInSession()) {
     std::vector<InputData> contents;
     contents.emplace_back(InputText(""));
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         std::vector<InputData> templated_contents,
         ApplyPromptTemplates(contents, ContentType::kLast,
                              session_info_->session_config, *tokenizer_,
                              /*is_first_turn=*/false));
     if (!templated_contents.empty()) {
-      ASSIGN_OR_RETURN(
+      ABSL_ASSIGN_OR_RETURN(
           std::vector<InputData> preprocessed_contents,
           PreprocessContents(templated_contents, session_info_->session_config,
                              *tokenizer_, session_info_->benchmark_info));
       auto noop_callback = [](absl::StatusOr<Responses> responses) {};
-      ASSIGN_OR_RETURN(auto task_id, execution_manager_lock->GetNewTaskId());
-      RETURN_IF_ERROR(execution_manager_lock->AddPrefillTask(
+      ABSL_ASSIGN_OR_RETURN(auto task_id,
+                            execution_manager_lock->GetNewTaskId());
+      ABSL_RETURN_IF_ERROR(execution_manager_lock->AddPrefillTask(
           session_id_, task_id, std::move(preprocessed_contents),
           last_task_ids_, cancelled, std::move(noop_callback)));
       last_task_ids_ = {task_id};
@@ -287,14 +304,20 @@ absl::StatusOr<std::unique_ptr<TaskController>> SessionAdvanced::RunDecodeAsync(
   }
   session_state_ = SessionState::kDecoded;
 
-  ASSIGN_OR_RETURN(auto task_id, execution_manager_lock->GetNewTaskId());
+  ABSL_ASSIGN_OR_RETURN(auto task_id, execution_manager_lock->GetNewTaskId());
 
-  RETURN_IF_ERROR(execution_manager_lock->AddDecodeTask(
+  ABSL_RETURN_IF_ERROR(execution_manager_lock->AddDecodeTask(
       session_id_, task_id, last_task_ids_,
-      decode_config.GetRepetitionPenaltyConfig(), decode_config.GetConstraint(),
-      cancelled, std::move(callback),
+      decode_config.GetRepetitionPenaltyConfig(),
+      decode_config.GetNoRepeatNgramConfig(),
+      decode_config.GetSuppressTokensConfig().value_or(
+          session_info_->session_config.GetSuppressTokensConfig()),
+      decode_config.GetConstraint(), cancelled, std::move(callback),
       decode_config.GetMaxOutputTokens().value_or(
-          session_info_->session_config.GetMaxOutputTokens())));
+          session_info_->session_config.GetMaxOutputTokens()),
+      decode_config.GetThinkingTokenBudget(),
+      decode_config.GetThinkingStartTokenIds(),
+      decode_config.GetThinkingEndTokenIds()));
 
   last_task_ids_ = {task_id};
 
@@ -320,11 +343,11 @@ absl::StatusOr<Responses> SessionAdvanced::RunTextScoring(
         collected_responses = std::move(responses);
       };
 
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       auto task_controller,
       RunTextScoringAsync(target_text, std::move(scoring_sync_callback),
                           store_token_lengths));
-  RETURN_IF_ERROR(task_controller->WaitUntilDone(Engine::kDefaultTimeout));
+  ABSL_RETURN_IF_ERROR(task_controller->WaitUntilDone(Engine::kDefaultTimeout));
   return collected_responses;
 }
 
@@ -343,8 +366,8 @@ SessionAdvanced::RunTextScoringAsync(
   }
 
   auto cancelled = std::make_shared<std::atomic<bool>>(false);
-  ASSIGN_OR_RETURN(auto task_id, execution_manager_lock->GetNewTaskId());
-  RETURN_IF_ERROR(execution_manager_lock->AddTextScoringTask(
+  ABSL_ASSIGN_OR_RETURN(auto task_id, execution_manager_lock->GetNewTaskId());
+  ABSL_RETURN_IF_ERROR(execution_manager_lock->AddTextScoringTask(
       session_id_, task_id, last_task_ids_, target_text, store_token_lengths,
       cancelled, std::move(callback)));
 
@@ -354,7 +377,7 @@ SessionAdvanced::RunTextScoringAsync(
 
 absl::StatusOr<Responses> SessionAdvanced::GenerateContent(
     const std::vector<InputData>& contents) {
-  RETURN_IF_ERROR(RunPrefill(contents));
+  ABSL_RETURN_IF_ERROR(RunPrefill(contents));
   return RunDecode();
 }
 
@@ -389,14 +412,20 @@ absl::Status SessionAdvanced::GenerateContentStream(
         }
       };
 
-  ASSIGN_OR_RETURN(auto task_controller,
-                   RunPrefillAsync(contents, std::move(prefill_callback)));
+  ABSL_ASSIGN_OR_RETURN(auto task_controller,
+                        RunPrefillAsync(contents, std::move(prefill_callback)));
 
   return absl::OkStatus();
 }
 
 absl::StatusOr<BenchmarkInfo> SessionAdvanced::GetBenchmarkInfo() {
-  absl::MutexLock lock(mutex_);
+  // Intentionally does not acquire `mutex_`: `session_info_` is an immutable
+  // pointer and `mutex_` does not guard `benchmark_info` contents. More
+  // importantly, this method is called from streaming callbacks that run on
+  // the execution thread while it holds the executor lock, whereas
+  // `SaveCheckpoint`/`RewindToStep`/`RestoreContext` acquire the executor lock
+  // while holding `mutex_`. Taking `mutex_` here creates a lock-order inversion
+  // that can deadlock.
   if (session_info_->benchmark_info.has_value()) {
     return session_info_->benchmark_info.value();
   }
@@ -418,14 +447,14 @@ absl::StatusOr<std::unique_ptr<SessionInterface>> SessionAdvanced::Clone() {
   std::unique_ptr<SessionInterface> session;
   {
     absl::MutexLock lock(mutex_);
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         session,
         CloneAsyncLocked([&status](absl::StatusOr<Responses> responses) {
           status = responses.status();
         }));
   }
-  RETURN_IF_ERROR(session->WaitUntilDone());
-  RETURN_IF_ERROR(status);
+  ABSL_RETURN_IF_ERROR(session->WaitUntilDone());
+  ABSL_RETURN_IF_ERROR(status);
   return session;
 }
 
@@ -443,24 +472,25 @@ SessionAdvanced::CloneAsyncLocked(
     return absl::FailedPreconditionError("Execution manager is not available.");
   }
 
-  ASSIGN_OR_RETURN(auto task_id, execution_manager_lock->GetNewTaskId());
+  ABSL_ASSIGN_OR_RETURN(auto task_id, execution_manager_lock->GetNewTaskId());
 
-  ASSIGN_OR_RETURN(auto session_id, execution_manager_lock->RegisterNewSession(
-                                        session_info_->session_config,
-                                        session_info_->benchmark_info));
+  ABSL_ASSIGN_OR_RETURN(
+      auto session_id,
+      execution_manager_lock->RegisterNewSession(
+          session_info_->session_config, session_info_->benchmark_info));
 
-  RETURN_IF_ERROR(execution_manager_lock->AddCloneSessionTask(
+  ABSL_RETURN_IF_ERROR(execution_manager_lock->AddCloneSessionTask(
       session_id_, task_id, last_task_ids_, session_id,
       std::make_shared<std::atomic<bool>>(false), std::move(callback)));
 
   last_task_ids_ = {task_id};
 
-  ASSIGN_OR_RETURN(auto session_info,
-                   execution_manager_lock->GetSessionInfo(session_id));
+  ABSL_ASSIGN_OR_RETURN(auto session_info,
+                        execution_manager_lock->GetSessionInfo(session_id));
 
-  return absl::WrapUnique(new SessionAdvanced(session_id, execution_manager_,
-                                              tokenizer_, session_info,
-                                              session_state_, last_task_ids_));
+  return absl::WrapUnique(new SessionAdvanced(
+      session_id, execution_manager_, tokenizer_, session_info, session_state_,
+      last_task_ids_, living_sessions_count_, engine_));
 }
 
 SessionAdvanced::~SessionAdvanced() {
@@ -485,8 +515,8 @@ absl::Status SessionAdvanced::SaveCheckpoint(absl::string_view label) {
   if (execution_manager_lock == nullptr) {
     return absl::FailedPreconditionError("Execution manager is not available.");
   }
-  ASSIGN_OR_RETURN(int current_step,
-                   execution_manager_lock->GetCurrentStep(*session_info_));
+  ABSL_ASSIGN_OR_RETURN(int current_step,
+                        execution_manager_lock->GetCurrentStep(*session_info_));
   checkpoint_map_[label] = {current_step, session_state_, last_task_ids_};
   return absl::OkStatus();
 }
@@ -518,6 +548,60 @@ absl::Status SessionAdvanced::RewindToCheckpoint(absl::string_view label) {
     return absl::FailedPreconditionError("Execution manager is not available.");
   }
   return execution_manager_lock->SetCurrentStep(*session_info_, target_step);
+}
+
+absl::Status SessionAdvanced::SaveContext(absl::string_view label) {
+  absl::MutexLock lock(mutex_);
+  auto execution_manager_lock = execution_manager_.lock();
+  if (execution_manager_lock == nullptr) {
+    return absl::FailedPreconditionError("Execution manager is not available.");
+  }
+  ABSL_ASSIGN_OR_RETURN(int current_step,
+                        execution_manager_lock->GetCurrentStep(*session_info_));
+  ABSL_ASSIGN_OR_RETURN(std::unique_ptr<ProcessedContext> processed_context,
+                        execution_manager_lock->SaveContext(*session_info_));
+  checkpoint_map_[label] = {current_step, session_state_, last_task_ids_,
+                            std::move(processed_context)};
+  return absl::OkStatus();
+}
+
+absl::Status SessionAdvanced::RestoreContext(absl::string_view label) {
+  absl::MutexLock lock(mutex_);
+
+  // Look up the checkpoint step.
+  auto it = checkpoint_map_.find(label);
+  if (it == checkpoint_map_.end()) {
+    return absl::NotFoundError(absl::StrCat("Checkpoint not found: ", label));
+  }
+  if (it->second.processed_context == nullptr) {
+    return absl::FailedPreconditionError(
+        absl::StrCat("Checkpoint does not contain context: ", label));
+  }
+  int target_step = it->second.step;
+  session_state_ = it->second.state;
+  // Restore the task dependencies. This is necessary to prevent task-dependency
+  // errors when a task is failed before the rewind. Otherwise, if the task
+  // failed, because of the dependency chain, all tasks after the rewind point
+  // would be considered as failed then finished immediately.
+  last_task_ids_ = it->second.last_task_ids;
+  std::unique_ptr<ProcessedContext> processed_context =
+      std::move(it->second.processed_context);
+  checkpoint_map_.erase(it);
+
+  // Remove all checkpoints after the current step.
+  absl::erase_if(checkpoint_map_, [target_step](const auto& pair) {
+    return pair.second.step > target_step;
+  });
+
+  // Get the execution manager, set the current step, and restore context.
+  auto execution_manager_lock = execution_manager_.lock();
+  if (execution_manager_lock == nullptr) {
+    return absl::FailedPreconditionError("Execution manager is not available.");
+  }
+  ABSL_RETURN_IF_ERROR(
+      execution_manager_lock->SetCurrentStep(*session_info_, target_step));
+  return execution_manager_lock->RestoreContext(*session_info_,
+                                                std::move(processed_context));
 }
 
 absl::Status SessionAdvanced::RewindToStep(int step) {
@@ -555,222 +639,83 @@ absl::StatusOr<int> SessionAdvanced::GetCurrentStep() const {
 
 absl::StatusOr<std::string> SessionAdvanced::GetKVCache() const {
   absl::MutexLock lock(const_cast<absl::Mutex*>(&mutex_));
-
-  auto execution_manager_lock = execution_manager_.lock();
-  if (execution_manager_lock == nullptr) {
-    return absl::FailedPreconditionError("Execution manager is not available.");
+  auto execution_manager = execution_manager_.lock();
+  if (!execution_manager || !session_info_ || !session_info_->context_handler) {
+    return absl::FailedPreconditionError("No active session context.");
   }
-
-  // 1. 获取当前的 current_step
-  ASSIGN_OR_RETURN(int current_step,
-                   execution_manager_lock->GetCurrentStep(*session_info_));
-
-  // 2. 获取 context_handler 中的 ProcessedContext 指针并转为 LlmProcessedContext*
-  if (!session_info_ || !session_info_->context_handler) {
-    return absl::FailedPreconditionError("No active context handler in session_info_.");
+  auto shared = session_info_->context_handler->shared_processed_context();
+  if (!shared || !shared->processed_context()) {
+    return absl::FailedPreconditionError("No processed context.");
   }
-
-  auto shared_ctx = session_info_->context_handler->shared_processed_context();
-  if (!shared_ctx) {
-    return absl::FailedPreconditionError("No shared processed context.");
+  auto* context = static_cast<LlmProcessedContext*>(shared->processed_context());
+  if (!context->state()) {
+    return absl::FailedPreconditionError("No KV cache state.");
   }
-
-  auto* base_ctx = shared_ctx->processed_context();
-  if (!base_ctx) {
-    return absl::FailedPreconditionError("No active processed context.");
-  }
-
-  auto* llm_ctx = static_cast<LlmProcessedContext*>(base_ctx);
-  auto& kv_cache_map = llm_ctx->kv_cache_buffers();
-
-  // 3. 收集所有的 KV Cache Tensor 并排序，保证严格的物理顺序
-  std::vector<std::pair<std::string, ::litert::TensorBuffer*>> all_tensors;
-  for (auto& pair : kv_cache_map) {
-    all_tensors.push_back({std::string(pair.first), &pair.second});
-  }
-
-  std::sort(all_tensors.begin(), all_tensors.end(), [](const auto& a, const auto& b) {
-    return a.first < b.first;
-  });
-
-  // 4. 开始序列化二进制流
-  std::vector<char> stream;
-  
-  uint32_t magic = 0x594E515F; // "WNYQ" 的倒序/特定标识
-  uint32_t version = 1;
-  uint32_t count = static_cast<uint32_t>(all_tensors.size());
-  uint32_t step_val = static_cast<uint32_t>(current_step);
-  uint32_t state_val = static_cast<uint32_t>(session_state_);
-
-  auto append_val = [&stream](const void* val_ptr, size_t val_size) {
-    const char* byte_ptr = static_cast<const char*>(val_ptr);
-    stream.insert(stream.end(), byte_ptr, byte_ptr + val_size);
-  };
-
-  append_val(&magic, sizeof(magic));
-  append_val(&version, sizeof(version));
-  append_val(&step_val, sizeof(step_val));
-  append_val(&state_val, sizeof(state_val));
-  append_val(&count, sizeof(count));
-
-  // 5. 依次读取每个 TensorBuffer
-  for (auto& pair : all_tensors) {
-    const std::string& name = pair.first;
-    auto* buffer = pair.second;
-
-    auto size_expected = buffer->PackedSize();
-    if (!size_expected.HasValue()) {
-      return absl::InternalError(absl::StrCat("Failed to get PackedSize for tensor: ", name));
-    }
-    size_t tensor_bytes = size_expected.Value();
-
-    uint32_t name_len = static_cast<uint32_t>(name.size());
-    append_val(&name_len, sizeof(name_len));
-    stream.insert(stream.end(), name.begin(), name.end());
-
-    uint32_t data_len = static_cast<uint32_t>(tensor_bytes);
-    append_val(&data_len, sizeof(data_len));
-
-    std::vector<char> temp_data(tensor_bytes);
-    auto read_expected = buffer->Read<char>(absl::MakeSpan(temp_data));
-    if (!read_expected.HasValue()) {
-      return absl::InternalError(absl::StrCat("Failed to read physical data from GPU for: ", name));
-    }
-
-    stream.insert(stream.end(), temp_data.begin(), temp_data.end());
-  }
-
-  return std::string(stream.begin(), stream.end());
+  ABSL_ASSIGN_OR_RETURN(int step, execution_manager->GetCurrentStep(*session_info_));
+  ABSL_ASSIGN_OR_RETURN(std::string state, context->state()->Serialize());
+  const uint32_t header[] = {0x594E515F, 2, static_cast<uint32_t>(step),
+                             static_cast<uint32_t>(session_state_)};
+  std::string data(reinterpret_cast<const char*>(header), sizeof(header));
+  data.append(state);
+  return data;
 }
 
-absl::Status SessionAdvanced::SetKVCache(absl::string_view cache_data) {
+absl::Status SessionAdvanced::SetKVCache(absl::string_view data) {
   absl::MutexLock lock(&mutex_);
-
-  auto execution_manager_lock = execution_manager_.lock();
-  if (execution_manager_lock == nullptr) {
-    return absl::FailedPreconditionError("Execution manager is not available.");
+  auto execution_manager = execution_manager_.lock();
+  if (!execution_manager || !session_info_ || !session_info_->context_handler) {
+    return absl::FailedPreconditionError("No active session context.");
   }
-
-  if (!session_info_ || !session_info_->context_handler) {
-    return absl::FailedPreconditionError("No active context handler in session_info_.");
-  }
-
-  // A. 天然的 Reset / 重置物理语义 (入参为空时)
-  if (cache_data.empty()) {
+  int step = 0;
+  if (data.empty()) {
     session_state_ = SessionState::kFresh;
-    if (session_info_->context_handler->HasRuntimeState()) {
-      auto state_status = session_info_->context_handler->GetRuntimeState();
-      if (state_status.ok()) {
-        auto runtime_state = state_status.value();
-        runtime_state.current_step = 0;
-        runtime_state.ran_decode = false;
-        RETURN_IF_ERROR(session_info_->context_handler->SetRuntimeState(
-            std::make_unique<RuntimeState>(runtime_state)));
-      }
+  } else {
+    uint32_t header[4];
+    if (data.size() < sizeof(header)) {
+      return absl::InvalidArgumentError("Truncated KV cache packet.");
     }
-    RETURN_IF_ERROR(execution_manager_lock->SetCurrentStep(*session_info_, 0));
-    return absl::OkStatus();
-  }
-
-  // B. 反序列化并灌入物理显存
-  auto shared_ctx = session_info_->context_handler->shared_processed_context();
-  if (!shared_ctx) {
-    return absl::FailedPreconditionError("No shared processed context.");
-  }
-
-  auto* base_ctx = shared_ctx->processed_context();
-  if (!base_ctx) {
-    return absl::FailedPreconditionError("No active processed context.");
-  }
-
-  auto* llm_ctx = static_cast<LlmProcessedContext*>(base_ctx);
-  auto& kv_cache_map = llm_ctx->kv_cache_buffers();
-
-  const char* stream_ptr = cache_data.data();
-  size_t size = cache_data.size();
-  size_t offset = 0;
-
-  auto read_val = [&stream_ptr, &offset, size](void* dest, size_t val_size) -> bool {
-    if (offset + val_size > size) return false;
-    std::memcpy(dest, stream_ptr + offset, val_size);
-    offset += val_size;
-    return true;
-  };
-
-  uint32_t magic = 0;
-  uint32_t version = 0;
-  uint32_t step_val = 0;
-  uint32_t state_val = 0;
-  uint32_t count = 0;
-
-  if (!read_val(&magic, sizeof(magic)) || magic != 0x594E515F) {
-    return absl::InvalidArgumentError("Invalid magic number.");
-  }
-  if (!read_val(&version, sizeof(version)) || version != 1) {
-    return absl::InvalidArgumentError("Unsupported packet version.");
-  }
-  if (!read_val(&step_val, sizeof(step_val))) {
-    return absl::InvalidArgumentError("Failed to read current_step.");
-  }
-  if (!read_val(&state_val, sizeof(state_val))) {
-    return absl::InvalidArgumentError("Failed to read session_state.");
-  }
-  if (!read_val(&count, sizeof(count))) {
-    return absl::InvalidArgumentError("Failed to read count.");
-  }
-
-  for (uint32_t i = 0; i < count; ++i) {
-    uint32_t name_len = 0;
-    if (!read_val(&name_len, sizeof(name_len))) {
-      return absl::InvalidArgumentError("Failed to read name length.");
+    std::memcpy(header, data.data(), sizeof(header));
+    if (header[0] != 0x594E515F || header[1] != 2) {
+      return absl::InvalidArgumentError("Unsupported KV cache packet version.");
     }
-
-    if (offset + name_len > size) {
-      return absl::InvalidArgumentError("Packet truncated reading tensor name.");
+    auto shared = session_info_->context_handler->shared_processed_context();
+    if (!shared || !shared->processed_context()) {
+      return absl::FailedPreconditionError("No processed context.");
     }
-    std::string name(stream_ptr + offset, name_len);
-    offset += name_len;
-
-    uint32_t data_len = 0;
-    if (!read_val(&data_len, sizeof(data_len))) {
-      return absl::InvalidArgumentError("Failed to read data length.");
+    auto* context = static_cast<LlmProcessedContext*>(shared->processed_context());
+    if (!context->state()) {
+      return absl::FailedPreconditionError("No KV cache state.");
     }
-
-    if (offset + data_len > size) {
-      return absl::InvalidArgumentError("Packet truncated reading tensor data.");
-    }
-    const char* raw_tensor_data = stream_ptr + offset;
-    offset += data_len;
-
-    auto it = kv_cache_map.find(name);
-    if (it != kv_cache_map.end()) {
-      auto& buffer = it->second;
-      auto write_expected = buffer.Write<char>(absl::MakeSpan(raw_tensor_data, data_len));
-      if (!write_expected.HasValue()) {
-        return absl::InternalError(absl::StrCat("Failed to write physical data to GPU for tensor: ", name));
-      }
-    } else {
-      ABSL_LOG(WARNING) << "Tensor key not found in active executors, skipping: " << name;
-    }
+    ABSL_RETURN_IF_ERROR(context->state()->Load(data.substr(sizeof(header))));
+    step = static_cast<int>(header[2]);
+    session_state_ = static_cast<SessionState>(header[3]);
   }
-
-  // C. 同步步数、内部状态及 RuntimeState
-  int current_step = static_cast<int>(step_val);
-  session_state_ = static_cast<SessionState>(state_val);
-
   if (session_info_->context_handler->HasRuntimeState()) {
-    auto state_status = session_info_->context_handler->GetRuntimeState();
-    if (state_status.ok()) {
-      auto runtime_state = state_status.value();
-      runtime_state.current_step = current_step;
-      runtime_state.ran_decode = (current_step > 0);
-      RETURN_IF_ERROR(session_info_->context_handler->SetRuntimeState(
-          std::make_unique<RuntimeState>(runtime_state)));
-    }
+    ABSL_ASSIGN_OR_RETURN(auto runtime_state,
+                          session_info_->context_handler->GetRuntimeState());
+    runtime_state.current_step = step;
+    runtime_state.ran_decode = step > 0;
+    ABSL_RETURN_IF_ERROR(session_info_->context_handler->SetRuntimeState(
+        std::make_unique<RuntimeState>(runtime_state)));
   }
+  return execution_manager->SetCurrentStep(*session_info_, step);
+}
+std::optional<SessionDebugInfo> SessionAdvanced::GetSessionDebugInfo() const {
+#if defined(LITERT_LM_DEBUGGER_ENABLED)
+  SessionDebugInfo debug_info;
+  debug_info.capture_dir = RuntimeDebugger::GetSessionCaptureDir(session_id_);
+  return debug_info;
+#else
+  return std::nullopt;
+#endif
+}
 
-  RETURN_IF_ERROR(execution_manager_lock->SetCurrentStep(*session_info_, current_step));
-  return absl::OkStatus();
+absl::StatusOr<const ::litert::Environment*> SessionAdvanced::GetEnvironment()
+    const {
+  if (engine_ == nullptr) {
+    return absl::NotFoundError("Engine is not available.");
+  }
+  return engine_->GetEnvironment();
 }
 
 }  // namespace litert::lm

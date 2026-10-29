@@ -19,10 +19,17 @@
 #include <vector>
 
 #include "absl/flags/flag.h"  // from @com_google_absl
+#include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/statusor.h"  // from @com_google_absl
+#include "absl/strings/match.h"  // from @com_google_absl
+#include "absl/strings/str_cat.h"  // from @com_google_absl
+#include "absl/strings/string_view.h"  // from @com_google_absl
+#include "runtime/executor/speculative_decoding_mode.h"
 
 ABSL_FLAG(std::optional<std::string>, vision_backend, std::nullopt,
-          "Backend to use for the vision model (cpu or gpu). If not specified, "
-          "the vision backend will be chosen based on the main backend.");
+          "Backend to use for the vision model (cpu, gpu, or npu). If not "
+          "specified, the vision backend will be chosen based on the main "
+          "backend.");
 ABSL_FLAG(std::optional<std::string>, audio_backend, std::nullopt,
           "Backend to use for the audio model (cpu or gpu). If not specified, "
           "the audio backend will be chosen based on the main backend.");
@@ -40,12 +47,18 @@ ABSL_FLAG(int, max_num_tokens, 0,
           "Maximum number of tokens or context length to use for LLM execution "
           "of a graph with dynamic context length. If 0, the maximum context "
           "length will be determined by some heuristic. On benchmark mode, it "
-          "will be set to one equal to or greater than "
-          "benchmark_prefill_tokens + benchmark_decode_tokens.");
+          "is not derived from benchmark_prefill_tokens and "
+          "benchmark_decode_tokens; set it explicitly (e.g. to their sum) to "
+          "benchmark with a specific KV cache size.");
 ABSL_FLAG(int, max_output_tokens, -1,
-          "Maximum number of output tokens for generation.");
+          "Maximum number of output tokens for generation. For thinking "
+          "models, both thinking (reasoning) tokens and the final response "
+          "tokens count towards this limit.");
 ABSL_FLAG(int, max_num_images, 1,
           "Maximum number of images to use for LLM execution.");
+ABSL_FLAG(int, visual_token_budget, -1,
+          "Visual token budget for multimodal processing (maximum number of "
+          "vision tokens per image).");
 ABSL_FLAG(std::vector<std::string>, prefill_batch_sizes, {},
           "A list of maximum numbers of prefill tokens processed at once. If "
           "empty, it will be the list of one entry with the length of input "
@@ -55,6 +68,7 @@ ABSL_FLAG(int, num_output_candidates, 1,
           "The number of candidates generated for the given prompt, or the "
           "batch size of the decode signature.");
 ABSL_FLAG(bool, benchmark, false, "Benchmark the LLM execution.");
+ABSL_FLAG(bool, enable_profiling, false, "Enable per-op profiling.");
 ABSL_FLAG(int, benchmark_prefill_tokens, 0,
           "If benchmark is true and the value is larger than 0, the benchmark "
           "will use this number to set the number of prefill tokens "
@@ -74,6 +88,8 @@ ABSL_FLAG(bool, multi_turns, false,
 ABSL_FLAG(int, num_cpu_threads, 0,
           "If greater than 0, the number of CPU threads to use for the LLM "
           "execution with CPU backend.");
+ABSL_FLAG(bool, enable_ynnpack, false,
+          "Delegate supported CPU operations to YNNPACK before XNNPACK.");
 ABSL_FLAG(bool, gpu_external_tensor_mode, false,
           "If false (by default), the GPU backend will use no external tensor "
           "mode which runs slightly faster during decode. It should be set "
@@ -149,12 +165,83 @@ ABSL_FLAG(bool, cache_compiled_shaders_only, false,
           "If true, only the compiled shaders will be cached. If false, gpu "
           "graph info including work group sizes (and all compiled shaders "
           "depending on backend) will be cached.");
+ABSL_FLAG(double, repetition_penalty, 1.0,
+          "Multiplicative penalty for any token already generated. "
+          "Values >= 1.0 (e.g., 1.0 = no penalty, 1.2 = moderate penalty). "
+          "Positive logits are divided by this penalty, and negative logits "
+          "are multiplied.");
+ABSL_FLAG(double, presence_penalty, 0.0,
+          "Scalar subtracted globally from a logit if a token has appeared at "
+          "least once within the currently generated sequence.");
+ABSL_FLAG(
+    double, frequency_penalty, 0.0,
+    "Scalar subtracted from a token's logit, scaled linearly by the number "
+    "of times that token has previously appeared.");
+ABSL_FLAG(int, repetition_window_size, 0,
+          "The maximum number of recent tokens to consider for penalization. "
+          "Tokens older than this are forgotten. 0 means track all history.");
+ABSL_FLAG(int, no_repeat_ngram_size, 0,
+          "If greater than 0, all ngrams of this size can only occur once in "
+          "the generated sequence. The logits of the banned tokens will be set "
+          "to -inf.");
+ABSL_FLAG(int, no_repeat_ngram_window_size, 0,
+          "The maximum number of recent tokens to consider for banning. "
+          "Tokens older than this are forgotten. 0 means track all history.");
+ABSL_FLAG(std::string, suppress_tokens, "",
+          "A comma-separated list of tokens to suppress.");
 ABSL_FLAG(std::string, constraint_regex, "",
           "Regular expression to constrain the output generation.");
 ABSL_FLAG(bool, use_submodel, false,
           "Whether the submodel should be used if available.");
+ABSL_FLAG(std::string, speculative_decoding, "",
+          "Default speculative decoding (MTP) mode of the engine: on, off or "
+          "adaptive. on speculates on every decode step; adaptive speculates "
+          "while it is measured to be faster than plain decoding (on every "
+          "step on backends that do not support it). on and adaptive load the "
+          "drafter when the engine is created. Unset uses the runtime default "
+          "(off).");
 ABSL_FLAG(bool, enable_speculative_decoding, false,
-          "Whether to use speculative decoding.");
+          "Deprecated: use --speculative_decoding=on instead. If true and "
+          "--speculative_decoding is unset, equivalent to "
+          "--speculative_decoding=on.");
+ABSL_FLAG(std::optional<double>, mtp_gating_half_life, std::nullopt,
+          "Diagnostic: half-life, in steps, of the cost estimates of the "
+          "adaptive speculative decoding policy.");
+ABSL_FLAG(std::optional<double>, mtp_gating_deadband, std::nullopt,
+          "Diagnostic: relative cost excess tolerated before the adaptive "
+          "speculative decoding policy disables speculation.");
+ABSL_FLAG(std::optional<double>, mtp_gating_margin, std::nullopt,
+          "Diagnostic: relative saving a probe must show before the adaptive "
+          "speculative decoding policy re-enables speculation.");
+ABSL_FLAG(std::optional<int>, mtp_gating_probe_interval, std::nullopt,
+          "Diagnostic: plain steps between probes of the adaptive speculative "
+          "decoding policy while speculation is disabled.");
+ABSL_FLAG(std::optional<int>, mtp_gating_probe_length, std::nullopt,
+          "Diagnostic: speculative steps per probe of the adaptive speculative "
+          "decoding policy.");
+ABSL_FLAG(std::optional<int>, mtp_gating_forced_switch_period, std::nullopt,
+          "Diagnostic: if > 0, the adaptive speculative decoding policy "
+          "ignores its estimates and alternates between speculative and plain "
+          "decoding every this many steps.");
+ABSL_FLAG(std::optional<double>, speculative_lenience, std::nullopt,
+          "Lenience factor c in [0, 1] of the speculative decoding acceptance "
+          "test. With c > 0, drafted tokens are also accepted with probability "
+          "c when the verifier disagrees, so tokens follow "
+          "(1 - c) * p + c * draft instead of the sampling distribution p. "
+          "Trades output quality for speed. Unset or 0: exact.");
+ABSL_FLAG(std::optional<int>, sampler_top_k, std::nullopt,
+          "If set, samples with top-k/top-p sampling using this k instead of "
+          "the model's default sampler. Defaults to 40 when only "
+          "--sampler_top_p or --sampler_temperature is given.");
+ABSL_FLAG(std::optional<double>, sampler_top_p, std::nullopt,
+          "If set, samples with top-k/top-p sampling using this p instead of "
+          "the model's default sampler (p defaults to 1.0).");
+ABSL_FLAG(std::optional<double>, sampler_temperature, std::nullopt,
+          "If set, samples with top-k/top-p sampling using this temperature "
+          "instead of the model's default sampler (defaults to 1.0).");
+ABSL_FLAG(std::optional<int>, sampler_seed, std::nullopt,
+          "If set, the random seed of the sampler. Requires --sampler_top_k, "
+          "--sampler_top_p or --sampler_temperature.");
 ABSL_FLAG(bool, enable_neon_for_npu_greedy_sampling, true,
           "If true, enable NEON for NPU greedy sampling.");
 ABSL_FLAG(bool, use_hw_masking_for_npu, true,
@@ -164,3 +251,40 @@ ABSL_FLAG(bool, use_hw_cache_update_for_npu, true,
 ABSL_FLAG(bool, use_hw_ple_for_npu, true, "If true, use HW PLE for NPU.");
 ABSL_FLAG(bool, enable_npu_debug_logging, false,
           "If true, enable debug logging for NPU.");
+ABSL_FLAG(
+    bool, disable_input_prompt_as_hint, false,
+    "If true, disable the input prompt as a hint when creating the engine. "
+    "This is useful to align the behavior of other languages with C++, where "
+    "the input prompt is not used as a hint.");
+ABSL_FLAG(bool, gpu_enable_metal_residency_set, false,
+          "If true, enable metal residency set for GPU backend which prevents "
+          "model weigths from being swapped out from memory. Note that it will "
+          "increase the memory pressure for other applications and may cause "
+          "others' crash with out-of-memory failures.");
+ABSL_FLAG(std::string, gpu_use_ir_model, "default",
+          "Whether to use the IR model path on the GPU backend. One of "
+          "\"enabled\", \"disabled\", or \"default\". \"default\" is currently "
+          "disabled.");
+
+namespace litert::lm {
+
+absl::StatusOr<std::optional<SpeculativeDecodingMode>>
+ParseSpeculativeDecodingFlag(absl::string_view value) {
+  if (value.empty()) {
+    return std::nullopt;
+  }
+  if (absl::EqualsIgnoreCase(value, "off")) {
+    return SpeculativeDecodingMode::kOff;
+  }
+  if (absl::EqualsIgnoreCase(value, "on")) {
+    return SpeculativeDecodingMode::kOn;
+  }
+  if (absl::EqualsIgnoreCase(value, "adaptive")) {
+    return SpeculativeDecodingMode::kAdaptive;
+  }
+  return absl::InvalidArgumentError(
+      absl::StrCat("Invalid --speculative_decoding: \"", value,
+                   "\". Expected on, off or adaptive."));
+}
+
+}  // namespace litert::lm

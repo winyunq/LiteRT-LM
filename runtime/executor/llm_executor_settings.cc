@@ -22,14 +22,39 @@
 #include <variant>
 
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/str_join.h"  // from @com_google_absl
 #include "runtime/executor/executor_settings_base.h"
+#include "runtime/executor/mtp_gating_policy.h"
+#include "runtime/executor/speculative_decoding_mode.h"
 #include "runtime/util/logging.h"
 #include "runtime/util/status_macros.h"  // NOLINT
 
 namespace litert::lm {
+namespace {
+
+// Returns the deprecated `AdvancedSettings::enable_speculative_decoding`. This
+// is the only place that reads it, so that the deprecation warning is
+// suppressed once.
+bool LegacyEnableSpeculativeDecoding(const AdvancedSettings& settings) {
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+  return settings.enable_speculative_decoding;
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+}
+
+}  // namespace
 
 std::ostream& operator<<(std::ostream& os, const GpuArtisanConfig& config) {
   os << "num_output_candidates: " << config.num_output_candidates << "\n";
@@ -61,6 +86,7 @@ std::ostream& operator<<(std::ostream& os, const CpuConfig& config) {
   os << "kv_increment_size: " << config.kv_increment_size << "\n";
   os << "prefill_chunk_size: " << config.prefill_chunk_size << "\n";
   os << "number_of_threads: " << config.number_of_threads << "\n";
+  os << "enable_ynnpack: " << config.enable_ynnpack << "\n";
   return os;
 }
 
@@ -74,7 +100,6 @@ std::ostream& operator<<(std::ostream& os, const NpuConfig& config) {
   return os;
 }
 
-
 std::ostream& operator<<(std::ostream& os, const AdvancedSettings& settings) {
   os << "prefill_batch_sizes: ["
      << absl::StrJoin(settings.prefill_batch_sizes, ", ") << "]\n";
@@ -87,7 +112,10 @@ std::ostream& operator<<(std::ostream& os, const AdvancedSettings& settings) {
      << settings.num_logits_to_print_after_decode << "\n";
   os << "gpu_madvise_original_shared_tensors: "
      << settings.gpu_madvise_original_shared_tensors << "\n";
+  os << "gpu_enable_metal_residency_set: "
+     << settings.gpu_enable_metal_residency_set << "\n";
   os << "is_benchmark: " << settings.is_benchmark << "\n";
+  os << "enable_profiling: " << settings.enable_profiling << "\n";
   os << "preferred_device_substr: " << settings.preferred_device_substr << "\n";
   os << "num_threads_to_upload: " << settings.num_threads_to_upload << "\n";
   os << "num_threads_to_compile: " << settings.num_threads_to_compile << "\n";
@@ -118,8 +146,8 @@ std::ostream& operator<<(std::ostream& os, const AdvancedSettings& settings) {
   } else {
     os << "gpu_context_low_priority: Not set\n";
   }
-  os << "enable_speculative_decoding: " << settings.enable_speculative_decoding
-     << "\n";
+  os << "enable_speculative_decoding: "
+     << LegacyEnableSpeculativeDecoding(settings) << "\n";
   os << "disable_delegate_clustering: " << settings.disable_delegate_clustering
      << "\n";
   if (settings.hint_kernel_batch_size.has_value()) {
@@ -128,7 +156,27 @@ std::ostream& operator<<(std::ostream& os, const AdvancedSettings& settings) {
   } else {
     os << "hint_kernel_batch_size: Not set\n";
   }
+  os << "error_on_invalid_sampled_token_id: "
+     << settings.error_on_invalid_sampled_token_id << "\n";
+  if (settings.mtp_gating_config.has_value()) {
+    os << "mtp_gating_config: " << *settings.mtp_gating_config << "\n";
+  } else {
+    os << "mtp_gating_config: Not set\n";
+  }
   return os;
+}
+
+SpeculativeDecodingMode
+LlmExecutorSettings::GetEffectiveSpeculativeDecodingMode() const {
+  if (speculative_decoding_config_.mode.has_value()) {
+    return *speculative_decoding_config_.mode;
+  }
+  // The deprecated `AdvancedSettings::enable_speculative_decoding` is read only
+  // when the config sets no mode.
+  return advanced_settings_.has_value() &&
+                 LegacyEnableSpeculativeDecoding(*advanced_settings_)
+             ? SpeculativeDecodingMode::kOn
+             : SpeculativeDecodingMode::kOff;
 }
 
 std::ostream& operator<<(std::ostream& os, const LlmExecutorSettings& config) {
@@ -142,6 +190,7 @@ std::ostream& operator<<(std::ostream& os, const LlmExecutorSettings& config) {
   os << "activation_data_type: " << config.GetActivationDataType() << "\n";
   os << "max_num_images: " << config.GetMaxNumImages() << "\n";
   os << "lora_rank: " << config.GetLoraRank() << "\n";
+  os << "pad_token_id: " << config.GetPadTokenId() << "\n";
   os << "cache_dir: " << config.GetCacheDir() << "\n";
   if (config.GetScopedCacheFile()) {
     os << "cache_file: " << config.GetScopedCacheFile()->file() << "\n";
@@ -160,6 +209,8 @@ std::ostream& operator<<(std::ostream& os, const LlmExecutorSettings& config) {
   } else {
     os << "advanced_settings: Not set\n";
   }
+  os << "speculative_decoding_config: " << config.GetSpeculativeDecodingConfig()
+     << "\n";
   return os;
 }
 
@@ -168,7 +219,7 @@ absl::StatusOr<LlmExecutorSettings> LlmExecutorSettings::CreateDefault(
     ModelAssets model_assets, Backend backend,
     std::optional<Backend> sampler_backend) {
   LlmExecutorSettings settings(std::move(model_assets));
-  if (backend == Backend::CPU) {
+  if (backend == Backend::CPU || IsCustomBackend(backend)) {
     CpuConfig config;
     config.kv_increment_size = 16;
     config.prefill_chunk_size = -1;
@@ -176,8 +227,8 @@ absl::StatusOr<LlmExecutorSettings> LlmExecutorSettings::CreateDefault(
     settings.SetBackendConfig(config);
   } else if (backend == Backend::GPU) {
     GpuConfig config;
-    // Default max top k to 1 for GPU.
-    config.max_top_k = 1;
+    // Default max top k to 64 for GPU.
+    config.max_top_k = 64;
     settings.SetBackendConfig(config);
   } else if (backend == Backend::NPU) {
     settings.SetBackendConfig(NpuConfig());
@@ -187,7 +238,7 @@ absl::StatusOr<LlmExecutorSettings> LlmExecutorSettings::CreateDefault(
     return absl::InvalidArgumentError(
         absl::StrCat("Unsupported backend: ", backend));
   }
-  RETURN_IF_ERROR(settings.SetBackend(backend));
+  ABSL_RETURN_IF_ERROR(settings.SetBackend(backend));
   // Explicitly set the field value to avoid undefined behavior. Setting to 0
   // means that the maximum number of tokens is not set can could be inferred
   // from the model assets (but note that for the model or backend which does

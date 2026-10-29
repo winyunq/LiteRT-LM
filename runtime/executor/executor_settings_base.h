@@ -21,16 +21,25 @@
 #include <string>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "litert/cc/litert_common.h"  // from @litert
 #include "runtime/util/data_stream.h"
 #include "runtime/util/memory_mapped_file.h"
 #include "runtime/util/scoped_file.h"
 
 namespace litert::lm {
 
+// NOTE: `Backend` currently conflates the target hardware accelerator (`CPU`,
+// `GPU`, `NPU`) with the executor implementation (`CPU_ARTISAN`, `GPU_ARTISAN`,
+// `TENSOR_LLM`, and dynamically registered custom executors such as
+// `gemma_cpp`). To support running a custom executor across multiple hardware
+// backends (e.g., `gemma_cpp` on `CPU` vs. `GPU`), we should decouple the
+// executor implementation selector (e.g., an `executor_type` / custom executor
+// name in `ExecutorSettingsBase`) from the hardware `Backend` enum.
 enum class Backend {
   // Unspecified backend.
   UNSPECIFIED,
@@ -54,10 +63,23 @@ enum class Backend {
   NPU,
 };
 std::ostream& operator<<(std::ostream& os, const Backend& backend);
+// Registers a custom/dynamic backend name (case-insensitive) and returns its
+// assigned Backend identifier. If the name is already registered or matches a
+// built-in backend, returns the existing Backend identifier.
+Backend RegisterCustomBackend(absl::string_view backend_name);
+// Returns true if `backend` was dynamically registered via
+// `RegisterCustomBackend`.
+bool IsCustomBackend(Backend backend);
 // Returns the backend enum from the string. Case-insensitive.
 absl::StatusOr<Backend> GetBackendFromString(absl::string_view backend_str);
 // Returns the string representation of the backend enum.
 std::string GetBackendString(Backend backend);
+
+// Returns the LiteRT hardware accelerator that matches `backend`, for use when
+// compiling auxiliary subgraphs (e.g. logit masking) that must run on the same
+// device as the model. Returns HwAccelerators::kNone for backends that have no
+// LiteRT accelerator equivalent.
+::litert::HwAccelerators GetHwAcceleratorForBackend(Backend backend);
 
 enum class ActivationDataType {
   // Use float32 as the activation data type.
@@ -77,6 +99,11 @@ std::ostream& operator<<(std::ostream& os,
 
 absl::StatusOr<ActivationDataType> GetActivationDataTypeFromString(
     const std::string& activation_data_type);
+
+// Parses a tri-state GPU IR model setting. Case-insensitive.
+// "enabled" -> true, "disabled" -> false, "default" -> std::nullopt.
+absl::StatusOr<std::optional<bool>> GetUseIrModelFromString(
+    absl::string_view use_ir_model);
 
 // Fake weights mode.
 enum class FakeWeightsMode {
@@ -208,6 +235,9 @@ class ExecutorSettingsBase {
 
   // Getter APIs.
   const ModelAssets& GetModelAssets() const { return model_assets_; }
+  void SetModelAssets(ModelAssets model_assets) {
+    model_assets_ = std::move(model_assets);
+  }
 
   // Backend APIs.
   const Backend& GetBackend() const { return backend_; }
@@ -309,6 +339,13 @@ class ExecutorSettingsBase {
   bool IsWeightCacheDisabled() const { return disable_weight_cache_; }
   bool IsProgramCacheDisabled() const { return disable_program_cache_; }
 
+  // Sets whether the GPU backend uses the IR model path. std::nullopt means
+  // "default", which is currently resolved to disabled.
+  void SetUseIrModel(std::optional<bool> use_ir_model) {
+    use_ir_model_ = use_ir_model;
+  }
+  const std::optional<bool>& UseIrModel() const { return use_ir_model_; }
+
  protected:
   explicit ExecutorSettingsBase(ModelAssets model_assets)
       : model_assets_(std::move(model_assets)) {}
@@ -354,6 +391,9 @@ class ExecutorSettingsBase {
 
   bool disable_weight_cache_ = false;
   bool disable_program_cache_ = false;
+  // Optional setting to use the IR model path on the GPU backend. If not set,
+  // the default (disabled) is used.
+  std::optional<bool> use_ir_model_;
 };
 
 }  // namespace litert::lm

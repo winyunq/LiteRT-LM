@@ -17,8 +17,10 @@
 #include <filesystem>  // NOLINT
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <system_error>  // NOLINT
 #include <utility>
 #include <variant>
 
@@ -34,6 +36,9 @@
 
 namespace litert::lm {
 namespace {
+
+using ::testing::Optional;
+using ::testing::status::StatusIs;
 
 std::string GetTestModelPath() {
   const auto model_path =
@@ -105,6 +110,21 @@ TEST(LlmExecutorConfigTest, StringToActivationDataType) {
                 "Unsupported activation data type: invalid. Supported "
                 "activation data types are: [FLOAT32, "
                 "FLOAT16, INT16, INT8]"));
+}
+
+TEST(LlmExecutorConfigTest, StringToUseIrModel) {
+  ASSERT_OK_AND_ASSIGN(auto use_ir_model, GetUseIrModelFromString("enabled"));
+  EXPECT_THAT(use_ir_model, Optional(true));
+  ASSERT_OK_AND_ASSIGN(use_ir_model, GetUseIrModelFromString("ENABLED"));
+  EXPECT_THAT(use_ir_model, Optional(true));
+  ASSERT_OK_AND_ASSIGN(use_ir_model, GetUseIrModelFromString("disabled"));
+  EXPECT_THAT(use_ir_model, Optional(false));
+  ASSERT_OK_AND_ASSIGN(use_ir_model, GetUseIrModelFromString("default"));
+  EXPECT_EQ(use_ir_model, std::nullopt);
+  EXPECT_THAT(GetUseIrModelFromString("true"),
+              StatusIs(absl::StatusCode::kInvalidArgument));
+  EXPECT_THAT(GetUseIrModelFromString(""),
+              StatusIs(absl::StatusCode::kInvalidArgument));
 }
 
 TEST(LlmExecutorConfigTest, ActivatonDataType) {
@@ -185,6 +205,24 @@ TEST(LlmExecutorConfigTest, ModelAssetsMemoryMapped) {
   oss << *model_assets;
   EXPECT_THAT(oss.str(), testing::HasSubstr("model_file memory mapped file"));
   EXPECT_THAT(oss.str(), testing::HasSubstr("FAKE_WEIGHTS_NONE"));
+
+  // Without path, GetOrCreateScopedFile on MemoryMappedFile should fail.
+  EXPECT_FALSE(model_assets->GetOrCreateScopedFile().ok());
+}
+
+TEST(LlmExecutorConfigTest, ModelAssetsMemoryMappedWithPath) {
+  const auto model_path = GetTestModelPath();
+  ASSERT_OK_AND_ASSIGN(auto memory_mapped_file,
+                       MemoryMappedFile::Create(model_path));
+  ASSERT_OK_AND_ASSIGN(
+      auto model_assets,
+      ModelAssets::Create(std::move(memory_mapped_file), model_path));
+  EXPECT_TRUE(model_assets.HasMemoryMappedFile());
+  EXPECT_OK(model_assets.GetPath());
+  // With path, GetOrCreateScopedFile should succeed by opening the path.
+  ASSERT_OK_AND_ASSIGN(auto scoped_file, model_assets.GetOrCreateScopedFile());
+  ASSERT_NE(scoped_file, nullptr);
+  EXPECT_TRUE(scoped_file->IsValid());
 }
 
 TEST(LlmExecutorConfigTest, ModelAssetsDataStream) {
@@ -370,6 +408,126 @@ TEST(LlmExecutorConfigTest, GetProgramCacheFileWithIdentifier) {
 
   EXPECT_THAT(path, testing::HasSubstr("test_model.tflite_"));
   EXPECT_THAT(path, testing::EndsWith("_9.program_cache"));
+}
+
+TEST(LlmExecutorConfigTest,
+     GetProgramCacheFileCheckAndClean_DeletesStaleCaches) {
+  ASSERT_OK_AND_ASSIGN(
+      std::string model_file,
+      JoinPath(testing::TempDir(), "stale_test_model_prog.tflite"));
+  std::ofstream ofs(model_file);
+  ofs << "test data";
+  ofs.close();
+
+  ASSERT_OK_AND_ASSIGN(std::string cache_dir,
+                       JoinPath(testing::TempDir(), "cache_dir_prog"));
+  std::error_code ec;
+  std::filesystem::create_directory(cache_dir, ec);
+
+  ASSERT_OK_AND_ASSIGN(
+      std::string stale_cache,
+      JoinPath(cache_dir, "stale_test_model_prog.tflite_oldid.program_cache"));
+  std::ofstream ofs_stale(stale_cache);
+  ofs_stale << "stale test data";
+  ofs_stale.close();
+
+  EXPECT_TRUE(std::filesystem::exists(stale_cache));
+
+  auto model_assets = ModelAssets::Create(model_file);
+  ASSERT_OK(model_assets);
+  TestExecutorSettings settings(*model_assets);
+  settings.SetCacheDir(cache_dir);
+
+  // check_and_clean = true
+  auto result = settings.GetProgramCacheFile(".program_cache", true);
+  ASSERT_OK(result);
+
+  // Stale cache should be deleted.
+  EXPECT_FALSE(std::filesystem::exists(stale_cache));
+}
+
+TEST(LlmExecutorConfigTest, GetWeightCacheFile) {
+  auto model_assets = ModelAssets::Create("/path/to/model.tflite");
+  ASSERT_OK(model_assets);
+  TestExecutorSettings settings(*model_assets);
+  settings.SetCacheDir("/cache/dir");
+
+  auto result = settings.GetWeightCacheFile();
+  ASSERT_OK(result);
+  EXPECT_TRUE(std::holds_alternative<std::string>(*result));
+  EXPECT_THAT(std::get<std::string>(*result),
+              testing::HasSubstr("model.tflite.cache"));
+}
+
+TEST(LlmExecutorConfigTest, GetWeightCacheFileWithSuffix) {
+  auto model_assets = ModelAssets::Create("/path/to/model.tflite");
+  ASSERT_OK(model_assets);
+  TestExecutorSettings settings(*model_assets);
+  settings.SetCacheDir("/cache/dir");
+
+  auto result = settings.GetWeightCacheFile(".mysuffix");
+  ASSERT_OK(result);
+  EXPECT_TRUE(std::holds_alternative<std::string>(*result));
+  EXPECT_THAT(std::get<std::string>(*result),
+              testing::HasSubstr("model.tflite.mysuffix"));
+}
+
+TEST(LlmExecutorConfigTest, GetWeightCacheFileWithIdentifier) {
+  ASSERT_OK_AND_ASSIGN(
+      std::string temp_file,
+      JoinPath(testing::TempDir(), "test_model_weight.tflite"));
+  std::ofstream ofs(temp_file);
+  ofs << "test data";
+  ofs.close();
+
+  auto model_assets = ModelAssets::Create(temp_file);
+  ASSERT_OK(model_assets);
+  TestExecutorSettings settings(*model_assets);
+  settings.SetCacheDir("/cache/dir");
+
+  auto result = settings.GetWeightCacheFile();
+  ASSERT_OK(result);
+  EXPECT_TRUE(std::holds_alternative<std::string>(*result));
+  std::string path = std::get<std::string>(*result);
+
+  EXPECT_THAT(path, testing::HasSubstr("test_model_weight.tflite_"));
+  EXPECT_THAT(path, testing::EndsWith("_9.cache"));
+}
+
+TEST(LlmExecutorConfigTest,
+     GetWeightCacheFileCheckAndClean_DeletesStaleCaches) {
+  ASSERT_OK_AND_ASSIGN(
+      std::string model_file,
+      JoinPath(testing::TempDir(), "stale_test_model_weight.tflite"));
+  std::ofstream ofs(model_file);
+  ofs << "test data";
+  ofs.close();
+
+  ASSERT_OK_AND_ASSIGN(std::string cache_dir,
+                       JoinPath(testing::TempDir(), "cache_dir_weight"));
+  std::error_code ec;
+  std::filesystem::create_directory(cache_dir, ec);
+
+  ASSERT_OK_AND_ASSIGN(
+      std::string stale_cache,
+      JoinPath(cache_dir, "stale_test_model_weight.tflite_oldid.cache"));
+  std::ofstream ofs_stale(stale_cache);
+  ofs_stale << "stale test data";
+  ofs_stale.close();
+
+  EXPECT_TRUE(std::filesystem::exists(stale_cache));
+
+  auto model_assets = ModelAssets::Create(model_file);
+  ASSERT_OK(model_assets);
+  TestExecutorSettings settings(*model_assets);
+  settings.SetCacheDir(cache_dir);
+
+  // check_and_clean = true
+  auto result = settings.GetWeightCacheFile(".cache", true);
+  ASSERT_OK(result);
+
+  // Stale cache should be deleted.
+  EXPECT_FALSE(std::filesystem::exists(stale_cache));
 }
 
 }  // namespace

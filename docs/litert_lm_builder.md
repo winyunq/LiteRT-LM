@@ -41,6 +41,15 @@ You can optionally drive tool dynamically by reading standard TOML configuration
 litert-lm-builder toml --path example.toml output --path real_via_toml.litertlm
 ```
 
+### Unpacking with litert-lm-builder
+
+You can unpack an existing `.litertlm` file into a directory containing its
+extracted sections and a reconstructed `model.toml`:
+
+```bash
+litert-lm-builder unpack --input demo.litertlm --output ./unpacked_dir
+```
+
 ### litert-lm-peek (Inspection & Extraction)
 
 This tool is designed to inspect the contents of a `.litertlm` file. It reads
@@ -75,16 +84,17 @@ from litert_lm_builder import (
     LitertLmFileBuilder,
     Metadata,
     DType,
-    TfLiteModelType,
     Backend,
     peek_litertlm_file
 )
+from litert_lm_builder.runtime.proto import llm_metadata_pb2
 
 def build_demo_model():
     """Builds a .litertlm file programmatically using the Python API."""
     # Paths to your assets
     model_path = "schema/testdata/attention.tflite"
     sp_path = "runtime/components/testdata/sentencepiece.model"
+    llm_metadata_path = "runtime/components/testdata/llm_metadata.pb"
     output_path = "demo_api.litertlm"
 
     # Initialize the core builder object
@@ -93,11 +103,12 @@ def build_demo_model():
     # Add metadata
     builder.add_system_metadata(Metadata(key="Authors", value="ODML Team", dtype=DType.STRING))
     builder.add_system_metadata(Metadata(key="TargetBackend", value=Backend.CPU.name, dtype=DType.STRING))
+    builder.add_llm_metadata(llm_metadata_path=llm_metadata_path)
 
     # Add main TfLite model
     builder.add_tflite_model(
         tflite_model_path=model_path,
-        model_type=TfLiteModelType.PREFILL_DECODE
+        model_type=llm_metadata_pb2.LlmMetadata.TF_LITE_PREFILL_DECODE,
     )
 
     # Add auxiliary tokens & tokenizers
@@ -113,6 +124,10 @@ def build_demo_model():
     # You can also use the peek programmatic API identically
     print(f"\n--- Peeking at {output_path} ---")
     peek_litertlm_file(output_path, None, sys.stdout)
+
+    # You can unpack the archive programmatically
+    unpacked_builder = LitertLmFileBuilder.unpack(output_path, "./unpacked_output")
+    print(f"Unpacked {output_path} into ./unpacked_output")
 
 if __name__ == "__main__":
     build_demo_model()

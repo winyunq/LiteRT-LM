@@ -24,7 +24,14 @@ import {LlmChatStateController, type StoredMessage} from '../state_controller.js
 import {sharedStyles} from '../styles/shared_styles.js';
 
 import {getLanguage, highlight, highlightAuto, hljsStyles} from './hljs_util.js';
-import {renderHtml} from './util.js';
+import {katexStyles, renderHtml} from './util.js';
+import * as katex from 'katex';
+
+const MATH_START = 'LitertLmMathStart';
+const MATH_END = 'LitertLmMathEnd';
+const MATH_RESTORE_RE = /LitertLmMathStart(\d+)LitertLmMathEnd/g;
+
+
 
 marked.use({
   renderer: {
@@ -83,7 +90,7 @@ export class LitertChatBubble extends LitElement {
   state!: LlmChatStateController;
 
   static override styles = [
-    sharedStyles, hljsStyles, css`
+    sharedStyles, hljsStyles, katexStyles, css`
       :host {
         display: flex;
         flex-direction: column;
@@ -170,6 +177,32 @@ export class LitertChatBubble extends LitElement {
 
       .message-user-text {
         white-space: pre-wrap; 
+      }
+
+      .message-image {
+        display: block;
+        max-width: 100%;
+        max-height: 240px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        margin: 6px 0;
+        object-fit: contain;
+      }
+
+      .message-audio {
+        display: block;
+        max-width: 100%;
+        margin: 6px 0;
+      }
+
+      .message-media-missing {
+        display: inline-block;
+        padding: 2px 8px;
+        margin: 0 2px;
+        border: 1px dashed var(--border);
+        border-radius: 8px;
+        font-size: 0.8em;
+        color: var(--text-muted);
       }
       
       .message-content {
@@ -261,6 +294,19 @@ export class LitertChatBubble extends LitElement {
     `
   ];
 
+  private renderMath(latex: string, displayMode: boolean): string {
+    try {
+      return katex.renderToString(latex, {
+        displayMode,
+        throwOnError: false,
+        output: 'html',
+      });
+    } catch (e) {
+      console.error('[LiteRT-LM] Failed to render math:', e);
+      return `<code>${latex}</code>`;
+    }
+  }
+
   private renderMarkdown(text: string): string {
     // Note: This is called in the render function for each token we receive
     // from the model.
@@ -268,8 +314,46 @@ export class LitertChatBubble extends LitElement {
     // each token, but it's fast enough for now.
     // A better solution would incrementally render new chunks of the markdown.
     if (!text) return '';
+
+    const mathStore: string[] = [];
+
+    // Split by code blocks and inline code to avoid processing math inside them
+    const codePattern = /(```[\s\S]*?```|`[^`]*`)/g;
+    const parts = text.split(codePattern);
+
+    const processedParts = parts.map((part, i) => {
+      // Odd indices are code blocks/inline code - leave them alone
+      if (i % 2 === 1) return part;
+
+      // Even indices are regular text - process math
+      // 1. Extract and render display math: $$...$$
+      let processed = part.replace(/\$\$([\s\S]+?)\$\$/g, (_, tex: string) => {
+        const idx = mathStore.length;
+        mathStore.push(this.renderMath(tex.trim(), true));
+        return `${MATH_START}${idx}${MATH_END}`;
+      });
+
+      // 2. Extract and render inline math: $...$
+      processed = processed.replace(/\$([^\s$](?:[^$]*[^\s$])?)\$/g, (_, tex: string) => {
+        const idx = mathStore.length;
+        mathStore.push(this.renderMath(tex.trim(), false));
+        return `${MATH_START}${idx}${MATH_END}`;
+      });
+
+      return processed;
+    });
+
+    const processedText = processedParts.join('');
+
     try {
-      return marked.parse(text, {async: false});
+      let htmlResult = marked.parse(processedText, {async: false}) as string;
+
+      // 3. Restore rendered math blocks
+      htmlResult = htmlResult.replace(MATH_RESTORE_RE, (_, idx: string) => {
+        return mathStore[Number(idx)] || '';
+      });
+
+      return htmlResult;
     } catch (e) {
       console.error('[LiteRT-LM] Failed to parse markdown:', e);
       return text
@@ -291,15 +375,36 @@ export class LitertChatBubble extends LitElement {
   }
 
   private async handleRewindEdit() {
-    const originalPrompt =
+    const originalParts =
         await this.state.chatSession.rewindAndEdit(this.index);
-    if (originalPrompt) {
+    if (originalParts) {
       this.dispatchEvent(new CustomEvent('edit-prompt', {
-        detail: {prompt: originalPrompt},
+        detail: {parts: originalParts},
         bubbles: true,
         composed: true,
       }));
     }
+  }
+
+  /** Renders a user message's text with its images and audio inline. */
+  private renderUserContent(msg: StoredMessage) {
+    if (!msg.parts) {
+      return html`<div class="message-user-text">${msg.text}</div>`;
+    }
+    return html`<div class="message-user-text">${msg.parts.map(part => {
+      if (part.type === 'text') return part.text;
+      const media = this.state.chatSession.getMedia(part.id);
+      if (!media) {
+        const icon = part.type === 'image' ? '🖼' : '🎵';
+        return html`<span class="message-media-missing" title="Images and audio are not saved across page reloads">${
+            icon} ${part.name}</span>`;
+      }
+      return part.type === 'image' ?
+          html`<img class="message-image" src=${media.url} alt=${
+              part.name} title=${part.name} />` :
+          html`<audio class="message-audio" controls src=${media.url} title=${
+              part.name}></audio>`;
+    })}</div>`;
   }
 
   override render() {
@@ -322,21 +427,21 @@ export class LitertChatBubble extends LitElement {
         <div class="message-content">
           <!-- Thought block rendering -->
           ${
-        msg.thoughtText ? html`
+        msg.thoughtText ?
+            html`
             <details class="thought-details" open>
               <summary class="thought-summary">Thought Process</summary>
               <div class="thought-content">${
-                              renderHtml(this.renderMarkdown(
-                                  msg.thoughtText || ''))}</div>
+                renderHtml(this.renderMarkdown(msg.thoughtText || ''))}</div>
             </details>
           ` :
-                          ''}
+            ''}
           
           <!-- Main message bubble content -->
           ${
-        isUser ? html`<div class="message-user-text">${msg.text}</div>` :
-                 html`<div>${
-                     renderHtml(this.renderMarkdown(msg.text || ''))}</div>`}
+        isUser ?
+            this.renderUserContent(msg) :
+            html`<div>${renderHtml(this.renderMarkdown(msg.text || ''))}</div>`}
         </div>
 
         <!-- Message actions bar (Edit / Copy & Retry) -->

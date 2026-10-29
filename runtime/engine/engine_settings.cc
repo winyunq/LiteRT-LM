@@ -15,6 +15,7 @@
 #include "runtime/engine/engine_settings.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <ostream>
@@ -23,32 +24,65 @@
 #include <vector>
 
 #include "absl/base/nullability.h"  // from @com_google_absl
+#include "absl/container/flat_hash_set.h"  // from @com_google_absl
 #include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/match.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
+#include "absl/strings/str_format.h"  // from @com_google_absl
 #include "absl/strings/str_split.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
-#include "support/tokenizer/tokenizer.h"  // from @litert
+#include "runtime/components/constrained_decoding/suppress_tokens_config.h"
 #include "runtime/components/model_resources.h"
-#include "runtime/executor/audio_executor_settings.h"
+#include "runtime/core/version.h"
+#include "runtime/engine/engine_defaults.h"
+#include "runtime/executor/audio/audio_executor_settings.h"
+#include "runtime/executor/executor_backend_registry.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/llm_executor_settings.h"
-#include "runtime/executor/vision_executor_settings.h"
+#include "runtime/executor/speculative_decoding_mode.h"
+#include "runtime/executor/vision/vision_executor_settings.h"
 #include "runtime/proto/engine.pb.h"
 #include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/proto/llm_model_type.pb.h"
 #include "runtime/proto/sampler_params.pb.h"
 #include "runtime/proto/token.pb.h"
+#include "runtime/util/file_util.h"
 #include "runtime/util/litert_lm_loader.h"
+#include "runtime/util/litert_lm_streaming_loader.h"
 #include "runtime/util/model_type_utils.h"
 #include "runtime/util/scoped_file.h"
 #include "runtime/util/status_macros.h"  // IWYU pragma: keep
 #include "schema/core/litertlm_header_schema_generated.h"
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
 namespace {
+
+// Returns an InvalidArgument error if `config` holds an invalid value.
+absl::Status ValidateSpeculativeDecodingConfig(
+    const SpeculativeDecodingConfig& config) {
+  if (config.mode.has_value()) {
+    switch (*config.mode) {
+      case SpeculativeDecodingMode::kOff:
+      case SpeculativeDecodingMode::kOn:
+      case SpeculativeDecodingMode::kAdaptive:
+        break;
+      default:
+        return absl::InvalidArgumentError(
+            absl::StrCat("Invalid speculative decoding mode: ",
+                         static_cast<int>(*config.mode)));
+    }
+  }
+  if (config.lenience.has_value() &&
+      !(*config.lenience >= 0.0f && *config.lenience <= 1.0f)) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Speculative lenience must be in [0, 1], but got: ", *config.lenience));
+  }
+  return absl::OkStatus();
+}
 
 // Margin for the default prefill batch size assuming the tokens to indicate the
 // start and end of the input prompt.
@@ -94,11 +128,11 @@ absl::Status ValidateBackendConstraint(
                        backend_constraint_str, "] but ", modality_name,
                        " backend is ", backend));
     }
-    ABSL_LOG(INFO) << "The " << modality_name
-                   << " backend constraint is matched: " << backend;
+    ABSL_VLOG(1) << "The " << modality_name
+                 << " backend constraint is matched: " << backend;
   } else {
-    ABSL_LOG(INFO) << "The " << modality_name
-                   << " backend constraint is not set.";
+    ABSL_VLOG(1) << "The " << modality_name
+                 << " backend constraint is not set.";
   }
   return absl::OkStatus();
 }
@@ -123,7 +157,7 @@ absl::Status MaybeOverrideActivationType(
     return absl::OkStatus();
   }
   if (prefer_activation_type.has_value()) {
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         ActivationDataType activation_data_type,
         GetActivationDataTypeFromString(prefer_activation_type.value()));
     executor_settings.SetActivationDataType(activation_data_type);
@@ -132,6 +166,17 @@ absl::Status MaybeOverrideActivationType(
       // and set the enable_mixed_precision to true.
       executor_settings.SetEnableMixedPrecision(true);
     }
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ValidateCacheDir(absl::string_view cache_dir) {
+  if (cache_dir.empty() || cache_dir == ":nocache" || cache_dir == ":memory") {
+    return absl::OkStatus();
+  }
+  if (!IsDirectoryWritable(cache_dir)) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Cache directory does not exist or is not writable: ", cache_dir));
   }
   return absl::OkStatus();
 }
@@ -156,6 +201,25 @@ absl::StatusOr<EngineSettings> EngineSettings::CreateDefault(
       if (mapped_file_status.ok()) {
         loader_status = LitertLmLoader::Create(*mapped_file_status);
       }
+    } else if (model_assets.HasDataStream()) {
+      auto data_stream_status = model_assets.GetDataStream();
+      if (data_stream_status.ok()) {
+        LitertLmStreamingLoader streaming_loader(*data_stream_status);
+        absl::Status load_header_status =
+            streaming_loader.LoadHeader(/*preserve_stream=*/true);
+        if (!load_header_status.ok()) {
+          ABSL_LOG(WARNING)
+              << "Failed to load LitertLm header from data stream: "
+              << load_header_status;
+        } else if (streaming_loader.HasSection(BufferKey(
+                       schema::AnySectionDataType_TFLiteModel,
+                       proto::LlmMetadata::TF_LITE_ARTISAN_TEXT_DECODER))) {
+          is_text_artisan = true;
+        }
+      } else {
+        ABSL_LOG(WARNING) << "Failed to get data stream from ModelAssets: "
+                          << data_stream_status.status();
+      }
     } else {
       auto scoped_file_status = model_assets.GetOrCreateScopedFile();
       if (scoped_file_status.ok()) {
@@ -178,15 +242,15 @@ absl::StatusOr<EngineSettings> EngineSettings::CreateDefault(
       if (loader
               .GetSectionLocation(
                   BufferKey(schema::AnySectionDataType_TFLiteModel,
-                            ModelType::kArtisanTextDecoder))
+                            proto::LlmMetadata::TF_LITE_ARTISAN_TEXT_DECODER))
               .ok()) {
         is_text_artisan = true;
       }
     }
 
     if (is_text_artisan) {
-      ABSL_LOG(INFO) << "Artisan model detected. Switching backend from GPU to "
-                        "GPU_ARTISAN.";
+      ABSL_VLOG(1) << "Artisan model detected. Switching backend from GPU to "
+                      "GPU_ARTISAN.";
       backend = Backend::GPU_ARTISAN;
       if (audio_backend.has_value() && audio_backend.value() == Backend::GPU) {
         audio_backend = Backend::GPU_ARTISAN;
@@ -194,12 +258,12 @@ absl::StatusOr<EngineSettings> EngineSettings::CreateDefault(
     }
   }
 
-  ASSIGN_OR_RETURN(  // NOLINT
+  ABSL_ASSIGN_OR_RETURN(  // NOLINT
       auto executor_settings, LlmExecutorSettings::CreateDefault(
                                   model_assets, backend, sampler_backend));
   std::optional<VisionExecutorSettings> vision_executor_settings;
   if (vision_backend.has_value()) {
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         vision_executor_settings,
         VisionExecutorSettings::CreateDefault(
             model_assets, /*encoder_backend=*/vision_backend.value(),
@@ -208,10 +272,11 @@ absl::StatusOr<EngineSettings> EngineSettings::CreateDefault(
   }
   std::optional<AudioExecutorSettings> audio_executor_settings;
   if (audio_backend.has_value()) {
-    ASSIGN_OR_RETURN(audio_executor_settings,
-                     AudioExecutorSettings::CreateDefault(
-                         model_assets, executor_settings.GetMaxNumTokens(),
-                         audio_backend.value()));
+    ABSL_ASSIGN_OR_RETURN(audio_executor_settings,
+                          AudioExecutorSettings::CreateDefault(
+                              model_assets, executor_settings.GetMaxNumTokens(),
+                              /*encoder_backend=*/audio_backend.value(),
+                              /*adapter_backend=*/Backend::CPU));
   }
   return EngineSettings(std::move(executor_settings),
                         std::move(vision_executor_settings),
@@ -236,6 +301,19 @@ absl::Status EngineSettings::MaybeUpdateAndValidate(
   // Copy the metadata from the file if it is provided.
   if (metadata_from_file != nullptr) {
     metadata = *metadata_from_file;
+  }
+
+  // Graceful runtime version compatibility check.
+  if (!metadata.min_runtime_version().empty()) {
+    if (CompareVersions(LITERT_LM_VERSION, metadata.min_runtime_version()) <
+        0) {
+      ABSL_LOG(WARNING) << absl::StrFormat(
+          "Model expects minimum LiteRT-LM runtime version %s, but current "
+          "runtime version is %s. If errors are encountered, please upgrade "
+          "the LiteRT-LM runtime to version %s or newer.",
+          metadata.min_runtime_version(), LITERT_LM_VERSION,
+          metadata.min_runtime_version());
+    }
   }
 
   // Convert the start/stop tokens from string to token ids.
@@ -287,18 +365,61 @@ absl::Status EngineSettings::MaybeUpdateAndValidate(
     }
   }
 
+  const Backend& backend = main_executor_settings_.GetBackend();
   // Load the max num tokens from the model file.
   // If not set, we set the default value to one based on the number of tokens
   // in the prompt.
   if (main_executor_settings_.GetMaxNumTokens() == 0) {
     // The default maximum number of tokens is set to the smallest multiple of
-    // 4096 greater than the number of tokens in the prompt plus the default
-    // decode length, 1024.
-    int max_num_tokens = ((num_prompt_tokens + 1023) / 4096 + 1) * 4096;
+    // kDefaultMaxNumTokens greater than the number of tokens in the prompt plus
+    // the default decode length, 1024.
+    int max_num_tokens =
+        ((num_prompt_tokens + 1023) / kDefaultMaxNumTokens + 1) *
+        kDefaultMaxNumTokens;
     if (metadata.max_num_tokens() > 0) {
       max_num_tokens = metadata.max_num_tokens();
+#if !defined(__APPLE__)
+      // Metal does not constraint the max allocated GPU buffer size.
+      if (backend == Backend::GPU && max_num_tokens > 4096) {
+        max_num_tokens =
+            ((num_prompt_tokens + 1023) / kDefaultMaxNumTokens + 1) *
+            kDefaultMaxNumTokens;
+      }
+#endif  // !__APPLE__
     }
     main_executor_settings_.SetMaxNumTokens(max_num_tokens);
+  }
+
+  if (main_executor_settings_.GetPadTokenId() == -1 &&
+      metadata.has_pad_token()) {
+    if (metadata.pad_token().has_token_str()) {
+      if (tokenizer != nullptr) {
+        auto pad_token_id =
+            tokenizer->TokenToId(metadata.pad_token().token_str());
+        if (pad_token_id.ok()) {
+          main_executor_settings_.SetPadTokenId(*pad_token_id);
+        } else {
+          auto pad_token_ids =
+              tokenizer->TextToTokenIds(metadata.pad_token().token_str());
+          if (pad_token_ids.ok()) {
+            if (pad_token_ids->size() != 1) {
+              return absl::InvalidArgumentError(absl::StrCat(
+                  "Pad token should only contain a single token ID, but got ",
+                  pad_token_ids->size()));
+            }
+            main_executor_settings_.SetPadTokenId((*pad_token_ids)[0]);
+          }
+        }
+      }
+    } else if (metadata.pad_token().token_ids().ids_size() > 0) {
+      if (metadata.pad_token().token_ids().ids_size() != 1) {
+        return absl::InvalidArgumentError(absl::StrCat(
+            "Pad token should only contain a single token ID, but got ",
+            metadata.pad_token().token_ids().ids_size()));
+      }
+      main_executor_settings_.SetPadTokenId(
+          metadata.pad_token().token_ids().ids(0));
+    }
   }
 
   // By default, the audio executor is configured to use the same max num
@@ -323,8 +444,13 @@ absl::Status EngineSettings::MaybeUpdateAndValidate(
     }
   }
 
+  // Look up registry traits once; each lookup acquires the registry mutex.
+  const std::optional<BackendTraits> registered_traits =
+      ExecutorBackendRegistry::Instance().GetTraits(backend);
+  const bool uses_external_sampler =
+      registered_traits.has_value() && registered_traits->use_external_sampler;
+
   // Set the default values for the sampler params.
-  Backend backend = main_executor_settings_.GetBackend();
   if (!metadata.has_sampler_params()) {
     proto::SamplerParameters& sampler_params =
         *metadata.mutable_sampler_params();
@@ -332,13 +458,16 @@ absl::Status EngineSettings::MaybeUpdateAndValidate(
         backend == Backend::GPU_ARTISAN
     ) {
       sampler_params.set_type(proto::SamplerParameters::TYPE_UNSPECIFIED);
-    } else if (backend == Backend::CPU || backend == Backend::GPU
+    } else if (backend == Backend::CPU || backend == Backend::GPU ||
+               uses_external_sampler
     ) {
       sampler_params.set_type(proto::SamplerParameters::TOP_P);
       sampler_params.set_k(1);
       sampler_params.set_p(0.95f);
       sampler_params.set_temperature(1.0f);
       sampler_params.set_seed(0);
+    } else if (registered_traits.has_value()) {
+      sampler_params.set_type(proto::SamplerParameters::TYPE_UNSPECIFIED);
     } else {
       return absl::InvalidArgumentError(
           absl::StrCat("Not recognized backend: ", backend));
@@ -347,15 +476,38 @@ absl::Status EngineSettings::MaybeUpdateAndValidate(
 
   if (metadata.sampler_params().type() ==
           proto::SamplerParameters::TYPE_UNSPECIFIED &&
-      (backend == Backend::CPU || backend == Backend::GPU)) {
+      (backend == Backend::CPU || backend == Backend::GPU ||
+       uses_external_sampler)) {
     metadata.mutable_sampler_params()->set_type(
         proto::SamplerParameters::TOP_P);
   }
 
+  if (metadata.has_sampler_params() && metadata.sampler_params().k() > 0) {
+    const uint32_t metadata_top_k =
+        static_cast<uint32_t>(metadata.sampler_params().k());
+    if (backend == Backend::GPU_ARTISAN
+    ) {
+      auto gpu_artisan_config =
+          main_executor_settings_.MutableBackendConfig<GpuArtisanConfig>();
+      if (gpu_artisan_config.ok() &&
+          metadata_top_k > gpu_artisan_config->max_top_k) {
+        gpu_artisan_config->max_top_k = metadata_top_k;
+        main_executor_settings_.SetBackendConfig(*gpu_artisan_config);
+      }
+    } else if (backend == Backend::GPU) {
+      auto gpu_config =
+          main_executor_settings_.MutableBackendConfig<GpuConfig>();
+      if (gpu_config.ok() && metadata_top_k > gpu_config->max_top_k) {
+        gpu_config->max_top_k = metadata_top_k;
+        main_executor_settings_.SetBackendConfig(*gpu_config);
+      }
+    }
+  }
+
   if (!metadata.has_llm_model_type()) {
     if (tokenizer != nullptr) {
-      ASSIGN_OR_RETURN(*metadata.mutable_llm_model_type(),
-                       InferLlmModelType(metadata, tokenizer));
+      ABSL_ASSIGN_OR_RETURN(*metadata.mutable_llm_model_type(),
+                            InferLlmModelType(metadata, tokenizer));
     } else {
       return absl::InvalidArgumentError(
           "Tokenizer is null and LLM model type is not set.");
@@ -409,34 +561,48 @@ absl::Status EngineSettings::MaybeUpdateAndValidate(
     main_executor_settings_.SetAdvancedSettings(advanced_settings);
   }
   if (!metadata.has_jinja_prompt_template()) {
-    ASSIGN_OR_RETURN(*metadata.mutable_jinja_prompt_template(),
-                     GetDefaultJinjaPromptTemplate(metadata.prompt_templates(),
-                                                   metadata.llm_model_type()));
+    ABSL_ASSIGN_OR_RETURN(
+        *metadata.mutable_jinja_prompt_template(),
+        GetDefaultJinjaPromptTemplate(metadata.prompt_templates(),
+                                      metadata.llm_model_type()));
   }
 
   // If the executor settings is set, then check if the input backend
   // constraint is compatible with the executor settings.
-  RETURN_IF_ERROR(ValidateBackendConstraint(main_executor_settings_,
-                                            text_backend_constraint, "Main"));
-  RETURN_IF_ERROR(MaybeOverrideActivationType(main_executor_settings_,
-                                              text_prefer_activation_type));
+  ABSL_RETURN_IF_ERROR(ValidateBackendConstraint(
+      main_executor_settings_, text_backend_constraint, "Main"));
+  ABSL_RETURN_IF_ERROR(MaybeOverrideActivationType(
+      main_executor_settings_, text_prefer_activation_type));
 
   if (vision_executor_settings_.has_value()) {
-    RETURN_IF_ERROR(ValidateBackendConstraint(vision_executor_settings_.value(),
-                                              vision_backend_constraint,
-                                              "Vision"));
-    RETURN_IF_ERROR(MaybeOverrideActivationType(
+    ABSL_RETURN_IF_ERROR(
+        ValidateBackendConstraint(vision_executor_settings_.value(),
+                                  vision_backend_constraint, "Vision"));
+    ABSL_RETURN_IF_ERROR(MaybeOverrideActivationType(
         vision_executor_settings_.value(), vision_prefer_activation_type));
   }
   if (audio_executor_settings_.has_value()) {
-    RETURN_IF_ERROR(ValidateBackendConstraint(
+    ABSL_RETURN_IF_ERROR(ValidateBackendConstraint(
         audio_executor_settings_.value(), audio_backend_constraint, "Audio"));
-    RETURN_IF_ERROR(MaybeOverrideActivationType(
+    ABSL_RETURN_IF_ERROR(MaybeOverrideActivationType(
         audio_executor_settings_.value(), audio_prefer_activation_type));
   }
 
+  ABSL_RETURN_IF_ERROR(ValidateCacheDir(main_executor_settings_.GetCacheDir()));
+  if (vision_executor_settings_.has_value()) {
+    ABSL_RETURN_IF_ERROR(
+        ValidateCacheDir(vision_executor_settings_->GetCacheDir()));
+  }
+  if (audio_executor_settings_.has_value()) {
+    ABSL_RETURN_IF_ERROR(
+        ValidateCacheDir(audio_executor_settings_->GetCacheDir()));
+  }
+
+  ABSL_RETURN_IF_ERROR(ValidateSpeculativeDecodingConfig(
+      main_executor_settings_.GetSpeculativeDecodingConfig()));
+
   ABSL_VLOG(5) << "The llm metadata: " << metadata.DebugString();
-  ABSL_LOG(INFO) << "The validated engine settings: " << *this;
+  ABSL_VLOG(1) << "The validated engine settings: " << *this;
   return absl::OkStatus();
 }
 
@@ -449,6 +615,17 @@ EngineSettings::EngineSettings(
       vision_executor_settings_(std::move(vision_executor_settings)),
       audio_executor_settings_(std::move(audio_executor_settings)),
       benchmark_params_(benchmark_params) {}
+
+const SpeculativeDecodingConfig& EngineSettings::GetSpeculativeDecodingConfig()
+    const {
+  return main_executor_settings_.GetSpeculativeDecodingConfig();
+}
+
+void EngineSettings::SetSpeculativeDecodingConfig(
+    const SpeculativeDecodingConfig& speculative_decoding_config) {
+  main_executor_settings_.SetSpeculativeDecodingConfig(
+      speculative_decoding_config);
+}
 
 const LlmExecutorSettings& EngineSettings::GetMainExecutorSettings() const {
   return main_executor_settings_;
@@ -527,11 +704,37 @@ std::ostream& operator<<(std::ostream& os, const EngineSettings& settings) {
   } else {
     os << "  AudioExecutorSettings: Not set" << std::endl;
   }
+  if (settings.GetMaxVisionTokensPerImage().has_value()) {
+    os << "  MaxVisionTokensPerImage: "
+       << settings.GetMaxVisionTokensPerImage().value() << std::endl;
+  }
+  if (settings.GetMinVisionTokensPerImage().has_value()) {
+    os << "  MinVisionTokensPerImage: "
+       << settings.GetMinVisionTokensPerImage().value() << std::endl;
+  }
   os << "  ParallelFileSectionLoading: "
      << settings.GetParallelFileSectionLoading() << std::endl;
   os << "  SingleThreadedExecution: " << settings.GetSingleThreadedExecution()
      << std::endl;
   return os;
+}
+
+std::optional<int> EngineSettings::GetMaxVisionTokensPerImage() const {
+  return max_vision_tokens_per_image_;
+}
+
+void EngineSettings::SetMaxVisionTokensPerImage(
+    int max_vision_tokens_per_image) {
+  max_vision_tokens_per_image_ = max_vision_tokens_per_image;
+}
+
+std::optional<int> EngineSettings::GetMinVisionTokensPerImage() const {
+  return min_vision_tokens_per_image_;
+}
+
+void EngineSettings::SetMinVisionTokensPerImage(
+    int min_vision_tokens_per_image) {
+  min_vision_tokens_per_image_ = min_vision_tokens_per_image;
 }
 
 proto::LlmMetadata& EngineSettings::GetMutableLlmMetadata() {
@@ -603,7 +806,7 @@ absl::Status SessionConfig::MaybeUpdateAndValidate(
       // If the sampler backend is still unspecified, then it will be set later
       // based on the main executor settings.
       if (backend_to_use != proto::SamplerParameters::UNSPECIFIED) {
-        ASSIGN_OR_RETURN(
+        ABSL_ASSIGN_OR_RETURN(
             sampler_backend_,
             GetBackendFromString(
                 proto::SamplerParameters::Backend_Name(backend_to_use)));
@@ -648,6 +851,13 @@ absl::Status SessionConfig::MaybeUpdateAndValidate(
         proto::LlmModelType::MODEL_TYPE_NOT_SET) {
       llm_model_type_ = llm_metadata.llm_model_type();
     }
+
+    if (llm_metadata.has_suppress_tokens() &&
+        !llm_metadata.suppress_tokens().ids().empty()) {
+      suppress_tokens_config_ = SuppressTokensConfig(absl::flat_hash_set<int>(
+          llm_metadata.suppress_tokens().ids().cbegin(),
+          llm_metadata.suppress_tokens().ids().cend()));
+    }
   }
 
   // Validating the required fields are set correctly.
@@ -662,17 +872,42 @@ absl::Status SessionConfig::MaybeUpdateAndValidate(
         "Number of output candidates need to be at least 1, but got: ",
         num_output_candidates_));
   }
+  const Backend main_backend =
+      engine_settings.GetMainExecutorSettings().GetBackend();
+  const auto registered_traits =
+      ExecutorBackendRegistry::Instance().GetTraits(main_backend);
 
   // If the sampler backend is not specified, then use the same backend as the
   // main executor settings.
   if (sampler_backend_ == Backend::UNSPECIFIED) {
-    if (engine_settings.GetMainExecutorSettings().GetBackend() ==
-        Backend::GPU) {
+    if (registered_traits.has_value() &&
+        registered_traits->default_sampler_backend != Backend::UNSPECIFIED) {
+      sampler_backend_ = registered_traits->default_sampler_backend;
+    } else if (main_backend == Backend::GPU) {
       sampler_backend_ = Backend::GPU;
     } else {
       sampler_backend_ = Backend::CPU;
     }
   }
+
+  if (registered_traits.has_value()) {
+    use_external_sampler_ = registered_traits->use_external_sampler;
+  }
+
+  // Fields of the speculative decoding config left unset inherit the engine's
+  // configuration. Validation runs after the inheritance so that it also covers
+  // an engine config that was not validated yet.
+  if (!speculative_decoding_config_.mode.has_value()) {
+    speculative_decoding_config_.mode =
+        engine_settings.GetMainExecutorSettings()
+            .GetEffectiveSpeculativeDecodingMode();
+  }
+  if (!speculative_decoding_config_.lenience.has_value()) {
+    speculative_decoding_config_.lenience =
+        engine_settings.GetSpeculativeDecodingConfig().lenience;
+  }
+  ABSL_RETURN_IF_ERROR(
+      ValidateSpeculativeDecodingConfig(speculative_decoding_config_));
 
   ABSL_VLOG(5) << "The validated session config: " << *this;
   return absl::OkStatus();
@@ -727,6 +962,15 @@ proto::LlmModelType& SessionConfig::GetMutableLlmModelType() {
   return llm_model_type_;
 }
 
+const SuppressTokensConfig& SessionConfig::GetSuppressTokensConfig() const {
+  return suppress_tokens_config_;
+}
+
+void SessionConfig::SetSuppressTokensConfig(
+    const SuppressTokensConfig& suppress_tokens_config) {
+  suppress_tokens_config_ = suppress_tokens_config;
+}
+
 std::shared_ptr<ScopedFile> SessionConfig::GetScopedLoraFile() const {
   return scoped_lora_file_;
 }
@@ -751,6 +995,8 @@ std::ostream& operator<<(std::ostream& os, const SessionConfig& config) {
      << std::endl;
   os << "  VisionModalityEnabled: " << config.VisionModalityEnabled()
      << std::endl;
+  os << "  EnableAudioSessionAdvanced: " << config.EnableAudioSessionAdvanced()
+     << std::endl;
   os << "  SamplerParams: " << config.GetSamplerParams().DebugString()
      << std::endl;
   os << "  SamplerBackend: " << config.GetSamplerBackend() << std::endl;
@@ -772,6 +1018,8 @@ std::ostream& operator<<(std::ostream& os, const SessionConfig& config) {
      << std::endl;
   os << "  ScopedAudioLoraFile: "
      << (config.GetAudioScopedLoraFile() != nullptr ? "Present" : "Not present")
+     << std::endl;
+  os << "  SpeculativeDecodingConfig: " << config.GetSpeculativeDecodingConfig()
      << std::endl;
   return os;
 }

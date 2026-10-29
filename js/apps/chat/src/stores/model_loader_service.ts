@@ -18,7 +18,46 @@ import {Backend, Engine, getOrLoadGlobalLiteRtLm, GpuArtisanConfig} from '@liter
 
 import {teeStream} from '../tee_stream.js';
 
-import {SettingsStore} from './settings_store.js';
+import {LocalDirectoryService} from './local_directory_service.js';
+import {CustomModel, ModelSettings} from './settings_store.js';
+
+const SUPPRESSED_WARNING_PATTERNS = [
+  /mel_filterbank\.cc:.*Missing \d+ bands\s+starting at \d+ in mel-frequency design\./,
+  /tasks\.cc:.*Failed to get (?:prefill|decode) profile summary: UNIMPLEMENTED: GetProfileSummary not implemented for backend: GpuArtisan/,
+];
+
+/**
+ * Maximum number of images in a conversation. Artisan models reserve GPU memory
+ * for this many images' embeddings when the model is loaded.
+ */
+const MAX_NUM_IMAGES = 8;
+
+/**
+ * Wraps `console.warn` to suppress known noisy WASM runtime warnings in the
+ * chat app.
+ */
+export function suppressKnownWasmWarnings(
+    consoleObj: Pick<Console, 'warn'> = console) {
+  const flaggedWarn = consoleObj.warn as unknown as {
+    __litertLmWarningsSuppressed?: boolean;
+  };
+  if (flaggedWarn.__litertLmWarningsSuppressed) {
+    return;
+  }
+  const originalWarn = consoleObj.warn;
+  const wrappedWarn = function(this: unknown, ...args: unknown[]) {
+    if (args.length > 0 && typeof args[0] === 'string') {
+      const msg = args[0];
+      if (SUPPRESSED_WARNING_PATTERNS.some(pattern => pattern.test(msg))) {
+        return;
+      }
+    }
+    return originalWarn.apply(this, args);
+  };
+  (wrappedWarn as unknown as {__litertLmWarningsSuppressed?: boolean})
+      .__litertLmWarningsSuppressed = true;
+  consoleObj.warn = wrappedWarn;
+}
 
 /**
  * Service responsible for downloading, caching, and building the GPU WASM
@@ -37,10 +76,12 @@ export class ModelLoaderService {
   downloadAbortController: AbortController|null = null;
   isDownloadAborted = false;
 
+  loadedSettings: ModelSettings|null = null;
+
   constructor(
       private readonly updateCallback: () => void,
-      private readonly settings: SettingsStore,
       private readonly updateStatus: (msg: string) => void,
+      private readonly localDirService?: LocalDirectoryService,
       private readonly createEngine: typeof Engine.create = Engine.create,
       private readonly loadWasm:
           typeof getOrLoadGlobalLiteRtLm = getOrLoadGlobalLiteRtLm) {}
@@ -72,10 +113,17 @@ export class ModelLoaderService {
     }
   }
 
-  async deleteModelFromCache(modelPath: string, onDeleted?: () => void) {
+  needsModelReload(settings: ModelSettings): boolean {
+    if (!this.engine || !this.loadedSettings) return true;
+    return this.loadedSettings.selectedModelPath !== settings.selectedModelPath ||
+           this.loadedSettings.contextLength !== settings.contextLength ||
+           this.loadedSettings.topK !== settings.topK;
+  }
+
+  async deleteModelFromCache(modelPath: string): Promise<boolean> {
     const confirmDelete = confirm(
         'Are you sure you want to remove this model\'s weights from your browser cache?');
-    if (!confirmDelete) return;
+    if (!confirmDelete) return false;
 
     try {
       const cache = await window.caches.open('litertlm-models');
@@ -83,13 +131,11 @@ export class ModelLoaderService {
       if (deleted) {
         this.updateStatus('Model cache removed successfully.');
         await this.updateCacheSize();
-
-        if (this.settings.selectedModelPath === modelPath) {
-          if (onDeleted) onDeleted();
-        }
       }
+      return deleted;
     } catch (e) {
       console.error('[LiteRT-LM] Failed to delete model from Cache:', e);
+      return false;
     }
   }
 
@@ -135,10 +181,11 @@ export class ModelLoaderService {
     });
   }
 
-  async loadModelWeights(onModelLoaded: () => Promise<void>) {
+  async loadModelWeights(
+      settings: ModelSettings, onModelLoaded: () => Promise<void>) {
     if (this.isModelLoading) return;
 
-    const modelPath = this.settings.selectedModelPath;
+    const modelPath = settings.selectedModelPath;
     const modelFilename = modelPath.split('/').pop() || modelPath;
 
     this.isModelLoading = true;
@@ -150,6 +197,7 @@ export class ModelLoaderService {
     try {
       if (!this.isWasmLoaded) {
         this.updateStatus('Loading LiteRT WASM runtime...');
+        suppressKnownWasmWarnings();
         const wasmPath = import.meta.env.DEV ? '/wasm' : undefined;
         await this.loadWasm(wasmPath);
         this.isWasmLoaded = true;
@@ -163,114 +211,139 @@ export class ModelLoaderService {
         this.engine = null;
       }
 
-      const cache = await window.caches.open('litertlm-models');
-      const cachedResponse = await cache.match(modelPath);
       let modelInput: ReadableStream<Uint8Array>;
 
-      this.downloadProgresses.set(modelFilename, 0);
-      this.downloadSpeeds.set(modelFilename, '0 MB / 0 MB');
-      this.updateCallback();
-
-      if (cachedResponse) {
-        if (!cachedResponse.body) {
-          throw new Error('Cached model response body is null.');
+      if (modelPath.startsWith('local-dir://')) {
+        if (!this.localDirService) {
+          throw new Error('Local directory service not available.');
         }
-        this.updateStatus(`Loading cached weights (${modelFilename})...`);
-
-        const totalBytes =
-            Number(cachedResponse.headers.get('content-length') || '0');
-        let bytesRead = 0;
-
-        const progressStream =
-            this.makeProgressStream(cachedResponse.body, (chunkLength) => {
-              bytesRead += chunkLength;
-              const percent =
-                  totalBytes > 0 ? (bytesRead / totalBytes) * 100 : 0;
-              this.downloadProgresses.set(modelFilename, Math.round(percent));
-              this.downloadSpeeds.set(
-                  modelFilename,
-                  `${(bytesRead / 1e6).toFixed(1)} MB / ${
-                      (totalBytes / 1e6).toFixed(1)} MB`);
-              this.updateCallback();
-            });
-
-        modelInput = progressStream;
+        this.updateStatus(`Loading local directory model ${modelFilename}...`);
+        const file = await this.localDirService.getFile(modelPath);
+        modelInput = file.stream();
       } else {
-        this.updateStatus(`Downloading weights (${modelFilename})...`);
+        const cache = await window.caches.open('litertlm-models');
+        const cachedResponse = await cache.match(modelPath);
 
-        this.downloadAbortController = new AbortController();
+        this.downloadProgresses.set(modelFilename, 0);
+        this.downloadSpeeds.set(modelFilename, '0 MB / 0 MB');
+        this.updateCallback();
 
-        const response = await fetch(modelPath, {
-          signal: this.downloadAbortController.signal,
-        });
-        if (!response.ok) {
-          throw new Error(`Failed to fetch model: ${response.statusText}`);
-        }
-
-        const totalBytes =
-            Number(response.headers.get('content-length') || '0');
-        let bytesRead = 0;
-
-        const progressStream =
-            this.makeProgressStream(response.body!, (chunkLength) => {
-              bytesRead += chunkLength;
-              const percent =
-                  totalBytes > 0 ? (bytesRead / totalBytes) * 100 : 0;
-              this.downloadProgresses.set(modelFilename, Math.round(percent));
-              this.downloadSpeeds.set(
-                  modelFilename,
-                  `${(bytesRead / 1e6).toFixed(1)} MB / ${
-                      (totalBytes / 1e6).toFixed(1)} MB`);
-              this.updateCallback();
-            });
-
-        const [loaderStream, cacheStream] = teeStream(progressStream);
-
-        const cacheResponse = new Response(cacheStream, {
-          headers: {
-            'Content-Type': 'application/octet-stream',
-            'Content-Length': totalBytes.toString(),
+        if (cachedResponse) {
+          if (!cachedResponse.body) {
+            throw new Error('Cached model response body is null.');
           }
-        });
+          this.updateStatus(`Loading cached weights (${modelFilename})...`);
 
-        void cache.put(modelPath, cacheResponse)
-            .then(() => {
-              this.updateCacheSize();
-            })
-            .catch(err => {
-              if (this.isDownloadAborted) {
-                console.log('[LiteRT-LM] Cache write aborted.');
-                return;
-              }
-              console.error('[LiteRT-LM] Cache write failed:', err);
-              this.updateStatus(
-                  '⚠ Cache Failed: Disk quota exceeded. (Running from memory)');
-            });
+          const totalBytes =
+              Number(cachedResponse.headers.get('content-length') || '0');
+          let bytesRead = 0;
 
-        modelInput = loaderStream;
+          const progressStream =
+              this.makeProgressStream(cachedResponse.body, (chunkLength) => {
+                bytesRead += chunkLength;
+                const percent =
+                    totalBytes > 0 ? (bytesRead / totalBytes) * 100 : 0;
+                this.downloadProgresses.set(modelFilename, Math.round(percent));
+                this.downloadSpeeds.set(
+                    modelFilename,
+                    `${(bytesRead / 1e6).toFixed(1)} MB / ${
+                        (totalBytes / 1e6).toFixed(1)} MB`);
+                this.updateCallback();
+              });
+
+          modelInput = progressStream;
+        } else if (modelPath.startsWith('https://local-model/')) {
+          throw new Error('Local model file not found in cache. Please re-upload the file.');
+        } else {
+          this.updateStatus(`Downloading weights (${modelFilename})...`);
+
+          this.downloadAbortController = new AbortController();
+
+          const response = await fetch(modelPath, {
+            signal: this.downloadAbortController.signal,
+          });
+          if (!response.ok) {
+            throw new Error(`Failed to fetch model: ${response.statusText}`);
+          }
+
+          const totalBytes =
+              Number(response.headers.get('content-length') || '0');
+          let bytesRead = 0;
+
+          const progressStream =
+              this.makeProgressStream(response.body!, (chunkLength) => {
+                bytesRead += chunkLength;
+                const percent =
+                    totalBytes > 0 ? (bytesRead / totalBytes) * 100 : 0;
+                this.downloadProgresses.set(modelFilename, Math.round(percent));
+                this.downloadSpeeds.set(
+                    modelFilename,
+                    `${(bytesRead / 1e6).toFixed(1)} MB / ${
+                        (totalBytes / 1e6).toFixed(1)} MB`);
+                this.updateCallback();
+              });
+
+          const [loaderStream, cacheStream] = teeStream(progressStream);
+
+          const cacheResponse = new Response(cacheStream, {
+            headers: {
+              'Content-Type': 'application/octet-stream',
+              'Content-Length': totalBytes.toString(),
+            }
+          });
+
+          void cache.put(modelPath, cacheResponse)
+              .then(() => {
+                this.updateCacheSize();
+              })
+              .catch(err => {
+                if (this.isDownloadAborted) {
+                  console.log('[LiteRT-LM] Cache write aborted.');
+                  return;
+                }
+                console.error('[LiteRT-LM] Cache write failed:', err);
+                this.updateStatus(
+                    '⚠ Cache Failed: Disk quota exceeded. (Running from memory)');
+              });
+
+          modelInput = loaderStream;
+        }
       }
 
       this.updateStatus(`Compiling Model (${modelFilename})...`);
 
       this.engine = await this.createEngine({
         model: modelInput,
-        backend: Backend.GPU_ARTISAN,
         mainExecutorSettings: {
-          maxNumTokens: this.settings.contextLength,
+          maxNumTokens: settings.contextLength,
+          // Artisan (GPU_ARTISAN) models reserve GPU memory for the embeddings
+          // of this many images per conversation up front, and can't take
+          // images if it's unset.
+          maxNumImages: MAX_NUM_IMAGES,
           backendConfig: {
             num_output_candidates: 1,
             wait_for_weight_uploads: true,
-            num_decode_steps_per_sync: 1,
+            num_decode_steps_per_sync: 3,
             sequence_batch_size: 0,
             supported_lora_ranks: [] as number[],
-            max_top_k: Math.max(1, this.settings.topK),
+            max_top_k: Math.max(1, settings.topK),
             enable_decode_logits: false,
             enable_external_embeddings: false,
-            use_submodel: true,
+            use_submodel: false,
+            use_autosized_ringbuffers: true,
           } as GpuArtisanConfig
         },
+        // Always enable image input. On web, only one vision signature is
+        // loaded by default to fit in the wasm heap.
+        visionBackend: Backend.GPU,
+        // Always enable audio input. On GPU, the audio encoder's weights are
+        // released from the wasm heap after they are uploaded.
+        audioBackend: Backend.GPU,
         benchmarkEnabled: true
       });
+
+      this.loadedSettings = structuredClone(settings);
+
       const loadTimeSec = (performance.now() - startTime) / 1000;
       this.metricLoadTime = `${loadTimeSec.toFixed(2)}s`;
 
@@ -296,6 +369,44 @@ export class ModelLoaderService {
       this.updateCallback();
     } finally {
       this.downloadAbortController = null;
+    }
+  }
+
+  async importCustomModel(file: File): Promise<CustomModel> {
+    const path = `https://local-model/${file.name}`;
+    const cache = await window.caches.open('litertlm-models');
+    
+    this.updateStatus(`Importing local model ${file.name}...`);
+    this.isModelLoading = true;
+    this.updateCallback();
+
+    try {
+      const response = new Response(file, {
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': file.size.toString(),
+        }
+      });
+      await cache.put(path, response);
+      
+      const customModel: CustomModel = {
+        name: file.name.replace(/\.litertlm$/, ''),
+        filename: file.name,
+        path,
+        size: `${(file.size / 1e9).toFixed(2)} GB`
+      };
+      
+      await this.updateCacheSize();
+      this.updateStatus(`Local model ${file.name} imported.`);
+      return customModel;
+      
+    } catch (e) {
+      console.error('[LiteRT-LM] Failed to import custom model:', e);
+      this.updateStatus(`Failed to import model: ${(e as Error).message}`);
+      throw e;
+    } finally {
+      this.isModelLoading = false;
+      this.updateCallback();
     }
   }
 

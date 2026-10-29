@@ -23,6 +23,7 @@
 
 #include "absl/base/nullability.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
@@ -133,10 +134,12 @@ absl::Status EndOfMultiModalEmbedding::LookupPrefill(
                      ". Output tensor bytes: ", prefill_output_size));
   }
 
-  auto prefill_output_lock_and_addr = ::litert::TensorBufferScopedLock::Create(
-      *prefill_output, TensorBuffer::LockMode::kWrite);
+  LITERT_ASSIGN_OR_RETURN(
+      auto prefill_output_lock_and_addr,
+      ::litert::TensorBufferScopedLock::Create(*prefill_output,
+                                               TensorBuffer::LockMode::kWrite));
   auto prefill_output_ptr =
-      reinterpret_cast<uint8_t*>(prefill_output_lock_and_addr->second);
+      reinterpret_cast<uint8_t*>(prefill_output_lock_and_addr.second);
   prefill_output_ptr += byte_offset;
   for (int token : tokens) {
     if (token == special_token_) {
@@ -171,10 +174,8 @@ EndOfMultiModalEmbedding::Create(
     bool require_full_acceleration) {
   auto handler = std::unique_ptr<EndOfMultiModalEmbedding>(
       new EndOfMultiModalEmbedding(env, model, special_token,
-                                   hardware_accelerators,
-                                   require_full_acceleration));
-  RETURN_IF_ERROR(  // IWYU pragma: keep as is included by status_macros.h
-      handler->Initialize());
+                                   hardware_accelerators, require_full_acceleration));
+  ABSL_RETURN_IF_ERROR(handler->Initialize());
   return handler;
 }
 
@@ -182,14 +183,16 @@ absl::Status EndOfMultiModalEmbedding::Initialize() {
   LITERT_ASSIGN_OR_RETURN(auto options, Options::Create());
   LITERT_RETURN_IF_ERROR(
       options.SetHardwareAccelerators(hardware_accelerators_));
+
 #if defined(__ANDROID__)
+  LITERT_ASSIGN_OR_RETURN(
+      ::litert::qualcomm::QualcommOptions & qnn_opts,
+      options.GetOptions<::litert::qualcomm::QualcommOptions>());
   if ((hardware_accelerators_ & litert::HwAccelerators::kNpu) != 0) {
-    LITERT_ASSIGN_OR_RETURN(::litert::qualcomm::QualcommOptions & qnn_opts,
-                            options.GetQualcommOptions());
-    qnn_opts.SetLogLevel(::litert::qualcomm::QualcommOptions::LogLevel::kOff);
-    qnn_opts.SetHtpPerformanceMode(
-        ::litert::qualcomm::QualcommOptions::HtpPerformanceMode::
-            kSustainedHighPerformance);
+  qnn_opts.SetLogLevel(::litert::qualcomm::QualcommOptions::LogLevel::kOff);
+  qnn_opts.SetHtpPerformanceMode(
+      ::litert::qualcomm::QualcommOptions::HtpPerformanceMode::
+          kSustainedHighPerformance);
   }
 #endif
 

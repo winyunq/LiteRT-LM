@@ -14,6 +14,7 @@
 
 #include "runtime/executor/llm_litert_compiled_model_executor.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>  // NOLINT: Required for path manipulation.
@@ -22,6 +23,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <random>
 #include <string>
 #include <system_error>  // NOLINT: Required for std::error_code used with std::filesystem.
 #include <tuple>
@@ -31,30 +33,42 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 #include "absl/cleanup/cleanup.h"  // from @com_google_absl
+#include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/memory/memory.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/time/time.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
+#include "litert/cc/litert_buffer_ref.h"  // from @litert
+#include "litert/cc/litert_common.h"  // from @litert
+#include "litert/cc/litert_compiled_model.h"  // from @litert
 #include "litert/cc/litert_element_type.h"  // from @litert
 #include "litert/cc/litert_environment.h"  // from @litert
 #include "litert/cc/litert_layout.h"  // from @litert
 #include "litert/cc/litert_macros.h"  // from @litert
 #include "litert/cc/litert_model.h"  // from @litert
+#include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "litert/test/matchers.h"  // from @litert
-#include "support/tokenizer/tokenizer.h"  // from @litert
-#include "runtime/components/logits_processor/constrained_decoding/constrained_decoder.h"
-#include "runtime/components/logits_processor/constrained_decoding/fake_constraint.h"
+#include "runtime/components/constrained_decoding/constrained_decoder.h"
+#include "runtime/components/constrained_decoding/fake_constraint.h"
+#include "runtime/components/embedding_lookup/embedding_lookup_manager.h"
 #include "runtime/components/model_resources.h"
 #include "runtime/components/model_resources_litert_lm.h"
-#include "runtime/components/model_resources_task.h"
+#include "runtime/components/sampler.h"
 #include "runtime/executor/executor_settings_base.h"
+#include "runtime/executor/executor_stats.h"
+#include "runtime/executor/litert_compiled_model_executor_utils.h"
 #include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/executor/llm_executor_settings.h"
+#include "runtime/executor/llm_executor_settings_utils.h"
+#include "runtime/executor/speculative_decoding_mode.h"
+#include "runtime/proto/llm_metadata.pb.h"
+#include "runtime/proto/sampler_params.pb.h"
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/litert_lm_loader.h"
-#include "runtime/util/model_asset_bundle_resources.h"
 #include "runtime/util/scoped_file.h"
 #include "runtime/util/status_macros.h"
 #include "runtime/util/test_utils.h"  // IWYU pragma: keep
@@ -62,74 +76,318 @@
 namespace litert::lm {
 namespace {
 
+using ::testing::status::StatusIs;
+
 constexpr char kTestStaticModelPath[] =
-    "litert_lm/runtime/testdata/test_lm.task";
+    "litert_lm/runtime/testdata/test_lm.litertlm";
 
 // Test model with dynamic sequence and context length dimensions.
 constexpr char kTestDynamicModelPath[] =
     "litert_lm/runtime/testdata/test_lm_dynamic.litertlm";
 
+constexpr char kDummyEmbedderModelPath[] =
+    "litert_lm/runtime/testdata/dummy_embedder.tflite";
+
 const int kMaxNumTokens = 32;
 const int kNumThreads = 4;
 
 absl::StatusOr<std::unique_ptr<ModelResources>>
-CreateExecutorModelResourcesTask(absl::string_view model_path) {
-  auto scoped_file = ScopedFile::Open(model_path);
-  auto resources = ModelAssetBundleResources::Create(
-      /*tag=*/"", std::move(*scoped_file));
-  auto model_resources = ModelResourcesTask::Create(std::move(*resources));
-  return model_resources;
+CreateExecutorModelResourcesLitertLm(absl::string_view model_path) {
+  ABSL_ASSIGN_OR_RETURN(auto scoped_file, ScopedFile::Open(model_path));
+  ABSL_ASSIGN_OR_RETURN(auto loader,
+                        LitertLmLoader::Create(std::move(scoped_file)));
+  return ModelResourcesLitertLm::Create(std::move(loader));
 }
 
-absl::StatusOr<std::unique_ptr<ModelResources>>
-CreateExecutorModelResourcesLitertLm(absl::string_view model_path) {
-  ASSIGN_OR_RETURN(auto scoped_file, ScopedFile::Open(model_path));
-  ASSIGN_OR_RETURN(auto loader, LitertLmLoader::Create(std::move(scoped_file)));
-  return ModelResourcesLitertLm::Create(std::move(loader));
+ExecutorInputs MakeTextInputs(absl::Span<const int> tokens) {
+  auto buffer =
+      CopyToTensorBuffer<int>(tokens, {1, static_cast<int>(tokens.size())});
+  ExecutorInputs inputs;
+  inputs.SetTextData(ExecutorTextData(std::move(*buffer)));
+  return inputs;
+}
+
+// Creates a CPU static executor for `model_path` (relative to SrcDir). The
+// returned ModelResources must outlive the executor.
+absl::StatusOr<std::pair<std::unique_ptr<ModelResources>,
+                         std::unique_ptr<LlmLiteRtCompiledModelExecutorStatic>>>
+CreateStaticCpuExecutor(Environment& env, absl::string_view model_path) {
+  auto path = std::filesystem::path(::testing::SrcDir()) / model_path;
+  ABSL_ASSIGN_OR_RETURN(auto model_resources,
+                        CreateExecutorModelResourcesLitertLm(path.string()));
+  ABSL_ASSIGN_OR_RETURN(auto model_assets, ModelAssets::Create(path.string()));
+  ABSL_ASSIGN_OR_RETURN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
+  CpuConfig config;
+  config.number_of_threads = kNumThreads;
+  executor_settings.SetBackendConfig(config);
+  ABSL_ASSIGN_OR_RETURN(auto executor,
+                        LlmLiteRtCompiledModelExecutorStatic::Create(
+                            executor_settings, env, *model_resources));
+  return std::make_pair(std::move(model_resources), std::move(executor));
+}
+
+// Installs a pre-graph-run callback that copies the first `num_floats` values
+// of the prefill "embeddings" input, i.e. the first token slot, into
+// `*captured`.
+void CaptureFirstPrefillEmbedding(LlmLiteRtCompiledModelExecutorBase& executor,
+                                  size_t num_floats,
+                                  std::vector<float>* captured) {
+  captured->clear();
+  executor.UpdatePreGraphRunCallback(
+      [num_floats, captured](
+          absl::string_view signature_name, int current_step,
+          absl::flat_hash_map<absl::string_view, TensorBuffer>&
+              tensor_buffers) {
+        if (signature_name == "decode") return;
+        auto emb_it = tensor_buffers.find("embeddings");
+        ASSERT_NE(emb_it, tensor_buffers.end());
+        auto emb_span = ReferTensorBufferAsSpan<float>(emb_it->second);
+        ASSERT_TRUE(emb_span);
+        ASSERT_GE(emb_span->size(), num_floats);
+        captured->assign(emb_span->begin(), emb_span->begin() + num_floats);
+      });
 }
 
 TEST(LlmLiteRtCompiledModelExecutorStaticTest,
      CreateExecutorTest_WithoutCache) {
   auto model_path =
       std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
-  ASSERT_OK_AND_ASSIGN(auto model_resources,
-                       CreateExecutorModelResourcesTask(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
   ASSERT_OK_AND_ASSIGN(auto model_assets,
                        ModelAssets::Create(model_path.string()));
-  auto executor_settings =
-      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU);
-  executor_settings->SetCacheDir(":nocache");
-  executor_settings->SetMaxNumTokens(kMaxNumTokens);
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
   ::litert::lm::CpuConfig config;
   config.number_of_threads = kNumThreads;
-  executor_settings->SetBackendConfig(config);
+  executor_settings.SetBackendConfig(config);
   LITERT_ASSERT_OK_AND_ASSIGN(
       auto env, Environment::Create(std::vector<Environment::Option>()));
   auto executor = LlmLiteRtCompiledModelExecutorStatic::Create(
-      *executor_settings, env, *model_resources);
+      executor_settings, env, *model_resources);
   ASSERT_OK(executor);
   ASSERT_NE(*executor, nullptr);
+}
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest,
+     CreateExecutorTest_SelectedSignatures) {
+  struct SelectionCase {
+    std::vector<std::string> keys;
+    bool valid;
+  };
+  const SelectionCase cases[] = {
+      {{}, true},
+      {{"decode", "prefill_16"}, true},
+      {{"prefill_64", "decode"}, true},
+      // At least one prefill and decode should be selected.
+      {{"decode"}, false},
+      {{"prefill_16"}, false},
+      {{"decode", "missing"}, false},
+      {{"decode", "prefill_16", "decode"}, false},
+  };
+  for (const auto& test_case : cases) {
+    SCOPED_TRACE(::testing::PrintToString(test_case.keys));
+    auto model_path =
+        std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
+    ASSERT_OK_AND_ASSIGN(
+        auto model_resources,
+        CreateExecutorModelResourcesLitertLm(model_path.string()));
+    ASSERT_OK_AND_ASSIGN(auto model_assets,
+                         ModelAssets::Create(model_path.string()));
+    ASSERT_OK_AND_ASSIGN(auto settings, LlmExecutorSettings::CreateDefault(
+                                            model_assets, Backend::CPU));
+    settings.SetCacheDir(":nocache");
+    settings.SetMaxNumTokens(kMaxNumTokens);
+    settings.SetSelectedSignatures(test_case.keys);
+    CpuConfig config;
+    config.number_of_threads = kNumThreads;
+    settings.SetBackendConfig(config);
+    LITERT_ASSERT_OK_AND_ASSIGN(auto env, Environment::Create({}));
+    auto executor = LlmLiteRtCompiledModelExecutorStatic::Create(
+        settings, env, *model_resources);
+    if (test_case.valid) {
+      ASSERT_OK(executor);
+      ASSERT_NE(*executor, nullptr);
+    } else {
+      EXPECT_THAT(executor, StatusIs(absl::StatusCode::kInvalidArgument));
+    }
+  }
+}
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest,
+     CreateExecutorTest_FromPreCompiledModel) {
+  auto model_path =
+      std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
+  ::litert::lm::CpuConfig config;
+  config.number_of_threads = kNumThreads;
+  executor_settings.SetBackendConfig(config);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+
+  ASSERT_OK_AND_ASSIGN(const litert::Model* litert_model,
+                       model_resources->GetTFLiteModel(
+                           proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
+  ASSERT_NE(litert_model, nullptr);
+
+  LITERT_ASSERT_OK_AND_ASSIGN(auto decode_signature,
+                              litert_model->FindSignature("decode"));
+  ASSERT_OK_AND_ASSIGN(
+      ModelSignatures signatures,
+      GetModelSignaturesFromInputOutputNames(decode_signature.InputNames(),
+                                             decode_signature.OutputNames()));
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto compilation_options,
+      CreateCompilationOptions(executor_settings, ActivationDataType::FLOAT32,
+                               &signatures));
+
+  ASSERT_OK_AND_ASSIGN(auto model_buffer_view,
+                       model_resources->GetTFLiteModelBuffer(
+                           proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
+  litert::BufferRef<uint8_t> model_buffer(
+      reinterpret_cast<const uint8_t*>(model_buffer_view.data()),
+      model_buffer_view.size());
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto compiled_model,
+      CompiledModel::Create(env, model_buffer, compilation_options));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto executor,
+      LlmLiteRtCompiledModelExecutorStatic::Create(
+          executor_settings, env,
+          std::make_unique<CompiledModel>(std::move(compiled_model)),
+          model_resources.get()));
+  ASSERT_NE(executor, nullptr);
+
+  ExecutorInputs inputs;
+  const std::vector<int> input_tokens = {1, 2, 0};
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto input_tokens_buffer,
+      CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 3}));
+  inputs.SetTextData(ExecutorTextData(std::move(input_tokens_buffer)));
+  EXPECT_OK(executor->Prefill(inputs));
+  ASSERT_OK_AND_ASSIGN(auto current_step, executor->GetCurrentStep());
+  EXPECT_EQ(current_step, 3);
+}
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest,
+     CreateExecutorTest_WithProfiling) {
+  auto model_path =
+      std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
+  executor_settings.SetAdvancedSettings(AdvancedSettings{
+      .enable_profiling = true,
+  });
+  ::litert::lm::CpuConfig config;
+  config.number_of_threads = kNumThreads;
+  executor_settings.SetBackendConfig(config);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  ASSERT_OK_AND_ASSIGN(auto executor,
+                       LlmLiteRtCompiledModelExecutorStatic::Create(
+                           executor_settings, env, *model_resources));
+  ASSERT_NE(executor, nullptr);
+
+  ExecutorInputs inputs;
+  const std::vector<int> input_tokens = {1, 2, 0};
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto input_tokens_buffer,
+      CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 3}));
+  inputs.SetTextData(ExecutorTextData(std::move(input_tokens_buffer)));
+
+  EXPECT_OK(executor->Prefill(inputs));
+
+  ASSERT_OK_AND_ASSIGN(auto summary, executor->GetProfileSummary());
+  EXPECT_FALSE(summary.empty());
+}
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest,
+     CreateExecutorTest_WithoutProfiling) {
+  auto model_path =
+      std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
+  executor_settings.SetAdvancedSettings(AdvancedSettings{
+      .enable_profiling = false,
+  });
+  ::litert::lm::CpuConfig config;
+  config.number_of_threads = kNumThreads;
+  executor_settings.SetBackendConfig(config);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  ASSERT_OK_AND_ASSIGN(auto executor,
+                       LlmLiteRtCompiledModelExecutorStatic::Create(
+                           executor_settings, env, *model_resources));
+  ASSERT_NE(executor, nullptr);
+
+  ExecutorInputs inputs;
+  const std::vector<int> input_tokens = {1, 2, 0};
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto input_tokens_buffer,
+      CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 3}));
+  inputs.SetTextData(ExecutorTextData(std::move(input_tokens_buffer)));
+
+  EXPECT_OK(executor->Prefill(inputs));
+
+  auto summary = executor->GetProfileSummary();
+  EXPECT_EQ(summary.status().code(), absl::StatusCode::kFailedPrecondition);
 }
 
 TEST(LlmLiteRtCompiledModelExecutorStaticTest, PrefillTest) {
   auto model_path =
       std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
-  ASSERT_OK_AND_ASSIGN(auto model_resources,
-                       CreateExecutorModelResourcesTask(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
   ASSERT_OK_AND_ASSIGN(auto model_assets,
                        ModelAssets::Create(model_path.string()));
-  auto executor_settings =
-      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU);
-  executor_settings->SetCacheDir(":nocache");
-  executor_settings->SetMaxNumTokens(kMaxNumTokens);
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
   ::litert::lm::CpuConfig config;
   config.number_of_threads = kNumThreads;
-  executor_settings->SetBackendConfig(config);
+  executor_settings.SetBackendConfig(config);
   LITERT_ASSERT_OK_AND_ASSIGN(
       auto env, Environment::Create(std::vector<Environment::Option>()));
   ASSERT_OK_AND_ASSIGN(auto executor,
                        LlmLiteRtCompiledModelExecutorStatic::Create(
-                           *executor_settings, env, *model_resources));
+                           executor_settings, env, *model_resources));
   ASSERT_NE(executor, nullptr);
 
   ExecutorInputs inputs;
@@ -148,26 +406,177 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest, PrefillTest) {
   EXPECT_EQ(current_step, 3);
 }
 
-TEST(LlmLiteRtCompiledModelExecutorStaticTest, DecodeTest) {
+TEST(LlmLiteRtCompiledModelExecutorStaticTest, ResetTest) {
   auto model_path =
       std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
-  ASSERT_OK_AND_ASSIGN(auto model_resources,
-                       CreateExecutorModelResourcesTask(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
   ASSERT_OK_AND_ASSIGN(auto model_assets,
                        ModelAssets::Create(model_path.string()));
-  auto executor_settings =
-      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU);
-  executor_settings->SetCacheDir(":nocache");
-  executor_settings->SetMaxNumTokens(kMaxNumTokens);
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
   ::litert::lm::CpuConfig config;
   config.number_of_threads = kNumThreads;
-  executor_settings->SetBackendConfig(config);
+  executor_settings.SetBackendConfig(config);
   LITERT_ASSERT_OK_AND_ASSIGN(
       auto env, Environment::Create(std::vector<Environment::Option>()));
   ASSERT_OK_AND_ASSIGN(auto executor,
                        LlmLiteRtCompiledModelExecutorStatic::Create(
-                           *executor_settings, env, *model_resources));
+                           executor_settings, env, *model_resources));
   ASSERT_NE(executor, nullptr);
+
+  ExecutorInputs inputs;
+  const std::vector<int> input_tokens = {1, 2, 0};
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto input_tokens_buffer,
+      CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 3}));
+  inputs.SetTextData(ExecutorTextData(std::move(input_tokens_buffer)));
+
+  EXPECT_OK(executor->Prefill(inputs));
+
+  {
+    ASSERT_OK_AND_ASSIGN(auto current_step, executor->GetCurrentStep());
+    EXPECT_EQ(current_step, 3);
+  }
+
+  EXPECT_OK(executor->Reset());
+
+  {
+    ASSERT_OK_AND_ASSIGN(auto current_step, executor->GetCurrentStep());
+    EXPECT_EQ(current_step, 0);
+  }
+
+  const std::vector<int> second_input_tokens = {3, 4, 5};
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto second_input_tokens_buffer,
+      CopyToTensorBuffer<int>(absl::MakeSpan(second_input_tokens), {1, 3}));
+  ExecutorInputs second_inputs;
+  second_inputs.SetTextData(
+      ExecutorTextData(std::move(second_input_tokens_buffer)));
+
+  EXPECT_OK(executor->Prefill(second_inputs));
+
+  {
+    ASSERT_OK_AND_ASSIGN(auto current_step, executor->GetCurrentStep());
+    EXPECT_EQ(current_step, 3);
+  }
+}
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest,
+     PrefillExceedsStateEntriesErrorTest) {
+  auto model_path =
+      std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
+  ::litert::lm::CpuConfig config;
+  config.number_of_threads = kNumThreads;
+  executor_settings.SetBackendConfig(config);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  ASSERT_OK_AND_ASSIGN(auto executor,
+                       LlmLiteRtCompiledModelExecutorStatic::Create(
+                           executor_settings, env, *model_resources));
+  ASSERT_NE(executor, nullptr);
+
+  // Create a tensor buffer with 165 tokens, which requires work groups total >
+  // max state entries (160).
+  const std::vector<int> input_tokens(165, 1);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto input_tokens_buffer,
+      CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 165}));
+  ExecutorInputs inputs;
+  inputs.SetTextData(ExecutorTextData(std::move(input_tokens_buffer)));
+
+  EXPECT_THAT(executor->Prefill(inputs),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+}
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest,
+     PrefillExceedsRemainingStateEntriesErrorTest) {
+  auto model_path =
+      std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
+  ::litert::lm::CpuConfig config;
+  config.number_of_threads = kNumThreads;
+  executor_settings.SetBackendConfig(config);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  ASSERT_OK_AND_ASSIGN(auto executor,
+                       LlmLiteRtCompiledModelExecutorStatic::Create(
+                           executor_settings, env, *model_resources));
+  ASSERT_NE(executor, nullptr);
+
+  // First prefill of 100 tokens (within 128 capacity).
+  const std::vector<int> first_input_tokens(100, 1);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto first_buffer,
+      CopyToTensorBuffer<int>(absl::MakeSpan(first_input_tokens), {1, 100}));
+  ExecutorInputs first_inputs;
+  first_inputs.SetTextData(ExecutorTextData(std::move(first_buffer)));
+  EXPECT_OK(executor->Prefill(first_inputs));
+
+  // Second prefill of 30 tokens. Current step is 100, remaining capacity is 28.
+  const std::vector<int> second_input_tokens(30, 1);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto second_buffer,
+      CopyToTensorBuffer<int>(absl::MakeSpan(second_input_tokens), {1, 30}));
+  ExecutorInputs second_inputs;
+  second_inputs.SetTextData(ExecutorTextData(std::move(second_buffer)));
+  EXPECT_THAT(executor->Prefill(second_inputs),
+              StatusIs(absl::StatusCode::kFailedPrecondition));
+}
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest, DecodeTest) {
+  auto model_path =
+      std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
+  ::litert::lm::CpuConfig config;
+  config.number_of_threads = kNumThreads;
+  executor_settings.SetBackendConfig(config);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  ASSERT_OK_AND_ASSIGN(auto executor,
+                       LlmLiteRtCompiledModelExecutorStatic::Create(
+                           executor_settings, env, *model_resources));
+  ASSERT_NE(executor, nullptr);
+
+  // An explicitly present but unspecified sampler config should use the
+  // default CPU sampler rather than disabling sampling.
+  RuntimeConfig runtime_config;
+  runtime_config.sampler_params = proto::SamplerParameters();
+  ASSERT_OK_AND_ASSIGN(
+      auto context, executor->CreateNewContext(std::nullopt, runtime_config));
+  ASSERT_OK(executor->RestoreContext(std::move(context)));
 
   ExecutorInputs inputs;
   // Create a tensor buffer with 3 elements.
@@ -192,7 +601,7 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest, DecodeTest) {
 
     ASSERT_EQ(output_tokens.size(), 1);
     ASSERT_EQ(output_tokens[0].size(), 1);
-    EXPECT_EQ(output_tokens[0][0], 8005);
+    EXPECT_EQ(output_tokens[0][0], 126670);
   }
 
   {
@@ -203,29 +612,302 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest, DecodeTest) {
 
     ASSERT_EQ(output_tokens.size(), 1);
     ASSERT_EQ(output_tokens[0].size(), 1);
-    EXPECT_EQ(output_tokens[0][0], 52530);
+    EXPECT_EQ(output_tokens[0][0], 126670);
   }
+}
+
+class FakeInvalidTokenSampler : public Sampler {
+ public:
+  absl::Status SampleToIdAndScoreBuffer(const TensorBuffer& logits_tensor,
+                                        TensorBuffer& ids_tensor,
+                                        TensorBuffer* scores_tensor) override {
+    LITERT_ASSIGN_OR_RETURN(auto lock_and_addr,
+                            TensorBufferScopedLock::Create(
+                                ids_tensor, TensorBuffer::LockMode::kWrite));
+    int* ptr = static_cast<int*>(const_cast<void*>(lock_and_addr.second));
+    ptr[0] = -1;
+    return absl::OkStatus();
+  }
+
+  absl::Status UpdateConfig(
+      const proto::SamplerParameters& sampler_params, int batch_size,
+      std::shared_ptr<std::default_random_engine> rand_gen) override {
+    return absl::OkStatus();
+  }
+};
+
+class FakeSamplerWithInputHandling : public Sampler {
+ public:
+  bool CanHandleInput() const override { return true; }
+  bool HandlesInput() const override { return inference_func_ != nullptr; }
+
+  absl::Status SetInferenceFuncAndInputTensors(
+      int (*run_inference_func)(void* arg), void* arg,
+      const TensorBuffer* ids_tensor,
+      const TensorBuffer* prev_input_positions_tensor,
+      const TensorBuffer* input_positions_tensor,
+      const TensorBuffer* prev_mask_tensor, const TensorBuffer* mask_tensor,
+      const TensorBuffer* prev_param_tensor,
+      const TensorBuffer* param_tensor) override {
+    inference_func_ = run_inference_func;
+    arg_ = arg;
+    prev_input_positions_tensor_ = prev_input_positions_tensor;
+    input_positions_tensor_ = input_positions_tensor;
+    if (run_inference_func != nullptr) {
+      set_count_++;
+    } else {
+      reset_count_++;
+    }
+    return absl::OkStatus();
+  }
+
+  absl::Status SampleToIdAndScoreBuffer(const TensorBuffer& logits_tensor,
+                                        TensorBuffer& ids_tensor,
+                                        TensorBuffer* scores_tensor) override {
+    sample_count_++;
+    LITERT_ASSIGN_OR_RETURN(auto lock_and_addr,
+                            TensorBufferScopedLock::Create(
+                                ids_tensor, TensorBuffer::LockMode::kWrite));
+    int* ptr = static_cast<int*>(const_cast<void*>(lock_and_addr.second));
+    ptr[0] = sample_count_;
+
+    if (inference_func_ != nullptr) {
+      inference_called_count_++;
+    }
+    return absl::OkStatus();
+  }
+
+  absl::Status UpdateConfig(
+      const proto::SamplerParameters& sampler_params, int batch_size,
+      std::shared_ptr<std::default_random_engine> rand_gen) override {
+    return absl::OkStatus();
+  }
+
+  int set_count() const { return set_count_; }
+  int reset_count() const { return reset_count_; }
+  int sample_count() const { return sample_count_; }
+  int inference_called_count() const { return inference_called_count_; }
+
+ private:
+  int (*inference_func_)(void* arg) = nullptr;
+  void* arg_ = nullptr;
+  const TensorBuffer* prev_input_positions_tensor_ = nullptr;
+  const TensorBuffer* input_positions_tensor_ = nullptr;
+  int set_count_ = 0;
+  int reset_count_ = 0;
+  int sample_count_ = 0;
+  int inference_called_count_ = 0;
+};
+
+class TestableLlmLiteRtCompiledModelExecutorStatic
+    : public LlmLiteRtCompiledModelExecutorStatic {
+ public:
+  static void SetSamplerForTest(LlmLiteRtCompiledModelExecutorStatic* executor,
+                                std::unique_ptr<Sampler> sampler) {
+    auto* testable =
+        static_cast<TestableLlmLiteRtCompiledModelExecutorStatic*>(executor);
+    testable->sampler_ = std::move(sampler);
+    testable->sampler_handles_input_ = false;
+  }
+
+  static void SetSamplerWithInputHandlingForTest(
+      LlmLiteRtCompiledModelExecutorStatic* executor,
+      std::unique_ptr<Sampler> sampler) {
+    auto* testable =
+        static_cast<TestableLlmLiteRtCompiledModelExecutorStatic*>(executor);
+    testable->sampler_ = std::move(sampler);
+    testable->sampler_handles_input_ = true;
+  }
+};
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest,
+     SamplerInputHandlingMultiTurnTest) {
+  auto model_path =
+      std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
+  executor_settings.SetAdvancedSettings(AdvancedSettings{
+      .sampler_handles_input = true,
+  });
+  ::litert::lm::CpuConfig config;
+  config.number_of_threads = kNumThreads;
+  executor_settings.SetBackendConfig(config);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  ASSERT_OK_AND_ASSIGN(auto executor,
+                       LlmLiteRtCompiledModelExecutorStatic::Create(
+                           executor_settings, env, *model_resources));
+  ASSERT_NE(executor, nullptr);
+
+  auto fake_sampler = std::make_unique<FakeSamplerWithInputHandling>();
+  auto* fake_sampler_ptr = fake_sampler.get();
+  TestableLlmLiteRtCompiledModelExecutorStatic::
+      SetSamplerWithInputHandlingForTest(executor.get(),
+                                         std::move(fake_sampler));
+
+  // Turn 1 Prefill
+  ExecutorInputs inputs1;
+  const std::vector<int> turn1_tokens = {1, 2, 3};
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto input_tokens_buffer1,
+      CopyToTensorBuffer<int>(absl::MakeSpan(turn1_tokens), {1, 3}));
+  inputs1.SetTextData(ExecutorTextData(std::move(input_tokens_buffer1)));
+  EXPECT_OK(executor->Prefill(inputs1));
+
+  // Turn 1 Decode - Step 1
+  ASSERT_OK_AND_ASSIGN(auto out_tokens1_step1, executor->Decode());
+  EXPECT_EQ(fake_sampler_ptr->set_count(), 1);
+  EXPECT_EQ(fake_sampler_ptr->inference_called_count(), 1);
+
+  // Turn 1 Decode - Step 2
+  ASSERT_OK_AND_ASSIGN(auto out_tokens1_step2, executor->Decode());
+  EXPECT_EQ(fake_sampler_ptr->inference_called_count(), 2);
+
+  // Turn 2 Prefill (should reset sampler input handling)
+  ExecutorInputs inputs2;
+  const std::vector<int> turn2_tokens = {4, 5};
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto input_tokens_buffer2,
+      CopyToTensorBuffer<int>(absl::MakeSpan(turn2_tokens), {1, 2}));
+  inputs2.SetTextData(ExecutorTextData(std::move(input_tokens_buffer2)));
+  EXPECT_OK(executor->Prefill(inputs2));
+
+  // Sampler input handling should be reset during prefill
+  EXPECT_GT(fake_sampler_ptr->reset_count(), 0);
+  EXPECT_FALSE(fake_sampler_ptr->HandlesInput());
+
+  // Turn 2 Decode - Step 1
+  ASSERT_OK_AND_ASSIGN(auto out_tokens2_step1, executor->Decode());
+  // Input handling should be re-enabled on first decode step of Turn 2
+  EXPECT_GT(fake_sampler_ptr->set_count(), 1);
+  EXPECT_EQ(fake_sampler_ptr->inference_called_count(), 3);
+
+  // Turn 2 Decode - Step 2
+  ASSERT_OK_AND_ASSIGN(auto out_tokens2_step2, executor->Decode());
+  EXPECT_EQ(fake_sampler_ptr->inference_called_count(), 4);
+}
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest,
+     ErrorOnInvalidSampledTokenId_True) {
+  auto model_path =
+      std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
+  executor_settings.SetAdvancedSettings(AdvancedSettings{
+      .error_on_invalid_sampled_token_id = true,
+  });
+  ::litert::lm::CpuConfig config;
+  config.number_of_threads = kNumThreads;
+  executor_settings.SetBackendConfig(config);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  ASSERT_OK_AND_ASSIGN(auto executor,
+                       LlmLiteRtCompiledModelExecutorStatic::Create(
+                           executor_settings, env, *model_resources));
+  ASSERT_NE(executor, nullptr);
+
+  ExecutorInputs inputs;
+  const std::vector<int> input_tokens = {1, 2, 0};
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto input_tokens_buffer,
+      CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 3}));
+  inputs.SetTextData(ExecutorTextData(std::move(input_tokens_buffer)));
+
+  EXPECT_OK(executor->Prefill(inputs));
+
+  TestableLlmLiteRtCompiledModelExecutorStatic::SetSamplerForTest(
+      executor.get(), std::make_unique<FakeInvalidTokenSampler>());
+
+  auto decode_status = executor->Decode();
+  EXPECT_EQ(decode_status.status().code(), absl::StatusCode::kInternal);
+  EXPECT_THAT(
+      decode_status.status().message(),
+      ::testing::HasSubstr(
+          "Invalid decode and sample result. The sampled token is negative."));
+}
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest,
+     ErrorOnInvalidSampledTokenId_False) {
+  auto model_path =
+      std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
+  executor_settings.SetAdvancedSettings(AdvancedSettings{
+      .error_on_invalid_sampled_token_id = false,
+  });
+  ::litert::lm::CpuConfig config;
+  config.number_of_threads = kNumThreads;
+  executor_settings.SetBackendConfig(config);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  ASSERT_OK_AND_ASSIGN(auto executor,
+                       LlmLiteRtCompiledModelExecutorStatic::Create(
+                           executor_settings, env, *model_resources));
+  ASSERT_NE(executor, nullptr);
+
+  ExecutorInputs inputs;
+  const std::vector<int> input_tokens = {1, 2, 0};
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto input_tokens_buffer,
+      CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 3}));
+  inputs.SetTextData(ExecutorTextData(std::move(input_tokens_buffer)));
+
+  EXPECT_OK(executor->Prefill(inputs));
+
+  TestableLlmLiteRtCompiledModelExecutorStatic::SetSamplerForTest(
+      executor.get(), std::make_unique<FakeInvalidTokenSampler>());
+
+  ASSERT_OK_AND_ASSIGN(auto output_tokens, executor->Decode());
+  ASSERT_EQ(output_tokens.size(), 1);
+  ASSERT_EQ(output_tokens[0].size(), 1);
+  EXPECT_EQ(output_tokens[0][0], 0);
 }
 
 TEST(LlmLiteRtCompiledModelExecutorStaticTest, ConstrainedDecodeTest) {
   auto model_path =
       std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
-  ASSERT_OK_AND_ASSIGN(auto model_resources,
-                       CreateExecutorModelResourcesTask(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
   ASSERT_OK_AND_ASSIGN(auto model_assets,
                        ModelAssets::Create(model_path.string()));
-  auto executor_settings =
-      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU);
-  executor_settings->SetCacheDir(":nocache");
-  executor_settings->SetMaxNumTokens(kMaxNumTokens);
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
   ::litert::lm::CpuConfig config;
   config.number_of_threads = kNumThreads;
-  executor_settings->SetBackendConfig(config);
+  executor_settings.SetBackendConfig(config);
   LITERT_ASSERT_OK_AND_ASSIGN(
       auto env, Environment::Create(std::vector<Environment::Option>()));
   ASSERT_OK_AND_ASSIGN(auto executor,
                        LlmLiteRtCompiledModelExecutorStatic::Create(
-                           *executor_settings, env, *model_resources));
+                           executor_settings, env, *model_resources));
   ASSERT_NE(executor, nullptr);
 
   ExecutorInputs inputs;
@@ -246,11 +928,10 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest, ConstrainedDecodeTest) {
   ExecutorDecodeParams params;
 
   auto constraint = FakeConstraint({2, 3}, /*vocabulary_size=*/262144);
-  ConstrainedDecoder constraint_decoder =
-      ConstrainedDecoder(&constraint, /*batch_size=*/1);
-  params.SetLogitsProcessorList({
-      &constraint_decoder,
-  });
+  ASSERT_OK_AND_ASSIGN(auto constrained_decoder,
+                       ConstrainedDecoder::Create(&constraint, /*batch_size=*/1,
+                                                  env, HwAccelerators::kCpu));
+  params.SetConstrainedDecoder(constrained_decoder.get());
 
   {
     ASSERT_OK_AND_ASSIGN(auto output_tokens, executor->Decode(params));
@@ -278,22 +959,24 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest, ConstrainedDecodeTest) {
 TEST(LlmLiteRtCompiledModelExecutorStaticTest, DecodeLogitsTest) {
   auto model_path =
       std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
-  ASSERT_OK_AND_ASSIGN(auto model_resources,
-                       CreateExecutorModelResourcesTask(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
   ASSERT_OK_AND_ASSIGN(auto model_assets,
                        ModelAssets::Create(model_path.string()));
-  auto executor_settings =
-      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU);
-  executor_settings->SetCacheDir(":nocache");
-  executor_settings->SetMaxNumTokens(kMaxNumTokens);
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
   ::litert::lm::CpuConfig config;
   config.number_of_threads = kNumThreads;
-  executor_settings->SetBackendConfig(config);
+  executor_settings.SetBackendConfig(config);
   LITERT_ASSERT_OK_AND_ASSIGN(
       auto env, Environment::Create(std::vector<Environment::Option>()));
   ASSERT_OK_AND_ASSIGN(auto executor,
                        LlmLiteRtCompiledModelExecutorStatic::Create(
-                           *executor_settings, env, *model_resources));
+                           executor_settings, env, *model_resources));
   ASSERT_NE(executor, nullptr);
 
   ExecutorInputs inputs;
@@ -328,14 +1011,48 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest, DecodeLogitsTest) {
 TEST(LlmLiteRtCompiledModelExecutorStaticTest, UpdateExecutorSettingsTest) {
   auto model_path =
       std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
-  ASSERT_OK_AND_ASSIGN(auto model_resources,
-                       CreateExecutorModelResourcesTask(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
+
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  ASSERT_OK_AND_ASSIGN(auto executor,
+                       LlmLiteRtCompiledModelExecutorStatic::Create(
+                           executor_settings, env, *model_resources));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto new_executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::GPU));
+  new_executor_settings.SetMaxNumTokens(kMaxNumTokens + 1);
+
+  EXPECT_OK(executor->UpdateExecutorSettings(new_executor_settings));
+
+  ASSERT_OK_AND_ASSIGN(auto updated_settings, executor->GetExecutorSettings());
+  EXPECT_EQ(updated_settings.GetBackend(), Backend::GPU);
+  EXPECT_EQ(updated_settings.GetMaxNumTokens(), kMaxNumTokens + 1);
+}
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest,
+     CreateExecutorClampsMaxNumTokensToModelLimit) {
+  auto model_path =
+      std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
   ASSERT_OK_AND_ASSIGN(auto model_assets,
                        ModelAssets::Create(model_path.string()));
   auto executor_settings =
       LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU);
   ASSERT_OK(executor_settings);
-  executor_settings->SetMaxNumTokens(kMaxNumTokens);
+  // Request more tokens than the static model supports (1024 > 128).
+  executor_settings->SetMaxNumTokens(1024);
 
   LITERT_ASSERT_OK_AND_ASSIGN(
       auto env, Environment::Create(std::vector<Environment::Option>()));
@@ -343,16 +1060,18 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest, UpdateExecutorSettingsTest) {
                        LlmLiteRtCompiledModelExecutorStatic::Create(
                            *executor_settings, env, *model_resources));
 
-  auto new_executor_settings =
-      LlmExecutorSettings::CreateDefault(model_assets, Backend::GPU);
-  ASSERT_OK(new_executor_settings);
-  new_executor_settings->SetMaxNumTokens(kMaxNumTokens + 1);
+  ASSERT_OK_AND_ASSIGN(auto actual_settings, executor->GetExecutorSettings());
+  EXPECT_EQ(actual_settings.GetMaxNumTokens(), 128);
 
+  // Updating executor settings with an excessive token count should also clamp.
+  auto new_executor_settings =
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU);
+  ASSERT_OK(new_executor_settings);
+  new_executor_settings->SetMaxNumTokens(2048);
   EXPECT_OK(executor->UpdateExecutorSettings(*new_executor_settings));
 
   ASSERT_OK_AND_ASSIGN(auto updated_settings, executor->GetExecutorSettings());
-  EXPECT_EQ(updated_settings.GetBackend(), Backend::GPU);
-  EXPECT_EQ(updated_settings.GetMaxNumTokens(), kMaxNumTokens + 1);
+  EXPECT_EQ(updated_settings.GetMaxNumTokens(), 128);
 }
 
 TEST(LlmLiteRtCompiledModelExecutorStaticTest, CreateExecutorTest_WithCache) {
@@ -365,21 +1084,23 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest, CreateExecutorTest_WithCache) {
 
   auto model_path =
       std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
-  ASSERT_OK_AND_ASSIGN(auto model_resources,
-                       CreateExecutorModelResourcesTask(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
   ASSERT_OK_AND_ASSIGN(auto model_assets,
                        ModelAssets::Create(model_path.string()));
-  auto executor_settings =
-      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU);
-  executor_settings->SetCacheDir(cache_path.string());
-  executor_settings->SetMaxNumTokens(kMaxNumTokens);
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(cache_path.string());
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
   ::litert::lm::CpuConfig config;
   config.number_of_threads = kNumThreads;
-  executor_settings->SetBackendConfig(config);
+  executor_settings.SetBackendConfig(config);
   LITERT_ASSERT_OK_AND_ASSIGN(
       auto env, Environment::Create(std::vector<Environment::Option>()));
   auto executor = LlmLiteRtCompiledModelExecutorStatic::Create(
-      *executor_settings, env, *model_resources);
+      executor_settings, env, *model_resources);
   ASSERT_OK(executor);
   ASSERT_NE(*executor, nullptr);
 }
@@ -409,21 +1130,23 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest,
 
   auto model_path =
       std::filesystem::path(::testing::SrcDir()) / kTestStaticModelPath;
-  ASSERT_OK_AND_ASSIGN(auto model_resources,
-                       CreateExecutorModelResourcesTask(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
   ASSERT_OK_AND_ASSIGN(auto model_assets,
                        ModelAssets::Create(model_path.string()));
-  auto executor_settings =
-      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU);
-  executor_settings->SetScopedCacheFile(shared_scoped_cache_file);
-  executor_settings->SetMaxNumTokens(kMaxNumTokens);
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetScopedCacheFile(shared_scoped_cache_file);
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
   ::litert::lm::CpuConfig config;
   config.number_of_threads = kNumThreads;
-  executor_settings->SetBackendConfig(config);
+  executor_settings.SetBackendConfig(config);
   LITERT_ASSERT_OK_AND_ASSIGN(
       auto env, Environment::Create(std::vector<Environment::Option>()));
   auto executor = LlmLiteRtCompiledModelExecutorStatic::Create(
-      *executor_settings, env, *model_resources);
+      executor_settings, env, *model_resources);
   ASSERT_OK(executor);
   ASSERT_NE(*executor, nullptr);
 }
@@ -448,12 +1171,25 @@ class TfLiteModelResources : public ModelResources {
       : model_(std::move(model)), with_mtp_drafter_(with_mtp_drafter) {}
 
  public:
+  void set_with_mtp_drafter(bool with_mtp_drafter) {
+    with_mtp_drafter_ = with_mtp_drafter;
+  }
+
   // ModelResources implementation:
-  absl::StatusOr<const Model*> GetTFLiteModel(ModelType model_type) override {
-    if (model_type == ModelType::kTfLitePrefillDecode) {
+  using ModelResources::HasTFLiteModel;
+
+  bool HasTFLiteModel(proto::LlmMetadata::TfLiteModelType model_type) override {
+    return model_type == proto::LlmMetadata::TF_LITE_PREFILL_DECODE ||
+           (model_type == proto::LlmMetadata::TF_LITE_MTP_DRAFTER &&
+            with_mtp_drafter_);
+  }
+
+  absl::StatusOr<const Model*> GetTFLiteModel(
+      proto::LlmMetadata::TfLiteModelType model_type) override {
+    if (model_type == proto::LlmMetadata::TF_LITE_PREFILL_DECODE) {
       return &model_;
     }
-    if (model_type == ModelType::kTfLiteMtpDrafter) {
+    if (model_type == proto::LlmMetadata::TF_LITE_MTP_DRAFTER) {
       if (with_mtp_drafter_) {
         // Reuse the same model for testing MTP drafter creation
         return &model_;
@@ -465,7 +1201,7 @@ class TfLiteModelResources : public ModelResources {
   }
 
   absl::StatusOr<absl::string_view> GetTFLiteModelBuffer(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
     return absl::UnimplementedError("GetTFLiteModelBuffer not implemented.");
   }
 
@@ -477,13 +1213,18 @@ class TfLiteModelResources : public ModelResources {
     return absl::UnimplementedError("GetLlmMetadata not implemented.");
   }
 
+  absl::StatusOr<const proto::ExecutorMetadata*> GetExecutorMetadata()
+      override {
+    return absl::UnimplementedError("GetExecutorMetadata not implemented.");
+  }
+
   std::optional<std::string> GetTFLiteModelBackendConstraint(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
     return std::nullopt;
   }
 
   std::optional<std::string> GetTFLiteModelPreferActivationType(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
     return std::nullopt;
   }
 
@@ -492,8 +1233,14 @@ class TfLiteModelResources : public ModelResources {
   }
 
   absl::StatusOr<std::pair<size_t, size_t>> GetWeightsSectionOffset(
-      ModelType model_type) override {
+      proto::LlmMetadata::TfLiteModelType model_type) override {
     return absl::UnimplementedError("GetWeightsSectionOffset not implemented.");
+  }
+
+  absl::StatusOr<FileRegion> GetTFLiteModelSectionFileRegion(
+      proto::LlmMetadata::TfLiteModelType model_type) override {
+    return absl::UnimplementedError(
+        "GetTFLiteModelSectionFileRegion not implemented.");
   }
 
  private:
@@ -521,23 +1268,333 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest,
   EXPECT_TRUE(executor);
 }
 
+TEST(LlmLiteRtCompiledModelExecutorStaticTest,
+     Decode_ExplicitSpeculativeDecoding) {
+  const std::filesystem::path model_path =
+      std::filesystem::path(::testing::SrcDir()) /
+      "litert_lm/runtime/testdata/magic_test_none.tflite";
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto executor_settings,
+                       LlmExecutorSettings::CreateDefault(model_assets));
+
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  ASSERT_OK_AND_ASSIGN(auto model_resources, TfLiteModelResources::Create(
+                                                 model_assets,
+                                                 /*with_mtp_drafter=*/false));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor, LlmLiteRtCompiledModelExecutorStatic::Create(
+                         std::move(executor_settings), env, *model_resources));
+  ASSERT_TRUE(executor);
+
+  // Prefill 5 tokens.
+  ExecutorInputs inputs;
+  const std::vector<int> input_tokens = {1, 2, 3, 4, 5};
+  auto input_tokens_buffer =
+      CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 5});
+  ASSERT_TRUE(input_tokens_buffer);
+  inputs.SetTextData(ExecutorTextData(std::move(*input_tokens_buffer)));
+  ASSERT_OK(executor->Prefill(inputs));
+
+  // Decode with the default (unset) speculative decoding mode succeeds.
+  ASSERT_OK(executor->Decode());
+
+  // Decode with SpeculativeDecodingMode::kOff succeeds.
+  ExecutorDecodeParams decode_params_disabled;
+  decode_params_disabled.SetSpeculativeDecodingConfig(
+      {.mode = SpeculativeDecodingMode::kOff});
+  ASSERT_OK(executor->Decode(decode_params_disabled));
+
+  // Decode with SpeculativeDecodingMode::kOn attempts lazy load and fails
+  // when model does not meet MTP requirements (e.g. embedding lookup).
+  ExecutorDecodeParams decode_params_enabled;
+  decode_params_enabled.SetSpeculativeDecodingConfig(
+      {.mode = SpeculativeDecodingMode::kOn});
+  EXPECT_THAT(executor->Decode(decode_params_enabled),
+              StatusIs(absl::StatusCode::kInternal));
+}
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest,
+     Decode_MtpPrimedIsInvalidatedByNonMtpSteps) {
+  const std::filesystem::path model_path =
+      std::filesystem::path(::testing::SrcDir()) /
+      "litert_lm/runtime/testdata/magic_test_none.tflite";
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto executor_settings,
+                       LlmExecutorSettings::CreateDefault(model_assets));
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  ASSERT_OK_AND_ASSIGN(auto model_resources, TfLiteModelResources::Create(
+                                                 model_assets,
+                                                 /*with_mtp_drafter=*/false));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor, LlmLiteRtCompiledModelExecutorStatic::Create(
+                         std::move(executor_settings), env, *model_resources));
+  ASSERT_TRUE(executor);
+  EXPECT_FALSE(executor->mtp_primed_for_testing());
+
+  // This model has no MTP drafter, so the flag never becomes true on its own.
+  // Set it before each operation to check that the operation clears it.
+  ExecutorInputs inputs;
+  const std::vector<int> input_tokens = {1, 2, 3, 4, 5};
+  auto input_tokens_buffer =
+      CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 5});
+  ASSERT_TRUE(input_tokens_buffer);
+  inputs.SetTextData(ExecutorTextData(std::move(*input_tokens_buffer)));
+  executor->set_mtp_primed_for_testing(true);
+  ASSERT_OK(executor->Prefill(inputs));
+  EXPECT_FALSE(executor->mtp_primed_for_testing());
+
+  // Plain decode.
+  ExecutorDecodeParams decode_params_disabled;
+  decode_params_disabled.SetSpeculativeDecodingConfig(
+      {.mode = SpeculativeDecodingMode::kOff});
+  executor->set_mtp_primed_for_testing(true);
+  ASSERT_OK(executor->Decode(decode_params_disabled));
+  EXPECT_FALSE(executor->mtp_primed_for_testing());
+
+  // Failed MTP attempt.
+  ExecutorDecodeParams decode_params_enabled;
+  decode_params_enabled.SetSpeculativeDecodingConfig(
+      {.mode = SpeculativeDecodingMode::kOn});
+  executor->set_mtp_primed_for_testing(true);
+  EXPECT_THAT(executor->Decode(decode_params_enabled),
+              StatusIs(absl::StatusCode::kInternal));
+  EXPECT_FALSE(executor->mtp_primed_for_testing());
+
+  // Setting the unchanged step keeps the flag; a step change clears it.
+  ASSERT_OK_AND_ASSIGN(int current_step, executor->GetCurrentStep());
+  executor->set_mtp_primed_for_testing(true);
+  ASSERT_OK(executor->SetCurrentStep(current_step));
+  EXPECT_TRUE(executor->mtp_primed_for_testing());
+  ASSERT_OK(executor->SetCurrentStep(3));
+  EXPECT_FALSE(executor->mtp_primed_for_testing());
+
+  // Reset.
+  executor->set_mtp_primed_for_testing(true);
+  ASSERT_OK(executor->Reset());
+  EXPECT_FALSE(executor->mtp_primed_for_testing());
+}
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest,
+     Decode_AccumulatesExecutorStats) {
+  const std::filesystem::path model_path =
+      std::filesystem::path(::testing::SrcDir()) /
+      "litert_lm/runtime/testdata/magic_test_none.tflite";
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto executor_settings,
+                       LlmExecutorSettings::CreateDefault(model_assets));
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  ASSERT_OK_AND_ASSIGN(auto model_resources, TfLiteModelResources::Create(
+                                                 model_assets,
+                                                 /*with_mtp_drafter=*/false));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor, LlmLiteRtCompiledModelExecutorStatic::Create(
+                         std::move(executor_settings), env, *model_resources));
+  ASSERT_TRUE(executor);
+  EXPECT_FALSE(executor->GetExecutorStats().has_value());
+
+  ExecutorInputs inputs;
+  const std::vector<int> input_tokens = {1, 2, 3, 4, 5};
+  auto input_tokens_buffer =
+      CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 5});
+  ASSERT_TRUE(input_tokens_buffer);
+  inputs.SetTextData(ExecutorTextData(std::move(*input_tokens_buffer)));
+  ASSERT_OK(executor->Prefill(inputs));
+  // Prefill records no decode stats.
+  EXPECT_FALSE(executor->GetExecutorStats().has_value());
+
+  ExecutorDecodeParams decode_params_disabled;
+  decode_params_disabled.SetSpeculativeDecodingConfig(
+      {.mode = SpeculativeDecodingMode::kOff});
+  ASSERT_OK(executor->Decode(decode_params_disabled));
+  ASSERT_OK(executor->Decode(decode_params_disabled));
+
+  std::optional<ExecutorStats> stats = executor->GetExecutorStats();
+  ASSERT_TRUE(stats.has_value());
+  EXPECT_EQ(stats->module_name, kLlmModuleName);
+  EXPECT_EQ(stats->plain_steps(), 2);
+  EXPECT_EQ(stats->mtp_rounds(), 0);
+  EXPECT_GE(stats->plain_step_time(), absl::ZeroDuration());
+
+  // A failed MTP attempt (no drafter in this model) records nothing.
+  ExecutorDecodeParams decode_params_enabled;
+  decode_params_enabled.SetSpeculativeDecodingConfig(
+      {.mode = SpeculativeDecodingMode::kOn});
+  EXPECT_THAT(executor->Decode(decode_params_enabled),
+              StatusIs(absl::StatusCode::kInternal));
+  stats = executor->GetExecutorStats();
+  ASSERT_TRUE(stats.has_value());
+  EXPECT_EQ(stats->plain_steps(), 2);
+  EXPECT_EQ(stats->mtp_rounds(), 0);
+
+  executor->ResetExecutorStats();
+  EXPECT_FALSE(executor->GetExecutorStats().has_value());
+
+  // The stats are executor-wide, so Reset() (called when a session is
+  // released) keeps them.
+  ASSERT_OK(executor->Decode(decode_params_disabled));
+  ASSERT_OK(executor->Reset());
+  stats = executor->GetExecutorStats();
+  ASSERT_TRUE(stats.has_value());
+  EXPECT_EQ(stats->plain_steps(), 1);
+  // `Decode(params)` decodes its logits internally; that is not also counted
+  // as a logits step.
+  EXPECT_EQ(stats->logits_steps(), 0);
+}
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest,
+     DecodeLogits_AccumulatesLogitsSteps) {
+  const std::filesystem::path model_path =
+      std::filesystem::path(::testing::SrcDir()) /
+      "litert_lm/runtime/testdata/magic_test_none.tflite";
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto executor_settings,
+                       LlmExecutorSettings::CreateDefault(model_assets));
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  ASSERT_OK_AND_ASSIGN(auto model_resources, TfLiteModelResources::Create(
+                                                 model_assets,
+                                                 /*with_mtp_drafter=*/false));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor, LlmLiteRtCompiledModelExecutorStatic::Create(
+                         std::move(executor_settings), env, *model_resources));
+  ASSERT_TRUE(executor);
+
+  const auto make_inputs = [](const std::vector<int>& tokens,
+                              int sequence_length) -> ExecutorInputs {
+    auto buffer = CopyToTensorBuffer<int>(absl::MakeConstSpan(tokens),
+                                          {1, sequence_length});
+    ExecutorInputs inputs;
+    inputs.SetTextData(ExecutorTextData(std::move(*buffer)));
+    return inputs;
+  };
+  ASSERT_OK(executor->Prefill(make_inputs({1, 2, 3, 4, 5}, 5)));
+
+  ASSERT_OK_AND_ASSIGN(auto logits,
+                       executor->DecodeLogits(make_inputs({6}, 1)));
+  ASSERT_OK(
+      executor->DecodeLogits(make_inputs({7}, 1), ExecutorDecodeParams()));
+  ASSERT_OK(executor->Decode(make_inputs({8}, 1), logits));
+
+  std::optional<ExecutorStats> stats = executor->GetExecutorStats();
+  ASSERT_TRUE(stats.has_value());
+  EXPECT_EQ(stats->logits_steps(), 3);
+  EXPECT_GE(stats->logits_step_time(), absl::ZeroDuration());
+  // Logits-only decodes exclude sampling and are kept out of the plain steps.
+  EXPECT_EQ(stats->plain_steps(), 0);
+  EXPECT_EQ(stats->mtp_rounds(), 0);
+}
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest, Decode_SpeculativeDecodingMode) {
+  // No hermetic test model can run a full MTP round: lazily loading the
+  // drafter fails with kInternal.
+  const std::filesystem::path model_path =
+      std::filesystem::path(::testing::SrcDir()) /
+      "litert_lm/runtime/testdata/magic_test_none.tflite";
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto executor_settings,
+                       LlmExecutorSettings::CreateDefault(model_assets));
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  ASSERT_OK_AND_ASSIGN(auto model_resources, TfLiteModelResources::Create(
+                                                 model_assets,
+                                                 /*with_mtp_drafter=*/false));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor, LlmLiteRtCompiledModelExecutorStatic::Create(
+                         std::move(executor_settings), env, *model_resources));
+  ASSERT_TRUE(executor);
+
+  ExecutorInputs inputs;
+  const std::vector<int> input_tokens = {1, 2, 3, 4, 5};
+  auto input_tokens_buffer =
+      CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 5});
+  ASSERT_TRUE(input_tokens_buffer);
+  inputs.SetTextData(ExecutorTextData(std::move(*input_tokens_buffer)));
+  ASSERT_OK(executor->Prefill(inputs));
+
+  // kOff never loads the drafter.
+  ExecutorDecodeParams disabled;
+  disabled.SetSpeculativeDecodingConfig(
+      {.mode = SpeculativeDecodingMode::kOff});
+  ASSERT_OK(executor->Decode(disabled));
+
+  // Without a loadable drafter, kAdaptive is best effort: it decodes plainly
+  // instead of failing, and never creates the gating policy.
+  ExecutorDecodeParams adaptive;
+  adaptive.SetSpeculativeDecodingConfig(
+      {.mode = SpeculativeDecodingMode::kAdaptive});
+  ASSERT_OK(executor->Decode(adaptive));
+  EXPECT_EQ(executor->mtp_gating_policy_for_testing(), nullptr);
+  // Later adaptive steps keep decoding plainly.
+  ASSERT_OK(executor->Decode(adaptive));
+  EXPECT_EQ(executor->mtp_gating_policy_for_testing(), nullptr);
+  EXPECT_FALSE(executor->mtp_primed_for_testing());
+
+  // kOn requires the drafter and surfaces the load failure.
+  ExecutorDecodeParams always;
+  always.SetSpeculativeDecodingConfig({.mode = SpeculativeDecodingMode::kOn});
+  EXPECT_THAT(executor->Decode(always), StatusIs(absl::StatusCode::kInternal));
+}
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest,
+     Decode_WithoutDrafterSkipsVerifierSamplerConfig) {
+  // Without an MTP drafter, keeping the verifier sampler in sync with the
+  // session sampler must not affect plain decoding (the verifier is only
+  // configured once a drafter exists).
+  const std::filesystem::path model_path =
+      std::filesystem::path(::testing::SrcDir()) /
+      "litert_lm/runtime/testdata/magic_test_none.tflite";
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto executor_settings,
+                       LlmExecutorSettings::CreateDefault(model_assets));
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  ASSERT_OK_AND_ASSIGN(auto model_resources, TfLiteModelResources::Create(
+                                                 model_assets,
+                                                 /*with_mtp_drafter=*/false));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor, LlmLiteRtCompiledModelExecutorStatic::Create(
+                         std::move(executor_settings), env, *model_resources));
+  ASSERT_TRUE(executor);
+
+  ExecutorInputs inputs;
+  const std::vector<int> input_tokens = {1, 2, 3, 4, 5};
+  auto input_tokens_buffer =
+      CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 5});
+  ASSERT_TRUE(input_tokens_buffer);
+  inputs.SetTextData(ExecutorTextData(std::move(*input_tokens_buffer)));
+  ASSERT_OK(executor->Prefill(inputs));
+  ASSERT_OK(executor->Decode());
+  ExecutorDecodeParams disabled;
+  disabled.SetSpeculativeDecodingConfig(
+      {.mode = SpeculativeDecodingMode::kOff});
+  ASSERT_OK(executor->Decode(disabled));
+}
+
 TEST(LlmLiteRtCompiledModelExecutorStaticTest, MultipleOutput_Decode) {
   const std::filesystem::path model_path =
       std::filesystem::path(::testing::SrcDir()) /
       "litert_lm/runtime/testdata/magic_test_decode_batch.tflite";
-  auto model_assets = ModelAssets::Create(model_path.string());
-  ASSERT_OK(model_assets);
-  auto executor_settings = LlmExecutorSettings::CreateDefault(*model_assets);
-  ASSERT_OK(executor_settings);
-  auto env = Environment::Create(std::vector<Environment::Option>());
-  LITERT_ASSERT_OK(env);
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto executor_settings,
+                       LlmExecutorSettings::CreateDefault(model_assets));
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
   ASSERT_OK_AND_ASSIGN(auto model_resources,
-                       TfLiteModelResources::Create(*model_assets));
+                       TfLiteModelResources::Create(model_assets));
 
   ASSERT_OK_AND_ASSIGN(
-      auto executor,
-      LlmLiteRtCompiledModelExecutorStatic::Create(
-          std::move(*executor_settings), *env, *model_resources));
+      auto executor, LlmLiteRtCompiledModelExecutorStatic::Create(
+                         std::move(executor_settings), env, *model_resources));
   auto step = executor->GetCurrentStep();
   EXPECT_OK(step);
   EXPECT_EQ(*step, 0);
@@ -602,19 +1659,19 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest,
   const std::filesystem::path model_path =
       std::filesystem::path(::testing::SrcDir()) /
       "litert_lm/runtime/testdata/magic_test_decode_batch.tflite";
-  auto model_assets = ModelAssets::Create(model_path.string());
-  ASSERT_OK(model_assets);
-  auto executor_settings = LlmExecutorSettings::CreateDefault(*model_assets);
-  ASSERT_OK(executor_settings);
-  auto env = Environment::Create(std::vector<Environment::Option>());
-  LITERT_ASSERT_OK(env);
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto executor_settings,
+                       LlmExecutorSettings::CreateDefault(model_assets));
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
   ASSERT_OK_AND_ASSIGN(auto model_resources,
-                       TfLiteModelResources::Create(*model_assets));
-  auto executor = LlmLiteRtCompiledModelExecutorStatic::Create(
-      std::move(*executor_settings), *env, *model_resources);
-  EXPECT_OK(executor);
-  EXPECT_TRUE(*executor);
-  auto step = (*executor)->GetCurrentStep();
+                       TfLiteModelResources::Create(model_assets));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor, LlmLiteRtCompiledModelExecutorStatic::Create(
+                         std::move(executor_settings), env, *model_resources));
+  ASSERT_NE(executor, nullptr);
+  auto step = executor->GetCurrentStep();
   EXPECT_OK(step);
   EXPECT_EQ(*step, 0);
 
@@ -624,12 +1681,12 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest,
   auto input_tokens_buffer =
       CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 5});
   inputs.SetTextData(ExecutorTextData(std::move(*input_tokens_buffer)));
-  EXPECT_OK((*executor)->Prefill(inputs));
-  step = (*executor)->GetCurrentStep();
+  EXPECT_OK(executor->Prefill(inputs));
+  step = executor->GetCurrentStep();
   EXPECT_OK(step);
   EXPECT_EQ(*step, 5);
   auto step_and_token =
-      (*executor)->processed_tokens_for_testing().GetNextUnprocessedToken();
+      executor->processed_tokens_for_testing().GetNextUnprocessedToken();
   EXPECT_EQ(step_and_token.step, 4);
   EXPECT_EQ(step_and_token.token.size(), 1);
   EXPECT_EQ(step_and_token.token[0]->id(), 5);
@@ -638,7 +1695,7 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest,
   constexpr int kDecodeSteps = 20;
   ExecutorInputs decode_inputs;
   for (int i = 0; i < kDecodeSteps; ++i) {
-    auto logits = (*executor)->DecodeLogits(decode_inputs);
+    auto logits = executor->DecodeLogits(decode_inputs);
     EXPECT_OK(logits);
     auto logits_type = logits->TensorType();
     EXPECT_TRUE(logits_type);
@@ -667,12 +1724,12 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest,
     decode_inputs.SetTextData(
         ExecutorTextData(std::move(*input_tokens_buffer)));
   }
-  step = (*executor)->GetCurrentStep();
+  step = executor->GetCurrentStep();
   EXPECT_OK(step);
   // First pending tokens were processed.
   EXPECT_EQ(*step, 5 + kDecodeSteps);
   step_and_token =
-      (*executor)->processed_tokens_for_testing().GetNextUnprocessedToken();
+      executor->processed_tokens_for_testing().GetNextUnprocessedToken();
   EXPECT_EQ(step_and_token.step, 4 + kDecodeSteps);
   // No pending input token left with DecodeLogits.
   EXPECT_TRUE(step_and_token.token.empty());
@@ -682,12 +1739,12 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest,
   input_tokens_buffer =
       CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens.data(), 1), {1, 1});
   inputs_next.SetTextData(ExecutorTextData(std::move(*input_tokens_buffer)));
-  EXPECT_OK((*executor)->Prefill(inputs_next));
-  step = (*executor)->GetCurrentStep();
+  EXPECT_OK(executor->Prefill(inputs_next));
+  step = executor->GetCurrentStep();
   EXPECT_OK(step);
   EXPECT_EQ(*step, 5 + kDecodeSteps + 1);
   step_and_token =
-      (*executor)->processed_tokens_for_testing().GetNextUnprocessedToken();
+      executor->processed_tokens_for_testing().GetNextUnprocessedToken();
   EXPECT_EQ(step_and_token.step, 4 + kDecodeSteps);
   // The prefilled token is added as pending input token.
   EXPECT_EQ(step_and_token.token.size(), 1);
@@ -698,19 +1755,19 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest,
   const std::filesystem::path model_path =
       std::filesystem::path(::testing::SrcDir()) /
       "litert_lm/runtime/testdata/magic_test_decode_batch.tflite";
-  auto model_assets = ModelAssets::Create(model_path.string());
-  ASSERT_OK(model_assets);
-  auto executor_settings = LlmExecutorSettings::CreateDefault(*model_assets);
-  ASSERT_OK(executor_settings);
-  auto env = Environment::Create(std::vector<Environment::Option>());
-  LITERT_ASSERT_OK(env);
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto executor_settings,
+                       LlmExecutorSettings::CreateDefault(model_assets));
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
   ASSERT_OK_AND_ASSIGN(auto model_resources,
-                       TfLiteModelResources::Create(*model_assets));
-  auto executor = LlmLiteRtCompiledModelExecutorStatic::Create(
-      std::move(*executor_settings), *env, *model_resources);
-  EXPECT_OK(executor);
-  EXPECT_TRUE(*executor);
-  auto step = (*executor)->GetCurrentStep();
+                       TfLiteModelResources::Create(model_assets));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor, LlmLiteRtCompiledModelExecutorStatic::Create(
+                         std::move(executor_settings), env, *model_resources));
+  ASSERT_NE(executor, nullptr);
+  auto step = executor->GetCurrentStep();
   EXPECT_OK(step);
   EXPECT_EQ(*step, 0);
 
@@ -720,12 +1777,12 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest,
   auto input_tokens_buffer =
       CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 5});
   inputs.SetTextData(ExecutorTextData(std::move(*input_tokens_buffer)));
-  EXPECT_OK((*executor)->Prefill(inputs));
-  step = (*executor)->GetCurrentStep();
+  EXPECT_OK(executor->Prefill(inputs));
+  step = executor->GetCurrentStep();
   EXPECT_OK(step);
   EXPECT_EQ(*step, 5);
   auto step_and_token =
-      (*executor)->processed_tokens_for_testing().GetNextUnprocessedToken();
+      executor->processed_tokens_for_testing().GetNextUnprocessedToken();
   EXPECT_EQ(step_and_token.step, 4);
   EXPECT_EQ(step_and_token.token.size(), 1);
   EXPECT_EQ(step_and_token.token[0]->id(), 5);
@@ -739,7 +1796,7 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest,
   EXPECT_TRUE(input_tokens_buffer);
   decode_inputs.SetTextData(ExecutorTextData(std::move(*input_tokens_buffer)));
   for (int i = 0; i < kDecodeSteps; ++i) {
-    auto logits = (*executor)->DecodeLogits(decode_inputs);
+    auto logits = executor->DecodeLogits(decode_inputs);
     EXPECT_OK(logits);
     auto logits_type = logits->TensorType();
     EXPECT_TRUE(logits_type);
@@ -757,12 +1814,12 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest,
                 logits_span->at((kMaxDecodeBatchSize - 1) * kVocabSize));
     }
   }
-  step = (*executor)->GetCurrentStep();
+  step = executor->GetCurrentStep();
   EXPECT_OK(step);
   // First pending tokens were ignored.
   EXPECT_EQ(*step, 5 + kDecodeSteps);
   step_and_token =
-      (*executor)->processed_tokens_for_testing().GetNextUnprocessedToken();
+      executor->processed_tokens_for_testing().GetNextUnprocessedToken();
   EXPECT_EQ(step_and_token.step, 4 + kDecodeSteps);
   // No pending input token left with DecodeLogits.
   EXPECT_TRUE(step_and_token.token.empty());
@@ -772,15 +1829,59 @@ TEST(LlmLiteRtCompiledModelExecutorStaticTest,
   input_tokens_buffer =
       CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens.data(), 1), {1, 1});
   inputs_next.SetTextData(ExecutorTextData(std::move(*input_tokens_buffer)));
-  EXPECT_OK((*executor)->Prefill(inputs_next));
-  step = (*executor)->GetCurrentStep();
+  EXPECT_OK(executor->Prefill(inputs_next));
+  step = executor->GetCurrentStep();
   EXPECT_OK(step);
   EXPECT_EQ(*step, 5 + kDecodeSteps + 1);
   step_and_token =
-      (*executor)->processed_tokens_for_testing().GetNextUnprocessedToken();
+      executor->processed_tokens_for_testing().GetNextUnprocessedToken();
   EXPECT_EQ(step_and_token.step, 4 + kDecodeSteps);
   // The prefilled token is added as pending input token.
   EXPECT_EQ(step_and_token.token.size(), 1);
+}
+
+TEST(LlmLiteRtCompiledModelExecutorStaticTest,
+     RollBackProcessedTokensWithZeroTokenIdTest) {
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  ASSERT_OK_AND_ASSIGN((auto [model_resources, executor]),
+                       CreateStaticCpuExecutor(env, kTestStaticModelPath));
+
+  // Prefill {1, 0, 3, 4}, then rewind to step 2 where token at
+  // `current_step - 1` is valid vocabulary token ID 0 (not a negative
+  // multimodal sentinel token).
+  ASSERT_OK(executor->Prefill(MakeTextInputs({1, 0, 3, 4})));
+  ASSERT_OK(executor->SetCurrentStep(2));
+
+  std::vector<int> captured_first_two_tokens;
+  executor->UpdatePreGraphRunCallback(
+      [&](absl::string_view signature_name, int current_step,
+          absl::flat_hash_map<absl::string_view, TensorBuffer>&
+              tensor_buffers) {
+        if (signature_name == "decode") return;
+        auto tok_it = tensor_buffers.find("tokens");
+        if (tok_it == tensor_buffers.end()) {
+          tok_it = tensor_buffers.find("token_ids");
+        }
+        ASSERT_NE(tok_it, tensor_buffers.end());
+        auto tok_span = ReferTensorBufferAsSpan<int32_t>(tok_it->second);
+        ASSERT_TRUE(tok_span);
+        ASSERT_GE(tok_span->size(), 2);
+        captured_first_two_tokens = {(*tok_span)[0], (*tok_span)[1]};
+      });
+
+  // Subsequent prefill of {5, 6} must roll back processed tokens so token 0
+  // becomes the pending input token at step 1, prefilling {0, 5} into the
+  // compiled model and leaving token 6 pending at step 3.
+  ASSERT_OK(executor->Prefill(MakeTextInputs({5, 6})));
+  ASSERT_OK_AND_ASSIGN(int step, executor->GetCurrentStep());
+  EXPECT_EQ(step, 4);
+  EXPECT_THAT(captured_first_two_tokens, ::testing::ElementsAre(0, 5));
+  auto step_and_token =
+      executor->processed_tokens_for_testing().GetNextUnprocessedToken();
+  EXPECT_EQ(step_and_token.step, 3);
+  ASSERT_EQ(step_and_token.token.size(), 1);
+  EXPECT_EQ(step_and_token.token[0]->id(), 6);
 }
 
 absl::StatusOr<
@@ -790,22 +1891,79 @@ CreateDynamicExecutor(Environment& env, absl::string_view model_path,
                       uint32_t kv_increment_size = 8,
                       int prefill_chunk_size = -1) {
   auto path = std::filesystem::path(::testing::SrcDir()) / model_path;
-  ASSIGN_OR_RETURN(auto model_resources,
-                   CreateExecutorModelResourcesLitertLm(path.string()));
-  ASSIGN_OR_RETURN(auto model_assets, ModelAssets::Create(path.string()));
-  auto executor_settings =
-      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU);
-  executor_settings->SetCacheDir(":nocache");
-  executor_settings->SetMaxNumTokens(kMaxNumTokens);
+  ABSL_ASSIGN_OR_RETURN(auto model_resources,
+                        CreateExecutorModelResourcesLitertLm(path.string()));
+  ABSL_ASSIGN_OR_RETURN(auto model_assets, ModelAssets::Create(path.string()));
+  ABSL_ASSIGN_OR_RETURN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
   CpuConfig config;
   config.number_of_threads = kNumThreads;
   config.kv_increment_size = kv_increment_size;
   config.prefill_chunk_size = prefill_chunk_size;
-  executor_settings->SetBackendConfig(config);
-  ASSIGN_OR_RETURN(auto executor,
-                   LlmLiteRtCompiledModelExecutorDynamic::Create(
-                       *executor_settings, env, *model_resources));
+  executor_settings.SetBackendConfig(config);
+  ABSL_ASSIGN_OR_RETURN(auto executor,
+                        LlmLiteRtCompiledModelExecutorDynamic::Create(
+                            executor_settings, env, *model_resources));
   return std::make_pair(std::move(model_resources), std::move(executor));
+}
+
+TEST(LlmLiteRtCompiledModelExecutorDynamicTest,
+     CreateExecutorTest_FromPreCompiledModel) {
+  auto model_path =
+      std::filesystem::path(::testing::SrcDir()) / kTestDynamicModelPath;
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
+  CpuConfig config;
+  config.number_of_threads = kNumThreads;
+  config.kv_increment_size = 8;
+  config.prefill_chunk_size = -1;
+  executor_settings.SetBackendConfig(config);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto compilation_options,
+      CreateCompilationOptions(executor_settings, ActivationDataType::FLOAT32,
+                               /*signatures=*/std::nullopt));
+
+  ASSERT_OK_AND_ASSIGN(auto model_buffer_view,
+                       model_resources->GetTFLiteModelBuffer(
+                           proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
+  litert::BufferRef<uint8_t> model_buffer(
+      reinterpret_cast<const uint8_t*>(model_buffer_view.data()),
+      model_buffer_view.size());
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto compiled_model,
+      CompiledModel::Create(env, model_buffer, compilation_options));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto executor,
+      LlmLiteRtCompiledModelExecutorDynamic::Create(
+          executor_settings, env,
+          std::make_unique<CompiledModel>(std::move(compiled_model)),
+          model_resources.get()));
+  ASSERT_NE(executor, nullptr);
+
+  ExecutorInputs inputs;
+  const std::vector<int> input_tokens = {1, 2, 0};
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto input_tokens_buffer,
+      CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 3}));
+  inputs.SetTextData(ExecutorTextData(std::move(input_tokens_buffer)));
+  EXPECT_OK(executor->Prefill(inputs));
+  ASSERT_OK_AND_ASSIGN(auto current_step, executor->GetCurrentStep());
+  EXPECT_EQ(current_step, 3);
 }
 
 TEST(LlmLiteRtCompiledModelExecutorDynamicTest, PrefillTest) {
@@ -832,6 +1990,54 @@ TEST(LlmLiteRtCompiledModelExecutorDynamicTest, PrefillTest) {
     EXPECT_OK(executor->Prefill(inputs));
     ASSERT_OK_AND_ASSIGN(auto current_step, executor->GetCurrentStep());
     EXPECT_EQ(current_step, 3 * (i + 1));
+  }
+}
+
+TEST(LlmLiteRtCompiledModelExecutorDynamicTest, ResetTest) {
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+  std::unique_ptr<ModelResources> model_resources;
+  std::unique_ptr<LlmLiteRtCompiledModelExecutorDynamic> executor;
+  {
+    ASSERT_OK_AND_ASSIGN(auto p,
+                         CreateDynamicExecutor(env, kTestDynamicModelPath));
+    std::tie(model_resources, executor) = std::move(p);
+  }
+
+  ExecutorInputs inputs;
+  const std::vector<int> input_tokens = {1, 2, 0};
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto input_tokens_buffer,
+      CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 3}));
+  inputs.SetTextData(ExecutorTextData(std::move(input_tokens_buffer)));
+
+  EXPECT_OK(executor->Prefill(inputs));
+
+  {
+    ASSERT_OK_AND_ASSIGN(auto current_step, executor->GetCurrentStep());
+    EXPECT_EQ(current_step, 3);
+  }
+
+  EXPECT_OK(executor->Reset());
+
+  {
+    ASSERT_OK_AND_ASSIGN(auto current_step, executor->GetCurrentStep());
+    EXPECT_EQ(current_step, 0);
+  }
+
+  const std::vector<int> second_input_tokens = {3, 4, 5};
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto second_input_tokens_buffer,
+      CopyToTensorBuffer<int>(absl::MakeSpan(second_input_tokens), {1, 3}));
+  ExecutorInputs second_inputs;
+  second_inputs.SetTextData(
+      ExecutorTextData(std::move(second_input_tokens_buffer)));
+
+  EXPECT_OK(executor->Prefill(second_inputs));
+
+  {
+    ASSERT_OK_AND_ASSIGN(auto current_step, executor->GetCurrentStep());
+    EXPECT_EQ(current_step, 3);
   }
 }
 
@@ -866,6 +2072,68 @@ TEST(LlmLiteRtCompiledModelExecutorDynamicTest, DecodeTest) {
     ASSERT_OK_AND_ASSIGN(auto current_step, executor->GetCurrentStep());
     EXPECT_EQ(current_step, input_tokens.size() + (i + 1));
   }
+}
+
+TEST(LlmLiteRtCompiledModelExecutorDynamicTest,
+     SingleTokenInitialPrefillWithTokenModelAndEmbeddingLookupTest) {
+  auto model_path =
+      std::filesystem::path(::testing::SrcDir()) / kTestDynamicModelPath;
+  ASSERT_OK_AND_ASSIGN(
+      auto model_resources,
+      CreateExecutorModelResourcesLitertLm(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create(model_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto executor_settings,
+      LlmExecutorSettings::CreateDefault(model_assets, Backend::CPU));
+  executor_settings.SetCacheDir(":nocache");
+  executor_settings.SetMaxNumTokens(kMaxNumTokens);
+  CpuConfig config;
+  config.number_of_threads = kNumThreads;
+  config.kv_increment_size = 8;
+  config.prefill_chunk_size = -1;
+  executor_settings.SetBackendConfig(config);
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto compilation_options,
+      CreateCompilationOptions(executor_settings, ActivationDataType::FLOAT32,
+                               /*signatures=*/std::nullopt));
+  ASSERT_OK_AND_ASSIGN(auto model_buffer_view,
+                       model_resources->GetTFLiteModelBuffer(
+                           proto::LlmMetadata::TF_LITE_PREFILL_DECODE));
+  litert::BufferRef<uint8_t> model_buffer(
+      reinterpret_cast<const uint8_t*>(model_buffer_view.data()),
+      model_buffer_view.size());
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto compiled_model,
+      CompiledModel::Create(env, model_buffer, compilation_options));
+
+  auto embedder_path =
+      std::filesystem::path(::testing::SrcDir()) / kDummyEmbedderModelPath;
+  LITERT_ASSERT_OK_AND_ASSIGN(auto embedder_model,
+                              Model::CreateFromFile(embedder_path.string()));
+  ASSERT_OK_AND_ASSIGN(
+      auto embedding_lookup,
+      EmbeddingLookupManager::Create(env, &embedder_model,
+                                     /*fully_supports_multi_modal=*/false));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto executor,
+      LlmLiteRtCompiledModelExecutorDynamic::Create(
+          executor_settings, env,
+          std::make_unique<CompiledModel>(std::move(compiled_model)),
+          model_resources.get(), std::move(embedding_lookup)));
+
+  // A 1-token initial prefill on a token-input model that also has an
+  // EmbeddingLookupManager (e.g., for MTP) must not attach float embeddings to
+  // the pending token; otherwise the next Prefill fails when filling the int32
+  // input_tokens buffer.
+  ASSERT_OK(executor->Prefill(MakeTextInputs({1})));
+  ASSERT_OK(executor->Prefill(MakeTextInputs({2, 3})));
+  ASSERT_OK_AND_ASSIGN(int step, executor->GetCurrentStep());
+  EXPECT_EQ(step, 3);
 }
 
 }  // namespace

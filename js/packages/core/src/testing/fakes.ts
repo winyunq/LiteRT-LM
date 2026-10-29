@@ -45,30 +45,24 @@ export class ConversationFake implements ChatInterface {
     if (this.nextResponses.length > 0) {
       return this.nextResponses.shift()!;
     }
-    return {role: 'model', content: 'hello from fake'};
+    return {role: 'assistant', content: 'hello from fake'};
   }
 
-  private appendInput(message: MessageLike|MessageLike[]) {
-    if (Array.isArray(message)) {
-      this.history.push(...message.map(
-          m => typeof m === 'string' ? {role: 'user', content: m} as Message :
-                                       m));
-    } else {
-      this.history.push(
-          typeof message === 'string' ?
-              {role: 'user', content: message} as Message :
-              message);
-    }
+  private appendInput(message: MessageLike) {
+    this.history.push(
+        typeof message === 'string' ?
+            {role: 'user', content: message} as Message :
+            message);
   }
 
-  async sendMessage(message: MessageLike|MessageLike[]): Promise<Message> {
+  async sendMessage(message: MessageLike): Promise<Message> {
     this.appendInput(message);
     const newMessage = this.popNextResponse();
     this.history.push(newMessage);
     return newMessage;
   }
 
-  sendMessageStreaming(message: MessageLike|MessageLike[]):
+  sendMessageStreaming(message: MessageLike):
       ReadableStream<Message> {
     this.appendInput(message);
     return new ReadableStream<Message>({
@@ -102,6 +96,12 @@ export class ConversationFake implements ChatInterface {
       timeToFirstTokenInSecond: 0,
     };
   }
+
+  clone(): Conversation {
+    const cloned = new ConversationFake([...this.history]);
+    cloned.nextResponses = [...this.nextResponses];
+    return cloned as unknown as Conversation;
+  }
 }
 
 /** Fake implementation of Session for testing. */
@@ -118,6 +118,12 @@ export class SessionFake {
   }
 
   cancel() {}
+
+  clone(): Session {
+    const cloned = new SessionFake();
+    cloned.inputsPrefilled = [...this.inputsPrefilled];
+    return cloned as unknown as Session;
+  }
 
   async delete(): Promise<void> {}
 }

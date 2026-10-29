@@ -15,27 +15,32 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_ENGINE_ENGINE_SETTINGS_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_ENGINE_ENGINE_SETTINGS_H_
 
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/base/nullability.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
-#include "support/tokenizer/tokenizer.h"  // from @litert
-#include "runtime/executor/audio_executor_settings.h"
+#include "runtime/components/constrained_decoding/suppress_tokens_config.h"
+#include "runtime/executor/audio/audio_executor_settings.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/llm_executor_settings.h"
-#include "runtime/executor/vision_executor_settings.h"
+#include "runtime/executor/speculative_decoding_mode.h"
+#include "runtime/executor/vision/vision_executor_settings.h"
 #include "runtime/proto/engine.pb.h"
 #include "runtime/proto/llm_metadata.pb.h"
 #include "runtime/proto/llm_model_type.pb.h"
 #include "runtime/proto/sampler_params.pb.h"
 #include "runtime/util/scoped_file.h"
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
 
@@ -63,12 +68,12 @@ namespace litert::lm {
 //
 // Example:
 //
-//   ASSIGN_OR_RETURN(ModelAssets model_assets,
+//   ABSL_ASSIGN_OR_RETURN(ModelAssets model_assets,
 //                    ModelAssets::Create(model_path));
-//   ASSIGN_OR_RETURN(EngineSettings engine_settings,
+//   ABSL_ASSIGN_OR_RETURN(EngineSettings engine_settings,
 //                    EngineSettings::CreateDefault(model_assets));
 //    ...initialize the Engine...
-//   ASSIGN_OR_RETURN(std::unique_ptr<Engine> engine,
+//   ABSL_ASSIGN_OR_RETURN(std::unique_ptr<Engine> engine,
 //                    Engine::CreateEngine(engine_settings));
 // TODO(b/397975034) Add overloading << operator for debugging.
 class EngineSettings {
@@ -145,6 +150,37 @@ class EngineSettings {
   // false.
   void SetSingleThreadedExecution(bool single_threaded_execution);
 
+  // Desired maximum number of vision tokens generated per image. If set,
+  // the engine will automatically select vision encoder (and adapter)
+  // signatures with capacity up to this length and the smallest signature that
+  // fits it.
+  std::optional<int> GetMaxVisionTokensPerImage() const;
+  void SetMaxVisionTokensPerImage(int max_vision_tokens_per_image);
+
+  // Smallest vision signature capacity to load, or std::nullopt for no
+  // minimum. Smaller signatures are skipped to save memory. On web, the engine
+  // defaults this to the max, so only one signature is loaded.
+  std::optional<int> GetMinVisionTokensPerImage() const;
+  // Must be non-negative and not exceed the max vision tokens per image.
+  void SetMinVisionTokensPerImage(int min_vision_tokens_per_image);
+
+  // Default speculative decoding (MTP) configuration for the sessions of the
+  // engine. Each session can override any field with
+  // `SessionConfig::SetSpeculativeDecodingConfig()`.
+  //
+  // `mode`:
+  // - std::nullopt (default): kOff, unless the deprecated
+  //   `AdvancedSettings::enable_speculative_decoding` is true, which means
+  //   kOn.
+  // - kOff: sessions don't speculate unless they request it.
+  // - kOn / kAdaptive: the MTP drafter is loaded when the engine is created,
+  //   and sessions use this mode unless they request another one.
+  //
+  // The settings are stored in the main executor settings.
+  const SpeculativeDecodingConfig& GetSpeculativeDecodingConfig() const;
+  void SetSpeculativeDecodingConfig(
+      const SpeculativeDecodingConfig& speculative_decoding_config);
+
  private:
   explicit EngineSettings(
       LlmExecutorSettings executor_settings,
@@ -174,6 +210,12 @@ class EngineSettings {
 
   // Whether the advanced engine should run tasks in a single thread.
   bool single_threaded_execution_ = false;
+
+  // Desired maximum number of vision tokens generated per image.
+  std::optional<int> max_vision_tokens_per_image_;
+
+  // Smallest vision signature capacity to load.
+  std::optional<int> min_vision_tokens_per_image_;
 };
 std::ostream& operator<<(std::ostream& os, const EngineSettings& settings);
 
@@ -200,6 +242,14 @@ class SessionConfig {
   bool VisionModalityEnabled() const { return vision_modality_enabled_; }
   void SetVisionModalityEnabled(bool enable_vision_modality) {
     vision_modality_enabled_ = enable_vision_modality;
+  }
+
+  // Configures whether to instantiate AudioSessionAdvanced.
+  bool EnableAudioSessionAdvanced() const {
+    return enable_audio_session_advanced_;
+  }
+  void SetEnableAudioSessionAdvanced(bool enable_audio_session_advanced) {
+    enable_audio_session_advanced_ = enable_audio_session_advanced;
   }
 
   // Sampler parameters:
@@ -237,6 +287,12 @@ class SessionConfig {
   const proto::LlmModelType& GetLlmModelType() const;
   proto::LlmModelType& GetMutableLlmModelType();
 
+  // Suppress tokens config:
+  // Getters for the suppress tokens config.
+  const SuppressTokensConfig& GetSuppressTokensConfig() const;
+  void SetSuppressTokensConfig(
+      const SuppressTokensConfig& suppress_tokens_config);
+
   // Whether to apply the basic prompt templates in the session.
   bool GetApplyPromptTemplateInSession() const {
     return apply_prompt_template_in_session_;
@@ -262,11 +318,54 @@ class SessionConfig {
   void SetAudioScopedLoraFile(
       std::shared_ptr<ScopedFile> scoped_audio_lora_file);
 
-  // The maximum number of tokens to generate in a single request:
-  // Getters for the max output tokens.
+  // The maximum number of tokens to generate in a single request. For thinking
+  // models, both thinking (reasoning) tokens and the final response tokens
+  // count towards this limit:
   int GetMaxOutputTokens() const { return max_output_tokens_; }
   void SetMaxOutputTokens(int max_output_tokens) {
     max_output_tokens_ = max_output_tokens;
+  }
+
+  // Speculative decoding (MTP) configuration for the session. Fields left
+  // unset inherit the engine's configuration
+  // (`EngineSettings::GetSpeculativeDecodingConfig()`) when the session is
+  // created; `MaybeUpdateAndValidate()` fills them in.
+  //
+  // `mode`:
+  // - std::nullopt (default): inherits the engine's mode (kOff by default).
+  // - kOff: never speculate, even if the engine speculates by default.
+  // - kOn: speculate on every decode step.
+  // - kAdaptive: speculate only while it is measured to be faster than plain
+  //   decoding. Adaptive gating is best effort:
+  //   - Any decoding constraint (e.g. a constrained decoder, a repetition
+  //     penalty or a thinking budget) disables the gating for that request and
+  //     speculation stays on, like kOn, because the constraint state is
+  //     not carried across plain and speculative steps.
+  //   - If the model has no usable MTP drafter, the session decodes plainly
+  //     instead of failing (kOn fails).
+  //   - The NPU executor does not support gating and speculates on every step,
+  //     like kOn.
+  //
+  // Caveats:
+  // - Lazy loading: If the engine's mode is kOff (the MTP drafter was not
+  //   loaded at startup), kOn and kAdaptive lazily load the MTP drafter on the
+  //   first session request that requires it (CPU/GPU only). This may incur a
+  //   one-time initialization latency and requires that the model asset
+  //   package contains MTP drafter artifacts. Lazy loading is not available
+  //   on the NPU executor (the session decodes plainly) or when the engine
+  //   streams the model weights at creation, which skips the drafter weights.
+  // - Batching: Speculative decoding (MTP) only supports a single output head
+  //   (batch size 1).
+  //
+  // `lenience`: see `SpeculativeDecodingConfig::lenience`. std::nullopt
+  // inherits the engine's lenience (exact by default). Validated in
+  // `MaybeUpdateAndValidate()`.
+  const SpeculativeDecodingConfig& GetSpeculativeDecodingConfig() const {
+    return speculative_decoding_config_;
+  }
+  void SetSpeculativeDecodingConfig(
+      const SpeculativeDecodingConfig& speculative_decoding_config) {
+    speculative_decoding_config_ = speculative_decoding_config;
   }
 
  private:
@@ -279,6 +378,9 @@ class SessionConfig {
 
   // Whether to enable vision modality in the session.
   bool vision_modality_enabled_ = false;
+
+  // Whether to instantiate AudioSessionAdvanced instead of SessionAdvanced.
+  bool enable_audio_session_advanced_ = false;
 
   // Parameters used to configure the sampling process.
   proto::SamplerParameters sampler_params_;
@@ -299,6 +401,11 @@ class SessionConfig {
   // Llm model type for the session. This is loaded from the model assets (if
   // present).
   proto::LlmModelType llm_model_type_;
+
+  // Suppress tokens config for the session. This is loaded from the model
+  // assets (if present).
+  SuppressTokensConfig suppress_tokens_config_ =
+      SuppressTokensConfig::Default();
 
   // The number of output candidates to generate. Default value is 1 and setting
   // it to a value greater than 1 will require the model to support batching.
@@ -326,6 +433,10 @@ class SessionConfig {
   // tokens (input + output) stored in the KV cache over the lifetime of a
   // session.
   int max_output_tokens_ = std::numeric_limits<int>::max();
+
+  // Speculative decoding configuration for the session.
+  // By default, every field is unset (inherits the engine's configuration).
+  SpeculativeDecodingConfig speculative_decoding_config_;
 };
 
 std::ostream& operator<<(std::ostream& os, const SessionConfig& config);

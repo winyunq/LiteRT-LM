@@ -16,17 +16,25 @@
 
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 
+#include "absl/base/no_destructor.h"  // from @com_google_absl
+#include "absl/base/thread_annotations.h"  // from @com_google_absl
 #include "absl/container/flat_hash_set.h"  // from @com_google_absl
 #include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
+#include "absl/strings/ascii.h"  // from @com_google_absl
 #include "absl/strings/match.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/synchronization/mutex.h"  // from @com_google_absl
+#include "litert/cc/litert_common.h"  // from @litert
 #include "runtime/util/data_stream.h"
 #include "runtime/util/file_util.h"
 #include "runtime/util/memory_mapped_file.h"
@@ -34,6 +42,54 @@
 #include "runtime/util/status_macros.h"  // NOLINT
 
 namespace litert::lm {
+namespace {
+
+// Table mapping dynamically registered custom executor names to synthetic
+// `Backend` enum values.
+// TODO(b/417814685): Decouple the custom executor implementation selector from
+// the hardware `Backend` enum (`CPU`, `GPU`, `NPU`) in `ExecutorSettingsBase`
+// so that a custom executor (e.g. `gemma_cpp`) can be paired with an explicit
+// hardware backend (e.g. `CPU` or `GPU`).
+struct CustomBackendNameTable {
+  absl::Mutex mu;
+  int next_id ABSL_GUARDED_BY(mu) = 1000;
+  std::unordered_map<std::string, Backend> name_to_backend ABSL_GUARDED_BY(mu);
+  std::unordered_map<Backend, std::string> backend_to_name ABSL_GUARDED_BY(mu);
+};
+
+CustomBackendNameTable& GetCustomBackendNameTable() {
+  static absl::NoDestructor<CustomBackendNameTable> table;
+  return *table;
+}
+
+}  // namespace
+
+Backend RegisterCustomBackend(absl::string_view backend_name) {
+  auto existing = GetBackendFromString(backend_name);
+  if (existing.ok()) {
+    ABSL_LOG(INFO) << "Backend '" << backend_name << "' is already registered.";
+    return *existing;
+  }
+  auto& table = GetCustomBackendNameTable();
+  absl::MutexLock lock(table.mu);
+  const std::string lower_name = absl::AsciiStrToLower(backend_name);
+  auto it = table.name_to_backend.find(lower_name);
+  if (it != table.name_to_backend.end()) {
+    ABSL_LOG(INFO) << "Custom backend '" << backend_name
+                   << "' is already registered.";
+    return it->second;
+  }
+  const Backend backend = static_cast<Backend>(table.next_id++);
+  table.name_to_backend[lower_name] = backend;
+  table.backend_to_name[backend] = absl::AsciiStrToUpper(backend_name);
+  return backend;
+}
+
+bool IsCustomBackend(Backend backend) {
+  auto& table = GetCustomBackendNameTable();
+  absl::MutexLock lock(table.mu);
+  return table.backend_to_name.contains(backend);
+}
 
 std::string GetBackendString(Backend backend) {
   switch (backend) {
@@ -49,13 +105,32 @@ std::string GetBackendString(Backend backend) {
       return "GOOGLE_TENSOR_ARTISAN";
     case Backend::NPU:
       return "NPU";
-    default:
+    default: {
+      auto& table = GetCustomBackendNameTable();
+      absl::MutexLock lock(table.mu);
+      auto it = table.backend_to_name.find(backend);
+      if (it != table.backend_to_name.end()) {
+        return it->second;
+      }
       return "UNSPECIFIED";
+    }
   }
 }
 
 std::ostream& operator<<(std::ostream& os, const Backend& backend) {
   return os << GetBackendString(backend);
+}
+
+::litert::HwAccelerators GetHwAcceleratorForBackend(Backend backend) {
+  switch (backend) {
+    case Backend::GPU:
+      return ::litert::HwAccelerators::kGpu;
+    case Backend::CPU:
+      return ::litert::HwAccelerators::kCpu;
+
+    default:
+      return ::litert::HwAccelerators::kNone;
+  }
 }
 
 absl::StatusOr<Backend> GetBackendFromString(absl::string_view backend_str) {
@@ -72,6 +147,14 @@ absl::StatusOr<Backend> GetBackendFromString(absl::string_view backend_str) {
   } else if (absl::EqualsIgnoreCase(backend_str, "google_tensor_artisan")) {
     return Backend::GOOGLE_TENSOR_ARTISAN;
   } else {
+    {
+      auto& table = GetCustomBackendNameTable();
+      absl::MutexLock lock(table.mu);
+      auto it = table.name_to_backend.find(absl::AsciiStrToLower(backend_str));
+      if (it != table.name_to_backend.end()) {
+        return it->second;
+      }
+    }
     return absl::InvalidArgumentError(
       absl::StrCat("Unsupported backend: ", backend_str,
                    ". Supported backends are: [CPU, GPU, NPU, GPU_ARTISAN, "
@@ -113,6 +196,21 @@ absl::StatusOr<ActivationDataType> GetActivationDataTypeFromString(
         absl::StrCat("Unsupported activation data type: ", activation_data_type,
                      ". Supported activation data types are: [FLOAT32, "
                      "FLOAT16, INT16, INT8]"));
+  }
+}
+
+absl::StatusOr<std::optional<bool>> GetUseIrModelFromString(
+    absl::string_view use_ir_model) {
+  if (absl::EqualsIgnoreCase(use_ir_model, "enabled")) {
+    return true;
+  } else if (absl::EqualsIgnoreCase(use_ir_model, "disabled")) {
+    return false;
+  } else if (absl::EqualsIgnoreCase(use_ir_model, "default")) {
+    return std::nullopt;
+  } else {
+    return absl::InvalidArgumentError(
+        absl::StrCat("Unsupported gpu_use_ir_model value: ", use_ir_model,
+                     ". Supported values are: [enabled, disabled, default]"));
   }
 }
 
@@ -234,13 +332,16 @@ absl::StatusOr<std::shared_ptr<ScopedFile>> ModelAssets::GetOrCreateScopedFile()
   if (HasScopedFile()) {
     return scoped_file_;
   }
+  if (!path_.empty()) {
+    ABSL_ASSIGN_OR_RETURN(auto scoped_file, ScopedFile::Open(path_));
+    return std::make_shared<ScopedFile>(std::move(scoped_file));
+  }
   if (HasMemoryMappedFile()) {
     return absl::InvalidArgumentError(
         "Cannot create ScopedFile from MemoryMappedFile.");
   }
 
-  ASSIGN_OR_RETURN(auto scoped_file, ScopedFile::Open(path_));
-  return std::make_shared<ScopedFile>(std::move(scoped_file));
+  return absl::InvalidArgumentError("Assets do not have a valid file source.");
 }
 
 std::ostream& operator<<(std::ostream& os, const ModelAssets& model_assets) {
@@ -335,11 +436,11 @@ ExecutorSettingsBase::GetWeightCacheFile(absl::string_view suffix,
 
   std::string cache_path;
   if (GetCacheDir().empty()) {
-    cache_path = absl::StrCat(model_path, suffix, metadata_id);
+    cache_path = absl::StrCat(model_path, metadata_id, suffix);
   } else {
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         cache_path, JoinPath(GetCacheDir(), absl::StrCat(Basename(model_path),
-                                                         suffix, metadata_id)));
+                                                         metadata_id, suffix)));
   }
 
   // Try to delete stale caches if the current cache file doesn't exist.
@@ -354,8 +455,7 @@ ExecutorSettingsBase::GetWeightCacheFile(absl::string_view suffix,
         ABSL_LOG(WARNING) << "Failed to clean stale caches: "
                           << num_deleted_or.status();
       } else {
-        ABSL_LOG(INFO) << "Deleted " << *num_deleted_or
-                       << " stale cache files.";
+        ABSL_VLOG(1) << "Deleted " << *num_deleted_or << " stale cache files.";
       }
     }
   }
@@ -397,7 +497,7 @@ ExecutorSettingsBase::GetProgramCacheFile(absl::string_view suffix,
   if (GetCacheDir().empty()) {
     cache_path = absl::StrCat(model_path, metadata_id, suffix);
   } else {
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         cache_path, JoinPath(GetCacheDir(), absl::StrCat(Basename(model_path),
                                                          metadata_id, suffix)));
   }
@@ -405,8 +505,8 @@ ExecutorSettingsBase::GetProgramCacheFile(absl::string_view suffix,
   // Try to delete stale caches if the current cache file doesn't exist.
   if (check_and_clean) {
     if (!FileExists(cache_path)) {
-      ABSL_LOG(INFO) << "File does not exist: " << cache_path
-                     << " Cleaning stale caches.";
+      ABSL_VLOG(1) << "File does not exist: " << cache_path
+                   << " Cleaning stale caches.";
       std::string dir_to_clean = GetCacheDir().empty()
                                      ? std::string(Dirname(model_path))
                                      : GetCacheDir();
@@ -416,8 +516,7 @@ ExecutorSettingsBase::GetProgramCacheFile(absl::string_view suffix,
         ABSL_LOG(WARNING) << "Failed to clean stale caches: "
                           << num_deleted_or.status();
       } else {
-        ABSL_LOG(INFO) << "Deleted " << *num_deleted_or
-                       << " stale cache files.";
+        ABSL_VLOG(1) << "Deleted " << *num_deleted_or << " stale cache files.";
       }
     }
   }

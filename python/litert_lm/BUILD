@@ -31,6 +31,15 @@ pytype_strict_library(
 )
 
 pytype_strict_library(
+    name = "model_info",
+    srcs = ["model_info.py"],
+    deps = [
+        ":_ffi",
+        ":interfaces",
+    ],
+)
+
+pytype_strict_library(
     name = "_messages",
     srcs = ["_messages.py"],
 )
@@ -71,6 +80,7 @@ pytype_strict_library(
         ":_ffi",
         ":_messages",
         ":interfaces",
+        ":utils",
     ],
 )
 
@@ -89,11 +99,22 @@ pytype_strict_library(
 )
 
 pytype_strict_library(
+    name = "embedding_engine",
+    srcs = ["embedding_engine.py"],
+    deps = [
+        ":_ffi",
+        ":_messages",
+        ":interfaces",
+    ],
+)
+
+pytype_strict_library(
     name = "benchmark",
     srcs = ["benchmark.py"],
     deps = [
         ":_ffi",
         ":interfaces",
+        ":utils",
     ],
 )
 
@@ -116,8 +137,10 @@ pytype_strict_library(
         ":_messages",
         ":benchmark",
         ":conversation",
+        ":embedding_engine",
         ":engine",
         ":interfaces",
+        ":model_info",
         ":session",
         ":tools",
     ],
@@ -126,6 +149,50 @@ pytype_strict_library(
 py_test(
     name = "engine_test",
     srcs = ["engine_test.py"],
+    data = [
+        "//models/gemma4:chat_template_e2b_e4b.jinja",
+        "//runtime/components/testdata",
+        "//runtime/testdata",
+    ],
+    tags = ["nowindows"],
+    deps = [
+        ":litert_lm",
+        "@absl_py//absl/flags",
+        "@absl_py//absl/testing:absltest",
+        "@absl_py//absl/testing:parameterized",
+    ],
+    imports = [".."],
+)
+
+py_test(
+    name = "model_info_test",
+    srcs = ["model_info_test.py"],
+    data = ["//runtime/testdata"],
+    tags = ["nowindows"],
+    deps = [
+        ":litert_lm",
+        "@absl_py//absl/flags",
+        "@absl_py//absl/testing:absltest",
+    ],
+    imports = [".."],
+)
+
+py_test(
+    name = "debug_artifacts_test",
+    srcs = ["debug_artifacts_test.py"],
+    tags = ["nowindows"],
+    deps = [
+        ":interfaces",
+        ":litert_lm",
+        ":session",
+        "@absl_py//absl/testing:absltest",
+    ],
+    imports = [".."],
+)
+
+py_test(
+    name = "embedding_engine_test",
+    srcs = ["embedding_engine_test.py"],
     data = ["//runtime/testdata"],
     tags = ["nowindows"],
     deps = [
@@ -167,11 +234,11 @@ load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
 load("//:version.bzl", "VERSION")
 load("//python/litert_lm:cc_runfiles.bzl", "cc_runfiles")
 
+# Prebuilt shared libraries staged alongside liblitert-lm.{so,dylib} so they can
+# be resolved via $ORIGIN / @loader_path at runtime.
 _PREBUILT_LIBS = [
     "libGemmaModelConstraintProvider",
-    "libLiteRtWebGpuAccelerator",
-    "libLiteRtTopKWebGpuSampler",
-    "libLiteRt",
+    "libwebgpu_dawn",
 ]
 
 genrule(

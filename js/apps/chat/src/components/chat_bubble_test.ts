@@ -16,7 +16,7 @@
 
 import './chat_bubble';
 
-import {ChatSessionStore} from '../stores/chat_session_store.js';
+import {ChatSessionStore, PromptMedia, PromptPart} from '../stores/chat_session_store.js';
 import {LlmChatStateController} from '../state_controller.js';
 import {LitertChatBubble} from './chat_bubble.js';
 
@@ -43,6 +43,7 @@ describe('litert-chat-bubble', () => {
     mockChatSession = jasmine.createSpyObj('ChatSessionStore', [
       'rewindAndEdit',
       'redoResponse',
+      'getMedia',
     ]);
     mockState = {
       chatSession: mockChatSession,
@@ -174,11 +175,12 @@ describe('litert-chat-bubble', () => {
     expect(editBtn.textContent!.trim()).toBe('✎ Edit');
 
     // Setup spy return
-    mockChatSession.rewindAndEdit.and.returnValue(Promise.resolve('Edit me'));
+    const parts: PromptPart[] = [{type: 'text', text: 'Edit me'}];
+    mockChatSession.rewindAndEdit.and.returnValue(Promise.resolve(parts));
 
-    let eventDetail: {prompt: string} | null = null;
+    let eventDetail: {parts: PromptPart[]}|null = null;
     element.addEventListener('edit-prompt', (e: Event) => {
-      eventDetail = (e as CustomEvent<{prompt: string}>).detail;
+      eventDetail = (e as CustomEvent<{parts: PromptPart[]}>).detail;
     });
 
     editBtn.click();
@@ -187,7 +189,64 @@ describe('litert-chat-bubble', () => {
     await new Promise(resolve => setTimeout(resolve, 50));
 
     expect(mockState.chatSession.rewindAndEdit).toHaveBeenCalledWith(4);
-    expect(eventDetail as {prompt: string} | null).toEqual({prompt: 'Edit me'});
+    expect(eventDetail as {parts: PromptPart[]} | null).toEqual({parts});
+  });
+
+  it('renders images and audio inline in a user message', async () => {
+    const image: PromptMedia = {
+      id: 'img1',
+      kind: 'image',
+      name: 'cat.png',
+      blob: new Blob(),
+      url: 'blob:fake-url',
+    };
+    const audio: PromptMedia = {
+      id: 'aud1',
+      kind: 'audio',
+      name: 'meow.wav',
+      blob: new Blob(),
+      url: 'blob:fake-audio-url',
+    };
+    const media = new Map([[image.id, image], [audio.id, audio]]);
+    mockChatSession.getMedia.and.callFake((id: string) => media.get(id));
+    element.message = {
+      role: 'user',
+      text: 'Before [image: cat.png] after [image: dog.png] ' +
+          '[audio: meow.wav] [audio: bark.wav]',
+      parts: [
+        {type: 'text', text: 'Before '},
+        {type: 'image', id: 'img1', name: 'cat.png'},
+        {type: 'text', text: ' after '},
+        {type: 'image', id: 'img2', name: 'dog.png'},
+        {type: 'text', text: ' '},
+        {type: 'audio', id: 'aud1', name: 'meow.wav'},
+        {type: 'text', text: ' '},
+        {type: 'audio', id: 'aud2', name: 'bark.wav'},
+      ],
+      senderName: 'User',
+    };
+    element.index = 0;
+    await element.updateComplete;
+
+    const content = element.shadowRoot!.querySelector('.message-user-text')!;
+    const img = content.querySelector('img.message-image') as HTMLImageElement;
+    expect(img).toBeTruthy();
+    expect(img.getAttribute('src')).toBe('blob:fake-url');
+    expect(img.alt).toBe('cat.png');
+
+    const audioEl =
+        content.querySelector('audio.message-audio') as HTMLAudioElement;
+    expect(audioEl).toBeTruthy();
+    expect(audioEl.getAttribute('src')).toBe('blob:fake-audio-url');
+
+    // Media from an earlier page load are shown as placeholders.
+    const missing = content.querySelectorAll('.message-media-missing');
+    expect(missing.length).toBe(2);
+    expect(missing[0]!.textContent).toContain('dog.png');
+    expect(missing[1]!.textContent).toContain('bark.wav');
+
+    expect(content.textContent).toContain('Before');
+    expect(content.textContent).toContain('after');
   });
 
   it('triggers redoResponse when user clicks Retry', async () => {
@@ -258,5 +317,44 @@ describe('litert-chat-bubble', () => {
     });
     
     expect(decodeURIComponent(escape(atob(eventDetail!.base64Code))).trim()).toBe('<h1>Hello</h1>');
+  });
+
+  it('renders inline and display LaTeX math', async () => {
+    element.message = {
+      role: 'assistant',
+      text: 'Inline math $e^{i\\pi} + 1 = 0$ and display math:\n$$f(x) = \\int_{-\\infty}^{\\infty} e^{-x^2} dx$$',
+      senderName: 'Assistant',
+    };
+    element.index = 8;
+    await element.updateComplete;
+
+    const content = element.shadowRoot!.querySelector('.message-content');
+    expect(content).toBeTruthy();
+
+    // Check KaTeX element exists
+    const katexElements = content!.querySelectorAll('.katex');
+    expect(katexElements.length).toBe(2);
+
+    // One of them should be in display mode (wrapped in .katex-display)
+    const displayKatex = content!.querySelector('.katex-display');
+    expect(displayKatex).toBeTruthy();
+    expect(displayKatex!.querySelector('.katex')).toBeTruthy();
+  });
+
+  it('does not render LaTeX math inside code blocks', async () => {
+    element.message = {
+      role: 'assistant',
+      text: 'Here is code with dollar: `const x = $5;` and a block:\n```\n$y = 6$\n```',
+      senderName: 'Assistant',
+    };
+    element.index = 9;
+    await element.updateComplete;
+
+    const content = element.shadowRoot!.querySelector('.message-content');
+    expect(content).toBeTruthy();
+
+    // There should be no KaTeX elements because they are in code blocks
+    const katexElements = content!.querySelectorAll('.katex');
+    expect(katexElements.length).toBe(0);
   });
 });

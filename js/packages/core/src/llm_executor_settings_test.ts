@@ -17,20 +17,26 @@
 import {LiteRtLm, loadLiteRtLm, unloadLiteRtLm, type Wasm} from '@litert-lm/core';
 // Placeholder for internal dependency on trusted resource url
 
+import {Cleanup} from './cleanup.js';
+import {createStreamingModelAssets} from './stream_utils.js';
+
 describe('LlmExecutorSettings', () => {
   let liteRtLm: LiteRtLm;
+  let cleanup: Cleanup;
   let modelAssets: Wasm.ModelAssets;
   let engineSettings: Wasm.EngineSettings;
   let llmExecutorSettings: Wasm.LlmExecutorSettings;
 
   beforeAll(async () => {
     unloadLiteRtLm();
-    liteRtLm = await loadLiteRtLm(trustedResourceUrl`/wasm`);
+    liteRtLm = await loadLiteRtLm('/wasm');
   });
 
-  beforeEach(() => {
-    modelAssets = liteRtLm.liteRtLmWasm.ModelAssets.create('/path/to/model');
-    engineSettings = liteRtLm.liteRtLmWasm.EngineSettings.createDefault(
+  beforeEach(async () => {
+    cleanup = new Cleanup();
+    ({modelAssets} = await createStreamingModelAssets(
+         new Blob([]), liteRtLm.liteRtLmWasm, cleanup));
+    engineSettings = await liteRtLm.liteRtLmWasm.EngineSettings.createDefault(
         modelAssets, liteRtLm.liteRtLmWasm.Backend.CPU);
     llmExecutorSettings = engineSettings.getMutableMainExecutorSettings();
   });
@@ -38,12 +44,17 @@ describe('LlmExecutorSettings', () => {
   afterEach(() => {
     // Do not delete llmExecutorSettings, as it is owned by engineSettings.
     engineSettings.delete();
-    modelAssets.delete();
+    cleanup.run();
   });
 
   it('sets and gets max num tokens', () => {
     llmExecutorSettings.setMaxNumTokens(100);
     expect(llmExecutorSettings.getMaxNumTokens()).toBe(100);
+  });
+
+  it('sets and gets max num images', () => {
+    llmExecutorSettings.setMaxNumImages(7);
+    expect(llmExecutorSettings.getMaxNumImages()).toBe(7);
   });
 
   it('sets and gets backend config CPU', () => {
@@ -58,7 +69,7 @@ describe('LlmExecutorSettings', () => {
 
   it('sets and gets backend config GPU', () => {
     const gpuConfig = {
-      max_top_k: 1,
+      max_top_k: 42,
       external_tensor_mode: true,
     };
     llmExecutorSettings.setBackendConfigGpu(gpuConfig);
@@ -67,7 +78,7 @@ describe('LlmExecutorSettings', () => {
 
   it('throws error if getting CPU config when GPU config is set', () => {
     const gpuConfig = {
-      max_top_k: 1,
+      max_top_k: 42,
       external_tensor_mode: true,
     };
     llmExecutorSettings.setBackendConfigGpu(gpuConfig);

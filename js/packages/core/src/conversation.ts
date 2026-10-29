@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import {Message, MessageLike} from './conversation_config.js';
+import {AudioContentPart, ContentPart, ImageContentPart, Message, MessageLike} from './conversation_config.js';
 import {Mutex} from './mutex.js';
 import {ChatInterface} from './orchestration/chat_interface.js';
 import {BenchmarkInfo, Conversation as WasmConversation, Engine as WasmEngine} from './wasm_binding_types.js';
@@ -31,18 +31,24 @@ export class Conversation implements ChatInterface {
   constructor(
       private readonly conversation: WasmConversation,
       private readonly engine: WasmEngine,
-      private readonly mutexes: {executor: Mutex}) {}
+      private readonly mutexes: {executor: Mutex},
+      /**
+       * Max vision tokens per image, passed to the image preprocessor. Should
+       * match the engine's `maxVisionTokensPerImage` so images fit the
+       * selected vision encoder signatures. 0 means no budget.
+       */
+      private readonly visualTokenBudget = 0) {}
 
-  async sendMessage(message: MessageLike|MessageLike[]): Promise<Message> {
+  async sendMessage(message: MessageLike): Promise<Message> {
     if (this.isBusy) {
       throw new Error(BUSY_MESSAGE);
     }
     this.isBusy = true;
     try {
+      const {json, blobs} = await serializeMessage(message);
       return await this.mutexes.executor.acquireAndRun(async () => {
-        const currentMessageJson = messageToJsonString(message);
-        const resultStr =
-            await this.conversation.sendMessage(currentMessageJson);
+        const resultStr = await this.conversation.sendMessage(
+            json, blobs, this.visualTokenBudget);
         return JSON.parse(resultStr) as Message;
       });
     } finally {
@@ -54,7 +60,7 @@ export class Conversation implements ChatInterface {
    * Sends a message to the LLM and returns a ReadableStream that yields
    * message chunks as they are generated.
    */
-  sendMessageStreaming(message: MessageLike|MessageLike[]):
+  sendMessageStreaming(message: MessageLike):
       ReadableStream<Message> {
     if (this.isBusy) {
       throw new Error(BUSY_MESSAGE);
@@ -65,12 +71,11 @@ export class Conversation implements ChatInterface {
     let hasErrored = false;
     return new ReadableStream<Message>({
       start: (controller) => {
-        const currentMessageJson = messageToJsonString(message);
-
         const executeGeneration = async(): Promise<void> => {
+          const {json, blobs} = await serializeMessage(message);
           await this.mutexes.executor.acquireAndRun(async () => {
             await this.conversation.sendMessageAsync(
-                currentMessageJson,
+                json, blobs,
                 (chunk: string|null, isDone: boolean, error: string|null) => {
                   if (isCancelled || hasErrored) return;
                   if (error) {
@@ -89,7 +94,8 @@ export class Conversation implements ChatInterface {
                       controller.error(e);
                     }
                   }
-                });
+                },
+                this.visualTokenBudget);
             // Since we're using the synchronus execution manager in C++, which
             // lazily executes tasks, we must queue the message and call
             // waitUntilDone to start the execution concurrently while holding
@@ -142,6 +148,27 @@ export class Conversation implements ChatInterface {
     });
   }
 
+  /**
+   * Clones the conversation. The cloned conversation will be independent of the
+   * original conversation, including the history, state, etc.
+   */
+  async clone(): Promise<Conversation> {
+    if (this.isBusy) {
+      throw new Error(BUSY_MESSAGE);
+    }
+    this.isBusy = true;
+    try {
+      return await this.mutexes.executor.acquireAndRun(() => {
+        const wasmClonedConversation = this.conversation.clone();
+        return new Conversation(
+            wasmClonedConversation, this.engine, this.mutexes,
+            this.visualTokenBudget);
+      });
+    } finally {
+      this.isBusy = false;
+    }
+  }
+
   async delete(): Promise<void> {
     await this.mutexes.executor.acquireAndRun(() => {
       this.conversation.delete();
@@ -149,14 +176,16 @@ export class Conversation implements ChatInterface {
   }
 }
 
-function messageToJsonString(messageLike: MessageLike|MessageLike[]): string {
-  let message: Message|Message[];
-  if (Array.isArray(messageLike)) {
-    message = messageLike.map(toMessage);
-  } else {
-    message = toMessage(messageLike);
-  }
-  return JSON.stringify(message);
+interface SerializedMessage {
+  json: string;
+  blobs: Uint8Array[];
+}
+
+async function serializeMessage(messageLike: MessageLike):
+    Promise<SerializedMessage> {
+  const blobs: Uint8Array[] = [];
+  const message = await toWireMessage(messageLike, blobs);
+  return {json: JSON.stringify(message), blobs};
 }
 
 function toMessage(messageLike: MessageLike): Message {
@@ -164,4 +193,47 @@ function toMessage(messageLike: MessageLike): Message {
     return {role: 'user', content: messageLike};
   }
   return messageLike;
+}
+
+/**
+ * Converts a message to the JSON-serializable form expected by the C++
+ * Conversation. Binary image and audio `data` is extracted into `blobs` and
+ * referenced by `blob_index`, while string `data` (already base64-encoded) is
+ * passed as `blob`.
+ */
+async function toWireMessage(
+    messageLike: MessageLike, blobs: Uint8Array[]): Promise<Message> {
+  const message = toMessage(messageLike);
+  if (!Array.isArray(message.content)) {
+    return message;
+  }
+  const content: ContentPart[] = [];
+  for (const part of message.content) {
+    if ((part.type !== 'image' && part.type !== 'audio') ||
+        !('data' in part) || part.data === undefined) {
+      content.push(part);
+      continue;
+    }
+    const {data, ...rest} = part as ImageContentPart | AudioContentPart;
+    if (typeof data === 'string') {
+      content.push({...rest, blob: data} as unknown as ContentPart);
+      continue;
+    }
+    const bytes = await toUint8Array(data);
+    const blobIndex = blobs.length;
+    blobs.push(bytes);
+    content.push({...rest, blob_index: blobIndex} as unknown as ContentPart);
+  }
+  return {...message, content};
+}
+
+async function toUint8Array(data: Uint8Array|ArrayBuffer|
+                            Blob): Promise<Uint8Array> {
+  if (data instanceof Blob) {
+    return new Uint8Array(await data.arrayBuffer());
+  }
+  if (data instanceof ArrayBuffer) {
+    return new Uint8Array(data);
+  }
+  return data;
 }

@@ -1,0 +1,161 @@
+// Copyright 2026 The ODML Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "runtime/util/streamed_weights_manager.h"
+
+#ifdef __EMSCRIPTEN__
+#include <algorithm>
+#include <cstddef>
+#include <cstring>
+#include <vector>
+
+#include "absl/types/span.h"  // from @com_google_absl
+#include <webgpu/webgpu_cpp.h>
+#include "weight_loader/external_weight_loader_litert.h"  // from @litert
+#endif  // __EMSCRIPTEN__
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <utility>
+
+#include "absl/container/flat_hash_map.h"  // from @com_google_absl
+#include "absl/status/status.h"  // from @com_google_absl
+#include "absl/strings/ascii.h"  // from @com_google_absl
+#include "absl/strings/str_cat.h"  // from @com_google_absl
+#include "absl/strings/string_view.h"  // from @com_google_absl
+#include "runtime/util/data_stream.h"
+
+namespace litert::lm {
+namespace {
+
+// Normalizes a model type wire string or enum name (e.g. "TF_LITE_EMBEDDER") to
+// the canonical lowercase wire string used as the registry key, matching
+// TfLiteModelTypeToWireString() and the other by-name ModelResources APIs.
+std::string NormalizeModelTypeKey(absl::string_view model_type_str) {
+  return absl::AsciiStrToLower(model_type_str);
+}
+
+// The model type wire string of the submodel currently being compiled, or
+// empty if unknown.
+std::string& CurrentlyCompilingModel() {
+  static auto* const model_type = new std::string();
+  return *model_type;
+}
+
+// Global map of stored weights streams, keyed by model type wire string.
+absl::flat_hash_map<std::string, std::shared_ptr<DataStream>>&
+GetStoredWeightsStreams() {
+  static auto* const m =
+      new absl::flat_hash_map<std::string, std::shared_ptr<DataStream>>();
+  return *m;
+}
+
+#ifdef __EMSCRIPTEN__
+absl::Status UploadStoredWeightsOnWeb(
+    const wgpu::Queue& queue,
+    absl::Span<const weight_loader::WebWeightUploadRequest> requests) {
+  std::vector<weight_loader::WebWeightUploadRequest> sorted_requests(
+      requests.begin(), requests.end());
+  // Requests should be sorted so we can efficiently discard chunks.
+  // Otherwise, DataStream caches any weight we skip over while reading until
+  // we eventually come back and read it.
+  std::sort(sorted_requests.begin(), sorted_requests.end(),
+            [](const auto& a, const auto& b) { return a.offset < b.offset; });
+
+  constexpr size_t kChunkSize = 4 * 1024 * 1024;  // 4 MB
+  std::vector<uint8_t> chunk_buf(kChunkSize);
+  const std::string model_type_str = GetCurrentlyCompilingModel();
+
+  for (const auto& req : sorted_requests) {
+    uint64_t bytes_uploaded = 0;
+    while (bytes_uploaded < req.length) {
+      const size_t chunk_size =
+          std::min<uint64_t>(kChunkSize, req.length - bytes_uploaded);
+      absl::Status status =
+          ReadStoredWeights(model_type_str, req.offset + bytes_uploaded,
+                            chunk_size, chunk_buf.data());
+      if (!status.ok()) {
+        return status;
+      }
+
+      // WebGPU writeBuffer requires data size to be a multiple of 4 bytes.
+      const size_t aligned_size = (chunk_size + 3) & ~static_cast<size_t>(3);
+      if (aligned_size > chunk_size) {
+        std::memset(chunk_buf.data() + chunk_size, 0,
+                    aligned_size - chunk_size);
+      }
+      queue.WriteBuffer(req.buffer, bytes_uploaded, chunk_buf.data(),
+                        aligned_size);
+      bytes_uploaded += chunk_size;
+    }
+  }
+  return absl::OkStatus();
+}
+#endif  // __EMSCRIPTEN__
+
+}  // namespace
+
+void SetCurrentlyCompilingModel(absl::string_view model_type_str) {
+  CurrentlyCompilingModel() = NormalizeModelTypeKey(model_type_str);
+}
+
+std::string GetCurrentlyCompilingModel() { return CurrentlyCompilingModel(); }
+
+void StoreWeightsStream(absl::string_view model_type_str,
+                        std::shared_ptr<DataStream> stream) {
+#ifdef __EMSCRIPTEN__
+  weight_loader::RegisterWebWeightUploadCallback(&UploadStoredWeightsOnWeb);
+#endif  // __EMSCRIPTEN__
+  GetStoredWeightsStreams()[NormalizeModelTypeKey(model_type_str)] =
+      std::move(stream);
+}
+
+absl::Status ReadStoredWeights(absl::string_view model_type_str,
+                               uint64_t offset, uint64_t size, void* buffer) {
+  const std::string key = NormalizeModelTypeKey(model_type_str);
+  auto& streams = GetStoredWeightsStreams();
+  auto it = streams.find(key);
+  if (it == streams.end() || it->second == nullptr) {
+    return absl::NotFoundError(absl::StrCat(
+        "Stored weights stream not found for model type: ", model_type_str));
+  }
+  return it->second->ReadAndDiscard(buffer, offset, size);
+}
+
+absl::Status ClearStoredWeightsStream(absl::string_view model_type_str) {
+  const std::string key = NormalizeModelTypeKey(model_type_str);
+  auto& streams = GetStoredWeightsStreams();
+  auto it = streams.find(key);
+  if (it != streams.end()) {
+    if (it->second) {
+      (void)it->second->Discard(0, UINT64_MAX);
+    }
+    streams.erase(it);
+  }
+  return absl::OkStatus();
+}
+
+absl::Status ClearStoredWeightsStreams() {
+  auto& streams = GetStoredWeightsStreams();
+  for (auto& [model_type, stream] : streams) {
+    if (stream) {
+      (void)stream->Discard(0, UINT64_MAX);
+    }
+  }
+  streams.clear();
+  return absl::OkStatus();
+}
+
+}  // namespace litert::lm

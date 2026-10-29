@@ -15,6 +15,10 @@
 #include "runtime/framework/resource_management/execution_manager.h"
 
 #include <atomic>
+#include <cstdint>
+#include <filesystem>  // NOLINT
+#include <fstream>
+#include <ios>
 #include <memory>
 #include <optional>
 #include <string>
@@ -25,28 +29,35 @@
 #include <gtest/gtest.h>
 #include "absl/functional/any_invocable.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
-#include "support/tokenizer/tokenizer.h"  // from @litert
-#include "runtime/components/logits_processor/constrained_decoding/fake_constraint.h"
-#include "runtime/components/logits_processor/repetition_penalty_config.h"
+#include "runtime/components/constrained_decoding/fake_constraint.h"
+#include "runtime/components/constrained_decoding/no_repeat_ngram_config.h"
+#include "runtime/components/constrained_decoding/repetition_penalty_config.h"
+#include "runtime/components/constrained_decoding/suppress_tokens_config.h"
 #include "runtime/components/model_resources.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
-#include "runtime/executor/audio_executor.h"
-#include "runtime/executor/audio_executor_settings.h"
+#include "runtime/executor/audio/audio_executor.h"
+#include "runtime/executor/audio/audio_executor_settings.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/fake_llm_executor.h"
 #include "runtime/executor/llm_executor_io_types.h"
+#include "runtime/executor/llm_executor_settings.h"
 #include "runtime/framework/resource_management/serial_execution_manager.h"
 #include "runtime/framework/resource_management/threaded_execution_manager.h"
 #include "runtime/proto/token.pb.h"
+#include "runtime/util/convert_tensor_buffer.h"
+#include "runtime/util/scoped_file.h"
 #include "runtime/util/status_macros.h"  // IWYU pragma: keep
 #include "runtime/util/test_utils.h"  // NOLINT
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
 
@@ -59,6 +70,7 @@ using ::testing::ElementsAre;
 using ::testing::Return;
 
 constexpr int kVocabSize = 10;
+constexpr int kValidTokensInAudioData = 4;
 
 class MockTokenizer : public Tokenizer {
  public:
@@ -67,17 +79,117 @@ class MockTokenizer : public Tokenizer {
   MOCK_METHOD(absl::StatusOr<int>, TokenToId, (absl::string_view token),
               (override));
   MOCK_METHOD(absl::StatusOr<std::string>, TokenIdsToText,
-              (const std::vector<int>& token_ids), (override));
+              (absl::Span<const int> token_ids, bool skip_special_tokens),
+              (override));
   MOCK_METHOD(TokenizerType, GetTokenizerType, (), (const, override));
   MOCK_METHOD(std::vector<std::string>, GetTokens, (), (const, override));
   MOCK_METHOD(int, GetVocabSize, (), (const, override));
 };
 
+class FakeAudioContext : public AudioContext {
+ public:
+  FakeAudioContext() = default;
+  absl::StatusOr<std::unique_ptr<AudioContext>> Clone() const override {
+    return std::make_unique<FakeAudioContext>(*this);
+  }
+};
+
 class FakeAudioExecutor : public AudioExecutor {
  public:
-  absl::StatusOr<::litert::lm::ExecutorAudioData> Encode(
-      const litert::TensorBuffer& spectrogram_tensor) override {
-    return ::litert::lm::ExecutorAudioData();
+  absl::StatusOr<ExecutorAudioData> Encode(
+      const TensorBuffer& spectrogram_tensor) override {
+    ExecutorAudioData data;
+    data.SetValidTokens(kValidTokensInAudioData);
+    return data;
+  }
+
+  absl::Status Reset() override {
+    reset_called_ = true;
+    return absl::OkStatus();
+  }
+
+  absl::StatusOr<ExecutorAudioData> Flush() override {
+    flush_called_ = true;
+    ExecutorAudioData data;
+    data.SetValidTokens(kValidTokensInAudioData);
+    return data;
+  }
+
+  absl::StatusOr<std::unique_ptr<AudioContext>> CreateNewContext() override {
+    return std::make_unique<FakeAudioContext>();
+  }
+
+  absl::StatusOr<std::unique_ptr<AudioContext>> CloneContext() override {
+    return std::make_unique<FakeAudioContext>();
+  }
+
+  absl::StatusOr<std::unique_ptr<AudioContext>> CloneContext(
+      const AudioContext& audio_context) override {
+    return audio_context.Clone();
+  }
+
+  absl::Status RestoreContext(
+      std::unique_ptr<AudioContext> audio_context) override {
+    return absl::OkStatus();
+  }
+
+  absl::Status LoadLoRA(uint32_t lora_id,
+                        const ModelAssets& model_assets) override {
+    if (!load_lora_status_.ok()) {
+      return load_lora_status_;
+    }
+    loaded_lora_ids_.push_back(lora_id);
+    return absl::OkStatus();
+  }
+
+  absl::Status UseLoRA(std::optional<uint32_t> lora_id) override {
+    used_lora_ids_.push_back(lora_id);
+    return absl::OkStatus();
+  }
+
+  bool reset_called_ = false;
+  bool flush_called_ = false;
+  absl::Status load_lora_status_ = absl::OkStatus();
+  std::vector<uint32_t> loaded_lora_ids_;
+  std::vector<std::optional<uint32_t>> used_lora_ids_;
+};
+
+class NonStreamingFakeAudioExecutor : public AudioExecutor {
+ public:
+  absl::StatusOr<ExecutorAudioData> Encode(
+      const TensorBuffer& spectrogram_tensor) override {
+    ExecutorAudioData data;
+    data.SetValidTokens(kValidTokensInAudioData);
+    return data;
+  }
+
+  absl::Status Reset() override {
+    reset_called_ = true;
+    return absl::OkStatus();
+  }
+
+  absl::StatusOr<ExecutorAudioData> Flush() override {
+    flush_called_ = true;
+    ExecutorAudioData data;
+    data.SetValidTokens(0);
+    return data;
+  }
+
+  // Intentionally do NOT override CreateNewContext, CloneContext,
+  // RestoreContext; they return absl::UnimplementedError from
+  // AudioExecutorBase.
+
+  bool reset_called_ = false;
+  bool flush_called_ = false;
+};
+
+class FailingAudioExecutor : public AudioExecutor {
+ public:
+  absl::StatusOr<ExecutorAudioData> Encode(
+      const TensorBuffer& spectrogram_tensor) override {
+    return absl::InternalError(
+        "Encode() should not be called when precomputed audio embeddings are "
+        "provided.");
   }
 };
 
@@ -91,23 +203,24 @@ class ExecutionManagerTest
  protected:
   void SetUp() override {
     tokenizer_ = std::make_unique<MockTokenizer>();
-    EXPECT_CALL(*tokenizer_, TokenIdsToText(ElementsAre(0)))
-        .WillRepeatedly(Return("0"));
-    EXPECT_CALL(*tokenizer_, TokenIdsToText(ElementsAre(4)))
-        .WillRepeatedly(Return("4"));
-    EXPECT_CALL(*tokenizer_, TokenIdsToText(ElementsAre(5)))
-        .WillRepeatedly(Return("5"));
-    EXPECT_CALL(*tokenizer_, TokenIdsToText(ElementsAre(6)))
-        .WillRepeatedly(Return("6"));
+    EXPECT_CALL(*tokenizer_, TokenIdsToText(testing::_, false))
+        .WillRepeatedly(
+            [](absl::Span<const int> ids, bool skip_special_tokens) {
+              std::string result;
+              for (int id : ids) {
+                result += std::to_string(id);
+              }
+              return result;
+            });
     EXPECT_CALL(*tokenizer_, GetVocabSize()).WillRepeatedly(Return(kVocabSize));
   }
 
   absl::StatusOr<SessionConfig> CreateDefaultSessionConfig(
       bool use_external_sampler = false) {
-    ASSIGN_OR_RETURN(auto model_assets,
-                     ModelAssets::Create("test_model_path_1"));
-    ASSIGN_OR_RETURN(auto settings,
-                     EngineSettings::CreateDefault(model_assets));
+    ABSL_ASSIGN_OR_RETURN(auto model_assets,
+                          ModelAssets::Create("test_model_path_1"));
+    ABSL_ASSIGN_OR_RETURN(auto settings,
+                          EngineSettings::CreateDefault(model_assets));
 
     proto::LlmMetadata llm_metadata;
     llm_metadata.mutable_stop_tokens()
@@ -250,9 +363,10 @@ TEST_P(ExecutionManagerTest, AddPrefillTaskWithAudioModality) {
 
   ASSERT_OK_AND_ASSIGN(auto model_assets,
                        ModelAssets::Create("test_model_path_2"));
-  ASSERT_OK_AND_ASSIGN(auto audio_settings,
-                       AudioExecutorSettings::CreateDefault(
-                           model_assets, 128, Backend::GPU_ARTISAN));
+  ASSERT_OK_AND_ASSIGN(
+      auto audio_settings,
+      AudioExecutorSettings::CreateDefault(
+          model_assets, 128, Backend::GPU_ARTISAN, Backend::GPU_ARTISAN));
 
   CreateExecutionManager(
       std::move(fake_llm_executor),
@@ -279,6 +393,162 @@ TEST_P(ExecutionManagerTest, AddPrefillTaskWithAudioModality) {
       std::make_shared<std::atomic<bool>>(false), nullptr));
 
   EXPECT_OK(execution_manager_->WaitUntilDone(task_id, absl::Seconds(3)));
+}
+
+TEST_P(ExecutionManagerTest, EncodeAudioWithSessionInfo) {
+  auto fake_llm_executor = CreateDefaultFakeLlmExecutor();
+
+  ASSERT_OK_AND_ASSIGN(auto* settings,
+                       fake_llm_executor->GetMutableExecutorSettings());
+  EXPECT_OK(settings->SetBackend(Backend::GPU_ARTISAN));
+
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create("test_model_path_2"));
+  ASSERT_OK_AND_ASSIGN(
+      auto audio_settings,
+      AudioExecutorSettings::CreateDefault(
+          model_assets, 128, Backend::GPU_ARTISAN, Backend::GPU_ARTISAN));
+
+  auto fake_audio_executor = std::make_unique<FakeAudioExecutor>();
+  auto* fake_audio_executor_ptr = fake_audio_executor.get();
+
+  CreateExecutionManager(
+      std::move(fake_llm_executor),
+      std::make_unique<AudioExecutorSettings>(std::move(audio_settings)),
+      std::move(fake_audio_executor));
+
+  ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig());
+  ASSERT_OK_AND_ASSIGN(const SessionId session_id,
+                       execution_manager_->RegisterNewSession(session_config));
+  ASSERT_OK_AND_ASSIGN(auto session_info,
+                       execution_manager_->GetSessionInfo(session_id));
+
+  const std::vector<float> kSpectrogramData = {1.0f, 2.0f, 3.0f, 4.0f};
+  auto tensor_or = CopyToTensorBuffer<float>(kSpectrogramData, {1, 4});
+  ASSERT_TRUE(tensor_or.HasValue());
+
+  ASSERT_OK_AND_ASSIGN(auto audio_data, execution_manager_->EncodeAudio(
+                                            *session_info, *tensor_or));
+  EXPECT_EQ(audio_data.GetValidTokens(), 4);
+
+  EXPECT_OK(execution_manager_->ResetAudio(*session_info));
+  EXPECT_TRUE(fake_audio_executor_ptr->reset_called_);
+
+  ASSERT_OK_AND_ASSIGN(auto flush_data,
+                       execution_manager_->FlushAudio(*session_info));
+  EXPECT_EQ(flush_data.GetValidTokens(), 4);
+  EXPECT_TRUE(fake_audio_executor_ptr->flush_called_);
+}
+
+TEST_P(ExecutionManagerTest, EncodeAudioWithNonStreamingAudioExecutor) {
+  auto fake_llm_executor = CreateDefaultFakeLlmExecutor();
+
+  ASSERT_OK_AND_ASSIGN(auto* settings,
+                       fake_llm_executor->GetMutableExecutorSettings());
+  EXPECT_OK(settings->SetBackend(Backend::GPU_ARTISAN));
+
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create("test_model_path_2"));
+  ASSERT_OK_AND_ASSIGN(
+      auto audio_settings,
+      AudioExecutorSettings::CreateDefault(
+          model_assets, 128, Backend::GPU_ARTISAN, Backend::GPU_ARTISAN));
+
+  auto fake_audio_executor = std::make_unique<NonStreamingFakeAudioExecutor>();
+  auto* fake_audio_executor_ptr = fake_audio_executor.get();
+
+  CreateExecutionManager(
+      std::move(fake_llm_executor),
+      std::make_unique<AudioExecutorSettings>(std::move(audio_settings)),
+      std::move(fake_audio_executor));
+
+  ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig());
+  ASSERT_OK_AND_ASSIGN(const SessionId session_id,
+                       execution_manager_->RegisterNewSession(session_config));
+  ASSERT_OK_AND_ASSIGN(auto session_info,
+                       execution_manager_->GetSessionInfo(session_id));
+
+  const std::vector<float> kSpectrogramData = {1.0f, 2.0f, 3.0f, 4.0f};
+  auto tensor_or = CopyToTensorBuffer<float>(kSpectrogramData, {1, 4});
+  ASSERT_TRUE(tensor_or.HasValue());
+
+  ASSERT_OK_AND_ASSIGN(auto audio_data, execution_manager_->EncodeAudio(
+                                            *session_info, *tensor_or));
+  EXPECT_EQ(audio_data.GetValidTokens(), 4);
+
+  EXPECT_OK(execution_manager_->ResetAudio(*session_info));
+  EXPECT_TRUE(fake_audio_executor_ptr->reset_called_);
+
+  ASSERT_OK_AND_ASSIGN(auto flush_data,
+                       execution_manager_->FlushAudio(*session_info));
+  EXPECT_EQ(flush_data.GetValidTokens(), 0);
+  EXPECT_TRUE(fake_audio_executor_ptr->flush_called_);
+}
+
+TEST_P(ExecutionManagerTest, AddPrefillTaskWithPrecomputedAudioEmbeddings) {
+  const std::vector<float> kEmbeddingData = {1.0f, 2.0f, 3.0f, 4.0f,
+                                             5.0f, 6.0f, 7.0f, 8.0f};
+  auto embedding_tensor_or = CopyToTensorBuffer<float>(kEmbeddingData, {2, 4});
+  ASSERT_TRUE(embedding_tensor_or.HasValue());
+  auto embedding_tensor = std::move(*embedding_tensor_or);
+
+  auto fake_llm_executor = std::make_unique<FakeLlmExecutor>(
+      kVocabSize,
+      std::vector<std::vector<int>>{{1, 2, 3, ExecutorAudioData::kSpecialToken,
+                                     ExecutorAudioData::kSpecialToken,
+                                     ExecutorAudioData::kEndToken}},
+      std::vector<std::vector<int>>{{4}, {5}, {6}},
+      /*batch_size=*/1,
+      /*projected_audio_embedding=*/kEmbeddingData);
+
+  ASSERT_OK_AND_ASSIGN(auto* settings,
+                       fake_llm_executor->GetMutableExecutorSettings());
+  EXPECT_OK(settings->SetBackend(Backend::GPU_ARTISAN));
+
+  ASSERT_OK_AND_ASSIGN(auto model_assets,
+                       ModelAssets::Create("test_model_path_2"));
+  ASSERT_OK_AND_ASSIGN(
+      auto audio_settings,
+      AudioExecutorSettings::CreateDefault(
+          model_assets, 128, Backend::GPU_ARTISAN, Backend::GPU_ARTISAN));
+
+  CreateExecutionManager(
+      std::move(fake_llm_executor),
+      std::make_unique<AudioExecutorSettings>(std::move(audio_settings)),
+      std::make_unique<FailingAudioExecutor>());
+
+  ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig());
+  session_config.SetAudioModalityEnabled(true);
+
+  ASSERT_OK_AND_ASSIGN(const SessionId session_id,
+                       execution_manager_->RegisterNewSession(session_config));
+
+  std::vector<InputData> inputs;
+  ASSERT_OK_AND_ASSIGN(auto input_text,
+                       tokenizer_->TokenIdsToTensorBuffer({1, 2, 3}));
+  inputs.push_back(InputText(std::move(input_text)));
+  inputs.push_back(
+      InputAudio(std::move(embedding_tensor), /*is_embeddings=*/true));
+  inputs.push_back(InputAudioEnd());
+
+  std::vector<TaskState> task_states;
+  absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback =
+      [&task_states](absl::StatusOr<Responses> responses) {
+        ASSERT_OK(responses);
+        task_states.push_back(responses->GetTaskState());
+      };
+
+  ASSERT_OK_AND_ASSIGN(const TaskId task_id,
+                       execution_manager_->GetNewTaskId());
+  ASSERT_OK(execution_manager_->AddPrefillTask(
+      session_id, task_id, std::move(inputs), {},
+      std::make_shared<std::atomic<bool>>(false), std::move(callback)));
+
+  EXPECT_OK(execution_manager_->WaitUntilDone(task_id, absl::Seconds(3)));
+
+  EXPECT_THAT(task_states,
+              ElementsAre(TaskState::kCreated, TaskState::kQueued,
+                          TaskState::kProcessing, TaskState::kDone));
 }
 
 TEST_P(ExecutionManagerTest, AddPrefillTaskInvalidAudioInput) {
@@ -405,6 +675,7 @@ TEST_P(ExecutionManagerTest, AddDecodeTaskWithInternalSampler) {
   ASSERT_OK(execution_manager_->AddDecodeTask(
       session_id, decode_task_id,
       /*dependency_task_ids=*/{}, RepetitionPenaltyConfig::Default(),
+      NoRepeatNgramConfig::Default(), SuppressTokensConfig::Default(),
       /*constraint=*/nullptr,
       /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
       std::move(callback)));
@@ -465,6 +736,7 @@ TEST_P(ExecutionManagerTest, AddDecodeTaskWithExternalSampler) {
   ASSERT_OK(execution_manager_->AddDecodeTask(
       session_id, decode_task_id,
       /*dependency_task_ids=*/{}, RepetitionPenaltyConfig::Default(),
+      NoRepeatNgramConfig::Default(), SuppressTokensConfig::Default(),
       /*constraint=*/nullptr,
       /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
       std::move(callback)));
@@ -505,6 +777,7 @@ TEST_P(ExecutionManagerTest, CreateAndRunDependentTasks) {
   ASSERT_OK(execution_manager_->AddDecodeTask(
       session_id, task_b_id,
       /*dependency_task_ids=*/{task_a_id}, RepetitionPenaltyConfig::Default(),
+      NoRepeatNgramConfig::Default(), SuppressTokensConfig::Default(),
       /*constraint=*/nullptr,
       /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
       /*callback=*/nullptr));
@@ -606,6 +879,7 @@ TEST_P(ExecutionManagerTest, WaitUntilTaskDoneTimeout) {
   ASSERT_OK(execution_manager_->AddDecodeTask(
       session_id, task_id,
       /*dependency_task_ids=*/{}, RepetitionPenaltyConfig::Default(),
+      NoRepeatNgramConfig::Default(), SuppressTokensConfig::Default(),
       /*constraint=*/nullptr,
       /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
       /*callback=*/nullptr));
@@ -648,6 +922,7 @@ TEST_P(ExecutionManagerTest, WaitUntilAllDoneTimeout) {
   ASSERT_OK(execution_manager_->AddDecodeTask(
       session_id, task_id,
       /*dependency_task_ids=*/{}, RepetitionPenaltyConfig::Default(),
+      NoRepeatNgramConfig::Default(), SuppressTokensConfig::Default(),
       /*constraint=*/nullptr,
       /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
       /*callback=*/nullptr));
@@ -744,6 +1019,7 @@ TEST_P(ExecutionManagerTest, CreateDependentTaskOnFailedTask) {
   ASSERT_OK(execution_manager_->AddDecodeTask(
       session_id, task_b_id,
       /*dependency_task_ids=*/{task_a_id}, RepetitionPenaltyConfig::Default(),
+      NoRepeatNgramConfig::Default(), SuppressTokensConfig::Default(),
       /*constraint=*/nullptr,
       /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
       [&](absl::StatusOr<Responses> responses) {
@@ -811,6 +1087,7 @@ TEST_P(ExecutionManagerTest,
   ASSERT_OK(execution_manager_->AddDecodeTask(
       session_id, task_b_id,
       /*dependency_task_ids=*/{task_a_id}, repetition_penalty_config,
+      NoRepeatNgramConfig::Default(), SuppressTokensConfig::Default(),
       /*constraint=*/nullptr,
       /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
       std::move(callback)));
@@ -874,6 +1151,7 @@ TEST_P(ExecutionManagerTest,
   ASSERT_OK(execution_manager_->AddDecodeTask(
       session_id, task_b_id,
       /*dependency_task_ids=*/{task_a_id}, repetition_penalty_config,
+      NoRepeatNgramConfig::Default(), SuppressTokensConfig::Default(),
       /*constraint=*/nullptr,
       /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
       std::move(callback)));
@@ -881,6 +1159,252 @@ TEST_P(ExecutionManagerTest,
   EXPECT_OK(execution_manager_->WaitUntilDone(task_b_id, absl::Seconds(3)));
 
   EXPECT_THAT(response_texts, ElementsAre("4", "5"));
+}
+
+TEST_P(ExecutionManagerTest,
+       AddDecodeTaskWithNoRepeatNgramConfigWithInternalSampler) {
+  std::vector<std::vector<int>> prefill_tokens = {{1}, {0}};
+  std::vector<std::vector<int>> decode_tokens = {{4}, {5}, {4}, {5}, {6}};
+
+  auto fake_llm_executor = std::make_unique<FakeLlmExecutor>(
+      kVocabSize,
+      /*prefill_tokens=*/std::move(prefill_tokens),
+      /*decode_tokens=*/std::move(decode_tokens));
+  fake_llm_executor->SetDecodeLogitsOptions(
+      FakeLlmExecutor::DecodeLogitsOptions{.match_value = 10.0f,
+                                           .mismatch_value = -10.0f,
+                                           .end_token_id = 6,
+                                           .mismatch_end_token_value = 0.0f});
+
+  CreateExecutionManager(std::move(fake_llm_executor));
+
+  ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig());
+  ASSERT_OK_AND_ASSIGN(const SessionId session_id,
+                       execution_manager_->RegisterNewSession(session_config));
+
+  std::vector<InputData> inputs;
+  ASSERT_OK_AND_ASSIGN(auto input_text,
+                       tokenizer_->TokenIdsToTensorBuffer({1}));
+  inputs.push_back(InputText(std::move(input_text)));
+  ASSERT_OK_AND_ASSIGN(const TaskId task_a_id,
+                       execution_manager_->GetNewTaskId());
+  ASSERT_OK(execution_manager_->AddPrefillTask(
+      session_id, task_a_id, std::move(inputs),
+      /*dependency_task_ids=*/{},
+      /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
+      /*callback=*/nullptr));
+
+  // Set no repeat ngram config to ban the repetition of bigrams (i.e. "4, 5"
+  // and "5, 4").
+  NoRepeatNgramConfig config(/*no_repeat_ngram_size=*/2, /*window_size=*/5);
+
+  std::vector<std::string> response_texts;
+  absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback =
+      [&response_texts](absl::StatusOr<Responses> responses) {
+        ASSERT_OK(responses);
+        if (!responses->GetTexts().empty()) {
+          response_texts.push_back(responses->GetTexts()[0]);
+        }
+      };
+
+  ASSERT_OK_AND_ASSIGN(const TaskId task_b_id,
+                       execution_manager_->GetNewTaskId());
+  ASSERT_OK(execution_manager_->AddDecodeTask(
+      session_id, task_b_id,
+      /*dependency_task_ids=*/{task_a_id}, RepetitionPenaltyConfig::Default(),
+      config, SuppressTokensConfig::Default(),
+      /*constraint=*/nullptr,
+      /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
+      std::move(callback)));
+
+  EXPECT_OK(execution_manager_->WaitUntilDone(task_b_id, absl::Seconds(3)));
+
+  EXPECT_THAT(response_texts, ElementsAre("4", "5", "4"));
+}
+
+TEST_P(ExecutionManagerTest,
+       AddDecodeTaskWithNoRepeatNgramConfigWithExternalSampler) {
+  std::vector<std::vector<int>> prefill_tokens = {{1}, {6}};
+  std::vector<std::vector<int>> decode_tokens = {{4}, {5}, {4}, {5}, {6}};
+
+  auto fake_llm_executor = std::make_unique<FakeLlmExecutor>(
+      kVocabSize,
+      /*prefill_tokens=*/std::move(prefill_tokens),
+      /*decode_tokens=*/std::move(decode_tokens));
+  fake_llm_executor->SetDecodeLogitsOptions(
+      FakeLlmExecutor::DecodeLogitsOptions{.match_value = 10.0f,
+                                           .mismatch_value = -10.0f,
+                                           .end_token_id = 6,
+                                           .mismatch_end_token_value = 0.0f});
+
+  CreateExecutionManager(std::move(fake_llm_executor));
+
+  ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig(
+                                                /*use_external_sampler=*/true));
+  ASSERT_OK_AND_ASSIGN(const SessionId session_id,
+                       execution_manager_->RegisterNewSession(session_config));
+
+  std::vector<InputData> inputs;
+  ASSERT_OK_AND_ASSIGN(auto input_text,
+                       tokenizer_->TokenIdsToTensorBuffer({1}));
+  inputs.push_back(InputText(std::move(input_text)));
+  ASSERT_OK_AND_ASSIGN(const TaskId task_a_id,
+                       execution_manager_->GetNewTaskId());
+  ASSERT_OK(execution_manager_->AddPrefillTask(
+      session_id, task_a_id, std::move(inputs),
+      /*dependency_task_ids=*/{},
+      /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
+      /*callback=*/nullptr));
+
+  // Set no repeat ngram config to ban the repetition of bigrams (i.e. "4, 5"
+  // and "5, 4").
+  NoRepeatNgramConfig config(/*no_repeat_ngram_size=*/2, /*window_size=*/5);
+
+  std::vector<std::string> response_texts;
+  absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback =
+      [&response_texts](absl::StatusOr<Responses> responses) {
+        ASSERT_OK(responses);
+        if (!responses->GetTexts().empty()) {
+          response_texts.push_back(responses->GetTexts()[0]);
+        }
+      };
+
+  ASSERT_OK_AND_ASSIGN(const TaskId task_b_id,
+                       execution_manager_->GetNewTaskId());
+  ASSERT_OK(execution_manager_->AddDecodeTask(
+      session_id, task_b_id,
+      /*dependency_task_ids=*/{task_a_id}, RepetitionPenaltyConfig::Default(),
+      config, SuppressTokensConfig::Default(),
+      /*constraint=*/nullptr,
+      /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
+      std::move(callback)));
+
+  EXPECT_OK(execution_manager_->WaitUntilDone(task_b_id, absl::Seconds(3)));
+
+  EXPECT_THAT(response_texts, ElementsAre("4", "5", "4"));
+}
+
+TEST_P(ExecutionManagerTest,
+       AddDecodeTaskWithSuppressTokensConfigWithInternalSampler) {
+  std::vector<std::vector<int>> prefill_tokens = {{1}, {0}};
+  std::vector<std::vector<int>> decode_tokens = {{4}, {4}, {5}, {5}, {6}};
+
+  auto fake_llm_executor = std::make_unique<FakeLlmExecutor>(
+      kVocabSize,
+      /*prefill_tokens=*/std::move(prefill_tokens),
+      /*decode_tokens=*/std::move(decode_tokens));
+  fake_llm_executor->SetDecodeLogitsOptions(
+      FakeLlmExecutor::DecodeLogitsOptions{.match_value = 10.0f,
+                                           .mismatch_value = -10.0f,
+                                           .end_token_id = 6,
+                                           .mismatch_end_token_value = 0.0f});
+
+  CreateExecutionManager(std::move(fake_llm_executor));
+
+  ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig());
+  ASSERT_OK_AND_ASSIGN(const SessionId session_id,
+                       execution_manager_->RegisterNewSession(session_config));
+
+  std::vector<InputData> inputs;
+  ASSERT_OK_AND_ASSIGN(auto input_text,
+                       tokenizer_->TokenIdsToTensorBuffer({1}));
+  inputs.push_back(InputText(std::move(input_text)));
+  ASSERT_OK_AND_ASSIGN(const TaskId task_a_id,
+                       execution_manager_->GetNewTaskId());
+  ASSERT_OK(execution_manager_->AddPrefillTask(
+      session_id, task_a_id, std::move(inputs),
+      /*dependency_task_ids=*/{},
+      /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
+      /*callback=*/nullptr));
+
+  std::vector<std::string> response_texts;
+  absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback =
+      [&response_texts](absl::StatusOr<Responses> responses) {
+        ASSERT_OK(responses);
+        if (!responses->GetTexts().empty()) {
+          response_texts.push_back(responses->GetTexts()[0]);
+        }
+      };
+
+  // Suppress token "5".
+  ASSERT_OK_AND_ASSIGN(const TaskId task_b_id,
+                       execution_manager_->GetNewTaskId());
+  ASSERT_OK(execution_manager_->AddDecodeTask(
+      session_id, task_b_id,
+      /*dependency_task_ids=*/{task_a_id}, RepetitionPenaltyConfig::Default(),
+      NoRepeatNgramConfig::Default(),
+      SuppressTokensConfig(/*suppress_tokens=*/{
+          5,
+      }),
+      /*constraint=*/nullptr,
+      /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
+      std::move(callback)));
+
+  EXPECT_OK(execution_manager_->WaitUntilDone(task_b_id, absl::Seconds(3)));
+
+  EXPECT_THAT(response_texts, ElementsAre("4", "4"));
+}
+
+TEST_P(ExecutionManagerTest,
+       AddDecodeTaskWithSuppressTokensConfigWithExternalSampler) {
+  std::vector<std::vector<int>> prefill_tokens = {{1}, {6}};
+  std::vector<std::vector<int>> decode_tokens = {{4}, {4}, {5}, {5}, {6}};
+
+  auto fake_llm_executor = std::make_unique<FakeLlmExecutor>(
+      kVocabSize,
+      /*prefill_tokens=*/std::move(prefill_tokens),
+      /*decode_tokens=*/std::move(decode_tokens));
+  fake_llm_executor->SetDecodeLogitsOptions(
+      FakeLlmExecutor::DecodeLogitsOptions{.match_value = 10.0f,
+                                           .mismatch_value = -10.0f,
+                                           .end_token_id = 6,
+                                           .mismatch_end_token_value = 0.0f});
+
+  CreateExecutionManager(std::move(fake_llm_executor));
+
+  ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig(
+                                                /*use_external_sampler=*/true));
+  ASSERT_OK_AND_ASSIGN(const SessionId session_id,
+                       execution_manager_->RegisterNewSession(session_config));
+
+  std::vector<InputData> inputs;
+  ASSERT_OK_AND_ASSIGN(auto input_text,
+                       tokenizer_->TokenIdsToTensorBuffer({1}));
+  inputs.push_back(InputText(std::move(input_text)));
+  ASSERT_OK_AND_ASSIGN(const TaskId task_a_id,
+                       execution_manager_->GetNewTaskId());
+  ASSERT_OK(execution_manager_->AddPrefillTask(
+      session_id, task_a_id, std::move(inputs),
+      /*dependency_task_ids=*/{},
+      /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
+      /*callback=*/nullptr));
+
+  std::vector<std::string> response_texts;
+  absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback =
+      [&response_texts](absl::StatusOr<Responses> responses) {
+        ASSERT_OK(responses);
+        if (!responses->GetTexts().empty()) {
+          response_texts.push_back(responses->GetTexts()[0]);
+        }
+      };
+
+  // Suppress token "5".
+  ASSERT_OK_AND_ASSIGN(const TaskId task_b_id,
+                       execution_manager_->GetNewTaskId());
+  ASSERT_OK(execution_manager_->AddDecodeTask(
+      session_id, task_b_id,
+      /*dependency_task_ids=*/{task_a_id}, RepetitionPenaltyConfig::Default(),
+      NoRepeatNgramConfig::Default(),
+      SuppressTokensConfig(/*suppress_tokens=*/{
+          5,
+      }),
+      /*constraint=*/nullptr,
+      /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
+      std::move(callback)));
+
+  EXPECT_OK(execution_manager_->WaitUntilDone(task_b_id, absl::Seconds(3)));
+
+  EXPECT_THAT(response_texts, ElementsAre("4", "4"));
 }
 
 TEST_P(ExecutionManagerTest, AddDecodeTaskWithConstraintWithInternalSampler) {
@@ -923,6 +1447,7 @@ TEST_P(ExecutionManagerTest, AddDecodeTaskWithConstraintWithInternalSampler) {
   ASSERT_OK(execution_manager_->AddDecodeTask(
       session_id, task_b_id,
       /*dependency_task_ids=*/{task_a_id}, RepetitionPenaltyConfig::Default(),
+      NoRepeatNgramConfig::Default(), SuppressTokensConfig::Default(),
       decode_config.GetConstraint(),
       /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
       std::move(callback)));
@@ -983,6 +1508,7 @@ TEST_P(ExecutionManagerTest, AddDecodeTaskWithConstraintWithExternalSampler) {
   ASSERT_OK(execution_manager_->AddDecodeTask(
       session_id, task_b_id,
       /*dependency_task_ids=*/{task_a_id}, RepetitionPenaltyConfig::Default(),
+      NoRepeatNgramConfig::Default(), SuppressTokensConfig::Default(),
       decode_config.GetConstraint(),
       /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
       std::move(callback)));
@@ -1051,6 +1577,66 @@ TEST_P(ExecutionManagerTest, AddTextScoringTask) {
   // log-prob is 0. Total score is 0.
   ASSERT_EQ(scores.size(), 1);
   EXPECT_FLOAT_EQ(scores[0], 0.0f);
+}
+
+TEST_P(ExecutionManagerTest, AddTextScoringTaskStepProgression) {
+  CreateExecutionManager(CreateDefaultFakeLlmExecutor());
+  ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig());
+  ASSERT_OK_AND_ASSIGN(const SessionId session_id,
+                       execution_manager_->RegisterNewSession(session_config));
+  ASSERT_OK_AND_ASSIGN(auto session_info,
+                       execution_manager_->GetSessionInfo(session_id));
+
+  // Prefill 3 tokens.
+  std::vector<InputData> inputs;
+  ASSERT_OK_AND_ASSIGN(auto input_text,
+                       tokenizer_->TokenIdsToTensorBuffer({1, 2, 3}));
+  inputs.push_back(InputText(std::move(input_text)));
+  ASSERT_OK_AND_ASSIGN(const TaskId prefill_task_id,
+                       execution_manager_->GetNewTaskId());
+  ASSERT_OK(execution_manager_->AddPrefillTask(
+      session_id, prefill_task_id, std::move(inputs),
+      /*dependency_task_ids=*/{},
+      /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
+      /*callback=*/[](absl::StatusOr<Responses> responses) {}));
+  ASSERT_OK(
+      execution_manager_->WaitUntilDone(prefill_task_id, absl::Seconds(3)));
+
+  // After prefill, current step must be 3.
+  ASSERT_OK_AND_ASSIGN(int step_after_prefill,
+                       execution_manager_->GetCurrentStep(*session_info));
+  EXPECT_EQ(step_after_prefill, 3);
+
+  // Score candidate "45" (2 tokens: 4 and 5).
+  ASSERT_OK_AND_ASSIGN(const TaskId scoring_task_id,
+                       execution_manager_->GetNewTaskId());
+  const std::vector<absl::string_view> target_text = {"45"};
+  EXPECT_CALL(*tokenizer_, TextToTokenIds("45"))
+      .WillOnce(Return(std::vector<int>({4, 5})));
+
+  std::vector<float> scores;
+  ASSERT_OK(execution_manager_->AddTextScoringTask(
+      session_id, scoring_task_id,
+      /*dep_tasks=*/{}, target_text,
+      /*store_token_lengths=*/false,
+      /*cancelled=*/std::make_shared<std::atomic<bool>>(false),
+      [&scores](absl::StatusOr<Responses> responses) {
+        ASSERT_OK(responses);
+        if (!responses->GetScores().empty()) {
+          scores.push_back(responses->GetScores()[0]);
+        }
+      }));
+  EXPECT_OK(
+      execution_manager_->WaitUntilDone(scoring_task_id, absl::Seconds(3)));
+
+  ASSERT_EQ(scores.size(), 1);
+  EXPECT_FLOAT_EQ(scores[0], 0.0f);
+
+  // After scoring 2 tokens, current step must progress to 5 without
+  // double-rewind.
+  ASSERT_OK_AND_ASSIGN(int step_after_scoring,
+                       execution_manager_->GetCurrentStep(*session_info));
+  EXPECT_EQ(step_after_scoring, 5);
 }
 
 TEST_P(ExecutionManagerTest, GetCurrentStep) {
@@ -1156,6 +1742,7 @@ TEST_P(ExecutionManagerTest, DestructorWaitsForActiveTasks) {
 
   ASSERT_OK(execution_manager_->AddDecodeTask(
       session_id, task_id, {}, RepetitionPenaltyConfig::Default(),
+      NoRepeatNgramConfig::Default(), SuppressTokensConfig::Default(),
       /*constraint=*/nullptr, std::make_shared<std::atomic<bool>>(false),
       [task_states, mutex](absl::StatusOr<Responses> responses) {
         absl::MutexLock lock(*mutex);
@@ -1194,6 +1781,116 @@ TEST_P(ExecutionManagerTest, ReleaseSessionCleansUpTasksAndQueue) {
 
   // WaitUntilAllDone should complete without error.
   EXPECT_OK(execution_manager_->WaitUntilAllDone(absl::Seconds(1)));
+}
+
+TEST_P(ExecutionManagerTest,
+       RegisterNewSessionDeduplicatesAudioScopedLoraFiles) {
+  const std::filesystem::path temp_dir(::testing::TempDir());
+  const std::filesystem::path lora_path_1 = temp_dir / "audio_lora_1.bin";
+  const std::filesystem::path lora_path_2 = temp_dir / "audio_lora_2.bin";
+  {
+    std::ofstream out1(lora_path_1, std::ios::binary);
+    out1 << "lora_weights_1";
+    std::ofstream out2(lora_path_2, std::ios::binary);
+    out2 << "lora_weights_2_different_size";
+  }
+
+  ASSERT_OK_AND_ASSIGN(auto scoped_lora_1,
+                       ScopedFile::Open(lora_path_1.string()));
+  ASSERT_OK_AND_ASSIGN(auto scoped_lora_1_dup, scoped_lora_1.Duplicate());
+  ASSERT_OK_AND_ASSIGN(auto scoped_lora_2,
+                       ScopedFile::Open(lora_path_2.string()));
+  auto shared_lora_1 = std::make_shared<ScopedFile>(std::move(scoped_lora_1));
+  auto shared_lora_1_dup =
+      std::make_shared<ScopedFile>(std::move(scoped_lora_1_dup));
+  auto shared_lora_2 = std::make_shared<ScopedFile>(std::move(scoped_lora_2));
+
+  auto fake_audio_executor = std::make_unique<FakeAudioExecutor>();
+  auto* fake_audio_executor_ptr = fake_audio_executor.get();
+  CreateExecutionManager(CreateDefaultFakeLlmExecutor(),
+                         /*audio_executor_settings=*/nullptr,
+                         std::move(fake_audio_executor));
+
+  ASSERT_OK_AND_ASSIGN(auto session_config_1, CreateDefaultSessionConfig());
+  session_config_1.SetAudioScopedLoraFile(shared_lora_1);
+  ASSERT_OK_AND_ASSIGN(
+      const SessionId session_1,
+      execution_manager_->RegisterNewSession(session_config_1));
+
+  // Second session sharing the same ScopedFile pointer should reuse lora_id 0
+  // without calling LoadLoRA again.
+  ASSERT_OK_AND_ASSIGN(
+      const SessionId session_2,
+      execution_manager_->RegisterNewSession(session_config_1));
+
+  // Third session with a distinct ScopedFile instance pointing to the same
+  // underlying file should also deduplicate to lora_id 0.
+  ASSERT_OK_AND_ASSIGN(auto session_config_1_dup, CreateDefaultSessionConfig());
+  session_config_1_dup.SetAudioScopedLoraFile(shared_lora_1_dup);
+  ASSERT_OK_AND_ASSIGN(
+      const SessionId session_3,
+      execution_manager_->RegisterNewSession(session_config_1_dup));
+
+  // Fourth session with a different underlying file should load a new LoRA
+  // with lora_id 1.
+  ASSERT_OK_AND_ASSIGN(auto session_config_2, CreateDefaultSessionConfig());
+  session_config_2.SetAudioScopedLoraFile(shared_lora_2);
+  ASSERT_OK_AND_ASSIGN(
+      const SessionId session_4,
+      execution_manager_->RegisterNewSession(session_config_2));
+
+  EXPECT_THAT(fake_audio_executor_ptr->loaded_lora_ids_, ElementsAre(0, 1));
+  EXPECT_THAT(
+      fake_audio_executor_ptr->used_lora_ids_,
+      ElementsAre(std::optional<uint32_t>(0), std::optional<uint32_t>(0),
+                  std::optional<uint32_t>(0), std::optional<uint32_t>(1)));
+
+  EXPECT_OK(execution_manager_->ReleaseSession(session_1));
+  EXPECT_OK(execution_manager_->ReleaseSession(session_2));
+  EXPECT_OK(execution_manager_->ReleaseSession(session_3));
+  EXPECT_OK(execution_manager_->ReleaseSession(session_4));
+}
+
+TEST_P(ExecutionManagerTest,
+       RegisterNewSessionRetriesAudioScopedLoraAfterLoadFailure) {
+  const std::filesystem::path lora_path =
+      std::filesystem::path(::testing::TempDir()) / "audio_lora_retry.bin";
+  {
+    std::ofstream out(lora_path, std::ios::binary);
+    out << "lora_weights_retry";
+  }
+
+  ASSERT_OK_AND_ASSIGN(auto scoped_lora, ScopedFile::Open(lora_path.string()));
+  auto shared_lora = std::make_shared<ScopedFile>(std::move(scoped_lora));
+
+  auto fake_audio_executor = std::make_unique<FakeAudioExecutor>();
+  auto* fake_audio_executor_ptr = fake_audio_executor.get();
+  fake_audio_executor_ptr->load_lora_status_ =
+      absl::InternalError("Simulated audio LoadLoRA failure");
+
+  CreateExecutionManager(CreateDefaultFakeLlmExecutor(),
+                         /*audio_executor_settings=*/nullptr,
+                         std::move(fake_audio_executor));
+
+  ASSERT_OK_AND_ASSIGN(auto session_config, CreateDefaultSessionConfig());
+  session_config.SetAudioScopedLoraFile(shared_lora);
+
+  // First session registration fails during LoadLoRA.
+  EXPECT_THAT(execution_manager_->RegisterNewSession(session_config),
+              testing::status::StatusIs(absl::StatusCode::kInternal));
+  EXPECT_TRUE(fake_audio_executor_ptr->loaded_lora_ids_.empty());
+  EXPECT_TRUE(fake_audio_executor_ptr->used_lora_ids_.empty());
+
+  // Subsequent session with the same ScopedFile must retry LoadLoRA rather
+  // than skipping LoadLoRA with a corrupted lora_hash_to_id_ entry.
+  fake_audio_executor_ptr->load_lora_status_ = absl::OkStatus();
+  ASSERT_OK_AND_ASSIGN(const SessionId session_id,
+                       execution_manager_->RegisterNewSession(session_config));
+  EXPECT_THAT(fake_audio_executor_ptr->loaded_lora_ids_, ElementsAre(0));
+  EXPECT_THAT(fake_audio_executor_ptr->used_lora_ids_,
+              ElementsAre(std::optional<uint32_t>(0)));
+
+  EXPECT_OK(execution_manager_->ReleaseSession(session_id));
 }
 
 INSTANTIATE_TEST_SUITE_P(

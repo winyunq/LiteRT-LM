@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 
-import {AutoToolChat, ChatInterface, JsonValue, SamplerType, ToolProgressEvent, ToolWithImplementation} from '@litert-lm/core';
+import {AutoToolChat, ChatInterface, ContentPart, JsonValue, MessageLike, SamplerType, ToolProgressEvent, ToolWithImplementation} from '@litert-lm/core';
 import {z} from 'zod';
 
 import {CodeSandbox} from '../components/code_sandbox.js';
+import {createObjectUrl} from '../components/util.js';
 
 import {ModelLoaderService} from './model_loader_service.js';
-import {SettingsStore} from './settings_store.js';
+import {ModelSettings, SettingsStore} from './settings_store.js';
 
 const ConversationMetaSchema = z.object({
   id: z.string(),
@@ -31,9 +32,25 @@ const ConversationMetaSchema = z.object({
 
 const ConversationMetaListSchema = z.array(ConversationMetaSchema);
 
+/**
+ * A persisted part of a user message. Only an image's or audio clip's id and
+ * name are saved; its bytes are kept in memory for the lifetime of the page.
+ */
+const StoredPartSchema = z.union([
+  z.object({type: z.literal('text'), text: z.string()}),
+  z.object({
+    type: z.union([z.literal('image'), z.literal('audio')]),
+    id: z.string(),
+    name: z.string(),
+  }),
+]);
+
 const StoredMessageSchema = z.object({
   role: z.union([z.literal('user'), z.literal('assistant')]),
+  // Plain-text form of the message. Media appear as e.g. `[image: name]`.
   text: z.string(),
+  // Ordered text and media parts, present only for messages with media.
+  parts: z.array(StoredPartSchema).optional(),
   senderName: z.string(),
   thoughtText: z.string().optional(),
   prefillSpeed: z.string().optional(),
@@ -46,6 +63,64 @@ const StoredMessageListSchema = z.array(StoredMessageSchema);
 /** Represents an individual chat message in the UI history. */
 export type StoredMessage = z.infer<typeof StoredMessageSchema>;
 
+/** A persisted part of a user message. */
+export type StoredPart = z.infer<typeof StoredPartSchema>;
+
+/** The kinds of media that can be attached to a prompt. */
+export type MediaKind = 'image'|'audio';
+
+/** An image or audio clip attached to a prompt. */
+export interface PromptMedia {
+  id: string;
+  kind: MediaKind;
+  name: string;
+  blob: Blob;
+  /** Object URL of `blob`, for previews and playback. */
+  url: string;
+}
+
+/**
+ * A single element of a prompt, in the order the user arranged it. Media are
+ * interleaved with text so the user controls where each image or audio clip
+ * sits relative to the surrounding words.
+ */
+export type PromptPart = {
+  type: 'text'; text: string;
+}|{
+  type: 'media';
+  media: PromptMedia;
+};
+
+/** Returns the placeholder text used for media the model cannot see. */
+export function mediaPlaceholder(kind: MediaKind, name: string): string {
+  return `[${kind}: ${name}]`;
+}
+
+/** Returns the plain-text form of a prompt, with media as placeholders. */
+export function promptPartsToText(parts: PromptPart[]): string {
+  return parts
+      .map(
+          p => p.type === 'text' ? p.text :
+                                   mediaPlaceholder(p.media.kind, p.media.name))
+      .join('');
+}
+
+/** Whether a prompt has anything worth sending. */
+export function promptHasContent(parts: PromptPart[]): boolean {
+  return parts.some(p => p.type === 'media' || p.text.trim().length > 0);
+}
+
+/** Trims leading and trailing whitespace from a prompt. */
+function trimPromptParts(parts: PromptPart[]): PromptPart[] {
+  const trimmed = parts.filter(p => p.type === 'media' || p.text.length > 0)
+                      .map(p => ({...p}));
+  const first = trimmed[0];
+  if (first?.type === 'text') first.text = first.text.trimStart();
+  const last = trimmed[trimmed.length - 1];
+  if (last?.type === 'text') last.text = last.text.trimEnd();
+  return trimmed.filter(p => p.type === 'media' || p.text.length > 0);
+}
+
 /** Represents a saved conversation in the sidebar history index. */
 export type ConversationMeta = z.infer<typeof ConversationMetaSchema>;
 
@@ -55,6 +130,7 @@ export class ChatSessionStore {
   isCancelled = false;
 
   activeSavedConvId: string|null = null;
+  activeModelSettings: ModelSettings|null = null;
   conversationsList: ConversationMeta[] = [];
   messages: StoredMessage[] = [];
   activeConversation: ChatInterface|null = null;
@@ -62,12 +138,51 @@ export class ChatSessionStore {
 
   private readonly CONVS_LIST_KEY = 'litertlm-conversations-list';
 
+  /**
+   * Media attached to prompts during this page's lifetime, by id. Saved
+   * history only references media by id, so media from a previous page load
+   * are not found here.
+   */
+  private readonly media = new Map<string, PromptMedia>();
+
   constructor(
       private readonly updateCallback: () => void,
       private readonly settings: SettingsStore,
       private readonly modelLoader: ModelLoaderService,
       private readonly updateStatus: (msg: string) => void) {
     this.loadSavedConversationsIndex();
+  }
+
+  /** Creates an image or audio clip that can be placed in a prompt. */
+  createMedia(kind: MediaKind, name: string, blob: Blob): PromptMedia {
+    const media: PromptMedia = {
+      id: Math.random().toString(36).substring(2) + Date.now().toString(36),
+      kind,
+      name,
+      blob,
+      url: createObjectUrl(blob),
+    };
+    this.media.set(media.id, media);
+    return media;
+  }
+
+  /** Returns media created during this page's lifetime, if available. */
+  getMedia(id: string): PromptMedia|undefined {
+    return this.media.get(id);
+  }
+
+  /**
+   * Returns the prompt parts of a stored message. Media that are no longer in
+   * memory become text placeholders.
+   */
+  getMessageParts(msg: StoredMessage): PromptPart[] {
+    if (!msg.parts) return [{type: 'text', text: msg.text}];
+    return msg.parts.map((p): PromptPart => {
+      if (p.type === 'text') return p;
+      const media = this.media.get(p.id);
+      return media ? {type: 'media', media} :
+                     {type: 'text', text: mediaPlaceholder(p.type, p.name)};
+    });
   }
 
   loadSavedConversationsIndex() {
@@ -247,6 +362,8 @@ export class ChatSessionStore {
           }
         },
         preface: {
+          // Media in the history are replayed as text placeholders (e.g.
+          // `[image: name]`); only media in new messages reach the model.
           messages: this.messages.length > 0 ?
               this.messages.map(msg => ({role: msg.role, content: msg.text})) :
               undefined,
@@ -267,17 +384,37 @@ export class ChatSessionStore {
       }
     });
 
+    this.activeModelSettings = structuredClone(this.settings.modelSettings);
     this.updateStatus('Model loaded and ready.');
   }
 
-  async sendMessage(promptText: string) {
-    if (this.isGenerating || !promptText.trim()) return;
+  private needsNewSession(settings: ModelSettings): boolean {
+    if (!this.activeConversation || !this.activeModelSettings) return true;
+    return this.activeModelSettings.selectedModelPath !== settings.selectedModelPath ||
+           this.activeModelSettings.contextLength !== settings.contextLength ||
+           this.activeModelSettings.maxOutputTokens !== settings.maxOutputTokens ||
+           this.activeModelSettings.samplerType !== settings.samplerType ||
+           this.activeModelSettings.temperature !== settings.temperature ||
+           this.activeModelSettings.topP !== settings.topP ||
+           this.activeModelSettings.topK !== settings.topK ||
+           this.activeModelSettings.enableThinking !== settings.enableThinking;
+  }
 
-    if (!this.modelLoader.engine) {
-      await this.modelLoader.loadModelWeights(async () => {
+  /**
+   * Sends a prompt to the model. A prompt is either plain text or an ordered
+   * list of text, image, and audio parts.
+   */
+  async sendMessage(prompt: string|PromptPart[]) {
+    const parts = trimPromptParts(
+        typeof prompt === 'string' ? [{type: 'text', text: prompt}] : prompt);
+    if (this.isGenerating || !promptHasContent(parts)) return;
+
+    const settings = this.settings.modelSettings;
+    if (this.modelLoader.needsModelReload(settings)) {
+      await this.modelLoader.loadModelWeights(settings, async () => {
         await this.createConversationSession();
       });
-    } else if (!this.activeConversation) {
+    } else if (this.needsNewSession(settings)) {
       await this.createConversationSession();
     }
 
@@ -287,10 +424,34 @@ export class ChatSessionStore {
     this.isCancelled = false;
     this.updateStatus('Thinking...');
 
-    const userMsg: StoredMessage =
-        {role: 'user', text: promptText, senderName: 'User', tokensCount: '-'};
+    const promptText = promptPartsToText(parts);
+    const hasMedia = parts.some(p => p.type === 'media');
+    const userMsg: StoredMessage = {
+      role: 'user',
+      text: promptText,
+      senderName: 'User',
+      tokensCount: '-'
+    };
+    if (hasMedia) {
+      userMsg.parts = parts.map(
+          (p): StoredPart => p.type === 'text' ?
+              p :
+              {type: p.media.kind, id: p.media.id, name: p.media.name});
+    }
     this.messages.push(userMsg);
     this.commitActiveChatHistory();
+
+    // Keep plain-text prompts as strings; send prompts with media as an
+    // ordered content array so each image or audio clip sits where the user
+    // placed it.
+    const modelMessage: MessageLike = hasMedia ? {
+      role: 'user',
+      content: parts.map(
+          (p): ContentPart => p.type === 'text' ?
+              {type: 'text', text: p.text} :
+              {type: p.media.kind, data: p.media.blob}),
+    } :
+                                                 promptText;
 
     const modelName =
         this.settings.selectedModelPath.split('/').pop() || 'Assistant';
@@ -307,7 +468,7 @@ export class ChatSessionStore {
 
     try {
       const responseStream =
-          await this.activeConversation!.sendMessageStreaming(promptText);
+          await this.activeConversation!.sendMessageStreaming(modelMessage);
       const reader = responseStream.getReader();
 
       while (true) {
@@ -330,9 +491,10 @@ export class ChatSessionStore {
         }
 
         if (value && value.content) {
+          const firstPart = Array.isArray(value.content) ? value.content[0] : undefined;
           const newChunkText = typeof value.content === 'string' ?
               value.content :
-              (value.content[0]?.['text'] || '');
+              (firstPart?.type === 'text' ? firstPart.text : '');
 
           fullResponseText += newChunkText;
           this.messages[activeMsgIndex] = {
@@ -436,22 +598,24 @@ export class ChatSessionStore {
       this.activeConversation = null;
     }
 
-    await this.sendMessage(previousUserMsg.text);
+    await this.sendMessage(
+        previousUserMsg.parts ? this.getMessageParts(previousUserMsg) :
+                                previousUserMsg.text);
   }
 
-  async rewindAndEdit(targetMessageIndex: number): Promise<string|null> {
+  /**
+   * Removes the given message, the messages after it, and its user prompt
+   * from the history. Returns that prompt so it can be edited and re-sent.
+   */
+  async rewindAndEdit(targetMessageIndex: number):
+      Promise<PromptPart[]|null> {
     if (this.isGenerating || targetMessageIndex < 0) return null;
 
-    let previousUserMsgText = '';
-
-    if (this.messages[targetMessageIndex]?.role === 'user') {
-      previousUserMsgText = this.messages[targetMessageIndex]!.text;
-      this.messages = this.messages.slice(0, targetMessageIndex);
-    } else {
-      const userMsgIdx = targetMessageIndex - 1;
-      previousUserMsgText = this.messages[userMsgIdx]?.text || '';
-      this.messages = this.messages.slice(0, userMsgIdx);
-    }
+    const userMsgIdx = this.messages[targetMessageIndex]?.role === 'user' ?
+        targetMessageIndex :
+        targetMessageIndex - 1;
+    const userMsg = this.messages[userMsgIdx];
+    this.messages = this.messages.slice(0, Math.max(0, userMsgIdx));
 
     this.commitActiveChatHistory();
 
@@ -460,6 +624,6 @@ export class ChatSessionStore {
       this.activeConversation = null;
     }
 
-    return previousUserMsgText;
+    return userMsg ? this.getMessageParts(userMsg) : null;
   }
 }

@@ -23,6 +23,7 @@
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
+#include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
@@ -36,7 +37,7 @@
 #include "litert/test/matchers.h"  // from @litert
 #include "runtime/components/model_resources_litert_lm.h"
 #include "runtime/executor/executor_settings_base.h"
-#include "runtime/executor/vision_executor_settings.h"
+#include "runtime/executor/vision/vision_executor_settings.h"
 #include "runtime/util/litert_lm_loader.h"
 #include "runtime/util/scoped_file.h"
 #include "runtime/util/test_utils.h"  // IWYU pragma: keep
@@ -88,7 +89,7 @@ TEST(VisionLiteRtCompiledModelExecutorTest, CreateExecutorTest) {
       VisionLiteRtCompiledModelExecutor::Create(settings, env);
   EXPECT_THAT(vision_executor,
               StatusIs(absl::StatusCode::kNotFound,
-                       "TF_LITE_VISION_ENCODER not found in the model."));
+                       "tf_lite_vision_encoder not found in the model."));
 }
 
 template <typename T>
@@ -164,6 +165,49 @@ TEST(VisionLiteRtCompiledModelExecutorTest,
   ASSERT_OK_AND_ASSIGN(auto output_vector,
                        ReadTensorBuffer<float>(*output_embeddings));
   EXPECT_EQ(output_vector.size(), 30);
+
+  // Verify buffer reuse across repeated single-buffer Encode() calls.
+  std::vector<float> second_input_data(10 * 8, 2.0f);
+  ASSERT_OK_AND_ASSIGN(
+      auto second_input_buffer,
+      CreateTensorBuffer<float>(absl::MakeSpan(second_input_data),
+                                input_tensor_type));
+  ASSERT_OK_AND_ASSIGN(auto second_output_data,
+                       vision_executor->Encode(second_input_buffer));
+  ASSERT_OK_AND_ASSIGN(TensorBuffer * second_output_embeddings,
+                       second_output_data.GetMutableEmbeddingsPtr());
+  ASSERT_OK_AND_ASSIGN(auto second_output_vector,
+                       ReadTensorBuffer<float>(*second_output_embeddings));
+  EXPECT_NE(second_output_vector, output_vector);
+
+  ASSERT_OK_AND_ASSIGN(auto repeat_output_data,
+                       vision_executor->Encode(input_buffer));
+  ASSERT_OK_AND_ASSIGN(TensorBuffer * repeat_output_embeddings,
+                       repeat_output_data.GetMutableEmbeddingsPtr());
+  ASSERT_OK_AND_ASSIGN(auto repeat_output_vector,
+                       ReadTensorBuffer<float>(*repeat_output_embeddings));
+  EXPECT_EQ(repeat_output_vector, output_vector);
+
+  // Verify buffer reuse across repeated map-based Encode() calls.
+  absl::flat_hash_map<std::string, TensorBuffer> input_maps;
+  input_maps["images"] = std::move(input_buffer);
+  ASSERT_OK_AND_ASSIGN(auto map_output_data,
+                       vision_executor->Encode(input_maps));
+  ASSERT_OK_AND_ASSIGN(TensorBuffer * map_output_embeddings,
+                       map_output_data.GetMutableEmbeddingsPtr());
+  ASSERT_OK_AND_ASSIGN(auto map_output_vector,
+                       ReadTensorBuffer<float>(*map_output_embeddings));
+  EXPECT_EQ(map_output_vector, output_vector);
+
+  absl::flat_hash_map<std::string, TensorBuffer> second_input_maps;
+  second_input_maps["images"] = std::move(second_input_buffer);
+  ASSERT_OK_AND_ASSIGN(auto second_map_output_data,
+                       vision_executor->Encode(second_input_maps));
+  ASSERT_OK_AND_ASSIGN(TensorBuffer * second_map_output_embeddings,
+                       second_map_output_data.GetMutableEmbeddingsPtr());
+  ASSERT_OK_AND_ASSIGN(auto second_map_output_vector,
+                       ReadTensorBuffer<float>(*second_map_output_embeddings));
+  EXPECT_EQ(second_map_output_vector, second_output_vector);
 }
 
 TEST(VisionLiteRtCompiledModelExecutorTest,
@@ -212,6 +256,89 @@ TEST(VisionLiteRtCompiledModelExecutorTest,
   EXPECT_EQ(output_type.Layout().Dimensions()[1], 5);
   EXPECT_EQ(output_type.Layout().Dimensions()[2], 5);
 
+  ASSERT_OK_AND_ASSIGN(auto output_vector,
+                       ReadTensorBuffer<float>(*output_embeddings));
+  EXPECT_EQ(output_vector.size(), 25);
+
+  // Verify buffer reuse across repeated single-buffer Encode() calls.
+  std::vector<float> second_input_data(10 * 8, 2.0f);
+  ASSERT_OK_AND_ASSIGN(
+      auto second_input_buffer,
+      CreateTensorBuffer<float>(absl::MakeSpan(second_input_data),
+                                input_tensor_type));
+  ASSERT_OK_AND_ASSIGN(auto second_output_data,
+                       vision_executor->Encode(second_input_buffer));
+  ASSERT_OK_AND_ASSIGN(TensorBuffer * second_output_embeddings,
+                       second_output_data.GetMutableEmbeddingsPtr());
+  ASSERT_OK_AND_ASSIGN(auto second_output_vector,
+                       ReadTensorBuffer<float>(*second_output_embeddings));
+  EXPECT_NE(second_output_vector, output_vector);
+
+  ASSERT_OK_AND_ASSIGN(auto repeat_output_data,
+                       vision_executor->Encode(input_buffer));
+  ASSERT_OK_AND_ASSIGN(TensorBuffer * repeat_output_embeddings,
+                       repeat_output_data.GetMutableEmbeddingsPtr());
+  ASSERT_OK_AND_ASSIGN(auto repeat_output_vector,
+                       ReadTensorBuffer<float>(*repeat_output_embeddings));
+  EXPECT_EQ(repeat_output_vector, output_vector);
+
+  // Verify buffer reuse across repeated map-based Encode() calls.
+  absl::flat_hash_map<std::string, TensorBuffer> input_maps;
+  input_maps["images"] = std::move(input_buffer);
+  ASSERT_OK_AND_ASSIGN(auto map_output_data,
+                       vision_executor->Encode(input_maps));
+  ASSERT_OK_AND_ASSIGN(TensorBuffer * map_output_embeddings,
+                       map_output_data.GetMutableEmbeddingsPtr());
+  ASSERT_OK_AND_ASSIGN(auto map_output_vector,
+                       ReadTensorBuffer<float>(*map_output_embeddings));
+  EXPECT_EQ(map_output_vector, output_vector);
+
+  absl::flat_hash_map<std::string, TensorBuffer> second_input_maps;
+  second_input_maps["images"] = std::move(second_input_buffer);
+  ASSERT_OK_AND_ASSIGN(auto second_map_output_data,
+                       vision_executor->Encode(second_input_maps));
+  ASSERT_OK_AND_ASSIGN(TensorBuffer * second_map_output_embeddings,
+                       second_map_output_data.GetMutableEmbeddingsPtr());
+  ASSERT_OK_AND_ASSIGN(auto second_map_output_vector,
+                       ReadTensorBuffer<float>(*second_map_output_embeddings));
+  EXPECT_EQ(second_map_output_vector, second_output_vector);
+}
+
+TEST(VisionLiteRtCompiledModelExecutorTest,
+     CreateExecutorWithSelectedSignaturesTest) {
+  const std::string& model_path =
+      (std::filesystem::path(::testing::SrcDir()) /
+       std::string(kTestVisionModelWithoutAdapterPath))
+          .string();
+
+  ASSERT_OK_AND_ASSIGN(ModelAssets model_assets,
+                       ModelAssets::Create(model_path));
+
+  ASSERT_OK_AND_ASSIGN(
+      VisionExecutorSettings settings,
+      VisionExecutorSettings::CreateDefault(model_assets,
+                                            /*encoder_backend=*/Backend::CPU,
+                                            /*adapter_backend=*/Backend::CPU));
+  settings.SetEncoderSelectedSignatures({"serving_default"});
+  settings.SetAdapterSelectedSignatures({"serving_default"});
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto env, Environment::Create(std::vector<Environment::Option>()));
+
+  ASSERT_OK_AND_ASSIGN(
+      auto vision_executor,
+      VisionLiteRtCompiledModelExecutor::Create(settings, env));
+
+  std::vector<float> input_data(10 * 8, 1.0f);
+  Layout input_layout(litert::Dimensions{1, 10, 8});
+  RankedTensorType input_tensor_type(ElementType::Float32,
+                                     std::move(input_layout));
+  ASSERT_OK_AND_ASSIGN(
+      auto input_buffer,
+      CreateTensorBuffer<float>(absl::MakeSpan(input_data), input_tensor_type));
+
+  ASSERT_OK_AND_ASSIGN(auto output_data, vision_executor->Encode(input_buffer));
+  ASSERT_OK_AND_ASSIGN(TensorBuffer * output_embeddings,
+                       output_data.GetMutableEmbeddingsPtr());
   ASSERT_OK_AND_ASSIGN(auto output_vector,
                        ReadTensorBuffer<float>(*output_embeddings));
   EXPECT_EQ(output_vector.size(), 25);

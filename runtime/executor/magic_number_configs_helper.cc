@@ -25,7 +25,7 @@
 #include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/strings/match.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
-#include "litert/cc/litert_environment.h"  // from @litert
+#include "litert/c/litert_common.h"  // from @litert
 #include "litert/cc/litert_environment_options.h"  // from @litert
 #include "litert/cc/litert_expected.h"  // from @litert
 #include "litert/cc/litert_macros.h"  // from @litert
@@ -33,6 +33,7 @@
 #include "litert/cc/options/litert_magic_number_options.h"  // from @litert
 #include "runtime/components/model_resources.h"
 #include "runtime/executor/llm_executor_settings.h"
+#include "runtime/proto/llm_metadata.pb.h"
 
 namespace litert::lm {
 namespace {
@@ -58,6 +59,10 @@ Expected<int64_t> GetLastDimensionOfInput(const Signature& signature,
                                           absl::string_view input_name) {
   LITERT_ASSIGN_OR_RETURN(auto tensor, signature.InputTensor(input_name));
   LITERT_ASSIGN_OR_RETURN(auto type, tensor.RankedTensorType());
+  if (type.Layout().Rank() == 0) {
+    return litert::Unexpected(kLiteRtStatusErrorInvalidArgument,
+                              "Tensor rank must be at least 1");
+  }
   return type.Layout().Dimensions()[type.Layout().Rank() - 1];
 }
 
@@ -65,6 +70,10 @@ Expected<int64_t> GetFirstDimensionOfOutput(const Signature& signature,
                                             absl::string_view output_name) {
   LITERT_ASSIGN_OR_RETURN(auto tensor, signature.OutputTensor(output_name));
   LITERT_ASSIGN_OR_RETURN(auto type, tensor.RankedTensorType());
+  if (type.Layout().Rank() == 0) {
+    return litert::Unexpected(kLiteRtStatusErrorInvalidArgument,
+                              "Tensor rank must be at least 1");
+  }
   return type.Layout().Dimensions()[0];
 }
 
@@ -267,7 +276,8 @@ int64_t GetTargetNumber(int64_t magic_number, int64_t target_number_hint) {
 std::vector<EnvironmentOptions::Option>
 MagicNumberConfigsHelper::GetLiteRtEnvOptions(
     ModelResources& resources, const LlmExecutorSettings& executor_settings) {
-  auto litert_model = resources.GetTFLiteModel(ModelType::kTfLitePrefillDecode);
+  auto litert_model =
+      resources.GetTFLiteModel(proto::LlmMetadata::TF_LITE_PREFILL_DECODE);
   if (!litert_model.ok() || !*litert_model) return {};
   auto magic_numbers = GetMagicNumbersFromModel(**litert_model);
   if (!magic_numbers || (magic_numbers->context_length == 0 &&

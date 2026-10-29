@@ -16,6 +16,7 @@
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_EXECUTOR_VISION_LITERT_COMPILED_MODEL_EXECUTOR_H_
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -26,14 +27,16 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "litert/cc/litert_compiled_model.h"  // from @litert
 #include "litert/cc/litert_environment.h"  // from @litert
+#include "litert/cc/litert_expected.h"  // from @litert
 #include "litert/cc/litert_model.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "runtime/components/model_resources.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/executor/executor_settings_base.h"
+#include "runtime/executor/executor_stats.h"
 #include "runtime/executor/llm_executor_io_types.h"
-#include "runtime/executor/vision_executor.h"
-#include "runtime/executor/vision_executor_settings.h"
+#include "runtime/executor/vision/vision_executor.h"
+#include "runtime/executor/vision/vision_executor_settings.h"
 
 namespace litert::lm {
 
@@ -47,6 +50,12 @@ class VisionLiteRtCompiledModelExecutor : public VisionExecutor {
   static absl::StatusOr<std::unique_ptr<VisionLiteRtCompiledModelExecutor>>
   Create(const VisionExecutorSettings& vision_executor_settings,
          Environment& env);
+
+  // Creates a VisionLiteRtCompiledModelExecutor from the given
+  // VisionExecutorSettings and ModelResources.
+  static absl::StatusOr<std::unique_ptr<VisionLiteRtCompiledModelExecutor>>
+  Create(const VisionExecutorSettings& vision_executor_settings,
+         Environment& env, ModelResources& resources);
 
   // Encodes the input image tensor into vision embeddings.
   // Args:
@@ -68,7 +77,29 @@ class VisionLiteRtCompiledModelExecutor : public VisionExecutor {
   absl::StatusOr<VisionExecutorProperties> GetVisionExecutorProperties()
       const override;
 
+  absl::Status StartProfiling() override;
+  absl::StatusOr<ExecutorStats> StopProfiling() override;
+
  private:
+  // Caches the input and output buffers of each signature across Encode()
+  // calls.
+  class SignatureBufferCache {
+   public:
+    // Returns the cached input buffers for `signature_index`, creating them on
+    // first use.
+    Expected<std::vector<TensorBuffer>&> GetOrCreateInputBuffers(
+        CompiledModel& compiled_model, int signature_index);
+
+    // Returns the cached output buffers for `signature_index`, creating them on
+    // first use.
+    Expected<std::vector<TensorBuffer>&> GetOrCreateOutputBuffers(
+        CompiledModel& compiled_model, int signature_index);
+
+   private:
+    absl::flat_hash_map<int, std::vector<TensorBuffer>> input_buffers_;
+    absl::flat_hash_map<int, std::vector<TensorBuffer>> output_buffers_;
+  };
+
   // The Vision Encoder LiteRT CompiledModel wrapper manage the input and
   // output buffers of the vision encoder model. It is not expected to be used
   // directly by the user. It is used by the VisionLiteRtCompiledModelExecutor
@@ -86,11 +117,12 @@ class VisionLiteRtCompiledModelExecutor : public VisionExecutor {
     static absl::StatusOr<std::unique_ptr<VisionEncoder>> Create(
         Environment& env, const Model* absl_nonnull model,
         const VisionExecutorSettings& vision_executor_settings,
-        const VisionExecutorProperties& vision_executor_properties);
+        const VisionExecutorProperties& vision_executor_properties,
+        ModelResources& resources);
 
     // Initialize the VisionEncoder, which will create the input and output
     // buffers for the vision encoder model.
-    absl::Status Initialize();
+    absl::Status Initialize(ModelResources& resources);
 
     // Returns the CompiledModel for the vision encoder model.
     const CompiledModel& GetCompiledModel() const { return compiled_model_; }
@@ -101,28 +133,21 @@ class VisionLiteRtCompiledModelExecutor : public VisionExecutor {
     // Returns the LiteRT model for the vision encoder model.
     const Model& GetModel() const { return model_; }
 
-    // Returns the input buffers for the vision encoder model.
-    const std::vector<TensorBuffer>& GetInputBuffers() const {
-      return input_buffers_;
+    // Returns the cached input buffers for `signature_index`, creating them on
+    // first use.
+    Expected<std::vector<TensorBuffer>&> GetOrCreateInputBuffers(
+        int signature_index) {
+      return buffer_cache_.GetOrCreateInputBuffers(compiled_model_,
+                                                   signature_index);
     }
 
-    // Returns the mutable input buffers for the vision encoder model.
-    std::vector<TensorBuffer>& GetMutableInputBuffers() {
-      return input_buffers_;
+    // Returns the cached output buffers for `signature_index`, creating them on
+    // first use.
+    Expected<std::vector<TensorBuffer>&> GetOrCreateOutputBuffers(
+        int signature_index) {
+      return buffer_cache_.GetOrCreateOutputBuffers(compiled_model_,
+                                                    signature_index);
     }
-
-    // Returns the output buffers for the vision encoder model.
-    const std::vector<TensorBuffer>& GetOutputBuffers() const {
-      return output_buffers_;
-    }
-
-    // Returns the mutable output buffers for the vision encoder model.
-    std::vector<TensorBuffer>& GetMutableOutputBuffers() {
-      return output_buffers_;
-    }
-
-    // Clears the input buffers for the vision encoder model.
-    absl::Status ClearInputBuffers();
 
    private:
     VisionEncoder(Environment& env, const Model* absl_nonnull model,
@@ -153,11 +178,8 @@ class VisionLiteRtCompiledModelExecutor : public VisionExecutor {
     // The vision encoder compiled model.
     CompiledModel compiled_model_;
 
-    // The input buffers for the vision encoder model.
-    std::vector<TensorBuffer> input_buffers_;
-
-    // The output buffers for the vision encoder model.
-    std::vector<TensorBuffer> output_buffers_;
+    // Cached input and output buffers for the vision encoder model.
+    SignatureBufferCache buffer_cache_;
   };
 
   // The Vision Adapter LiteRT CompiledModel wrapper manage the input and
@@ -177,10 +199,11 @@ class VisionLiteRtCompiledModelExecutor : public VisionExecutor {
     static absl::StatusOr<std::unique_ptr<VisionAdapter>> Create(
         Environment& env, const Model* absl_nonnull model,
         const VisionExecutorSettings& vision_executor_settings,
-        const VisionExecutorProperties& vision_executor_properties);
+        const VisionExecutorProperties& vision_executor_properties,
+        ModelResources& resources);
 
     // Initialize the VisionAdapter.
-    absl::Status Initialize();
+    absl::Status Initialize(ModelResources& resources);
 
     // Returns the CompiledModel for the vision adapter model.
     const CompiledModel& GetCompiledModel() const { return compiled_model_; }
@@ -191,14 +214,20 @@ class VisionLiteRtCompiledModelExecutor : public VisionExecutor {
     // Returns the LiteRT model for the vision adapter model.
     const Model& GetModel() const { return model_; }
 
-    // Returns the input buffers for the vision adapter model.
-    const std::vector<TensorBuffer>& GetInputBuffers() const {
-      return input_buffers_;
+    // Returns the cached input buffers for `signature_index`, creating them on
+    // first use.
+    Expected<std::vector<TensorBuffer>&> GetOrCreateInputBuffers(
+        int signature_index) {
+      return buffer_cache_.GetOrCreateInputBuffers(compiled_model_,
+                                                   signature_index);
     }
 
-    // Returns the mutable input buffers for the vision adapter model.
-    std::vector<TensorBuffer>& GetMutableInputBuffers() {
-      return input_buffers_;
+    // Returns the cached output buffers for `signature_index`, creating them on
+    // first use.
+    Expected<std::vector<TensorBuffer>&> GetOrCreateOutputBuffers(
+        int signature_index) {
+      return buffer_cache_.GetOrCreateOutputBuffers(compiled_model_,
+                                                    signature_index);
     }
 
    private:
@@ -230,8 +259,8 @@ class VisionLiteRtCompiledModelExecutor : public VisionExecutor {
     // The vision adapter compiled model.
     CompiledModel compiled_model_;
 
-    // The input buffers for the vision adapter model.
-    std::vector<TensorBuffer> input_buffers_;
+    // Cached input and output buffers for the vision adapter model.
+    SignatureBufferCache buffer_cache_;
   };
 
   explicit VisionLiteRtCompiledModelExecutor(
@@ -270,6 +299,8 @@ class VisionLiteRtCompiledModelExecutor : public VisionExecutor {
 
   // The vision executor properties.
   VisionExecutorProperties vision_executor_properties_;
+
+  std::optional<ExecutorStats> latency_stats_;
 };
 
 }  // namespace litert::lm

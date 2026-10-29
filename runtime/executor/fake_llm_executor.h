@@ -26,11 +26,13 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
+#include "litert/cc/litert_environment.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "runtime/executor/llm_executor.h"
 #include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/executor/llm_executor_processed_tokens.h"
 #include "runtime/executor/llm_executor_settings.h"
+#include "runtime/executor/speculative_decoding_mode.h"
 
 namespace litert::lm {
 
@@ -60,11 +62,12 @@ class FakeLlmExecutor : public LlmExecutor {
   //   at each time the Prefill function is called. The Prefill function will
   //   only return OkStatus if the input audio embedding matches the expected
   //   audio embedding.
-  FakeLlmExecutor(
-      int vocab_size, const std::vector<std::vector<int>>& prefill_tokens_set,
-      const std::vector<std::vector<int>>& decode_tokens_set,
-      int batch_size = 1,
-      std::optional<std::vector<float>> audio_embedding = std::nullopt);
+  FakeLlmExecutor(int vocab_size,
+                  const std::vector<std::vector<int>>& prefill_tokens_set,
+                  const std::vector<std::vector<int>>& decode_tokens_set,
+                  int batch_size = 1,
+                  std::optional<std::vector<float>> projected_audio_embedding =
+                      std::nullopt);
 
   absl::Status Prefill(const ExecutorInputs& inputs) override;
   absl::Status Prefill(const ExecutorInputs& inputs,
@@ -87,9 +90,16 @@ class FakeLlmExecutor : public LlmExecutor {
 
   absl::StatusOr<int> GetVocabSize() override { return vocab_size_; }
 
+  ::litert::Environment* GetEnvironment() const override;
+
   absl::StatusOr<LlmExecutorSettings> GetExecutorSettings() const override {
     return executor_settings_;
   };
+  absl::Status UpdateExecutorSettings(
+      const LlmExecutorSettings& executor_settings) override {
+    executor_settings_ = executor_settings;
+    return absl::OkStatus();
+  }
   absl::StatusOr<LlmExecutorSettings*> GetMutableExecutorSettings() {
     return &executor_settings_;
   };
@@ -107,6 +117,33 @@ class FakeLlmExecutor : public LlmExecutor {
       std::unique_ptr<LlmContext> llm_context) override {
     return absl::OkStatus();
   };
+
+  class FakeProcessedContext : public ProcessedContext {
+   public:
+    std::optional<uint32_t> lora_id() const override { return lora_id_; }
+    void set_lora_id(std::optional<uint32_t> lora_id) override {
+      lora_id_ = lora_id;
+    }
+    ProcessedTokens& processed_tokens() override { return processed_tokens_; }
+
+   private:
+    std::optional<uint32_t> lora_id_;
+    ProcessedTokens processed_tokens_;
+  };
+
+  absl::StatusOr<std::unique_ptr<ProcessedContext>> SaveContext()
+      const override {
+    return std::make_unique<FakeProcessedContext>();
+  }
+
+  absl::Status RestoreContext(
+      std::unique_ptr<ProcessedContext> processed_context) override {
+    if (dynamic_cast<FakeProcessedContext*>(processed_context.get()) ==
+        nullptr) {
+      return absl::InvalidArgumentError("Invalid processed context.");
+    }
+    return absl::OkStatus();
+  }
 
   absl::StatusOr<const ProcessedTokens*> GetProcessedTokens() const override {
     return &processed_tokens_;
@@ -146,6 +183,13 @@ class FakeLlmExecutor : public LlmExecutor {
 
   absl::Status Reset() override;
 
+  // Returns the effective speculative decoding mode of the last
+  // `Decode(const ExecutorDecodeParams&)` call.
+  const SpeculativeDecodingConfig& last_decode_speculative_decoding_config()
+      const {
+    return last_decode_speculative_decoding_config_;
+  }
+
  private:
   // Util function to try to sleep for the decode delay duration (if set). This
   // is used to simulate a long-running task.
@@ -154,7 +198,7 @@ class FakeLlmExecutor : public LlmExecutor {
   int vocab_size_;
   std::vector<std::vector<int>> prefill_tokens_set_;
   std::vector<std::vector<int>> decode_tokens_set_;
-  std::optional<std::vector<float>> audio_embedding_set_;
+  std::optional<std::vector<float>> projected_audio_embedding_set_;
   int batch_size_;
 
   // The number of times the Prefill function has been called.
@@ -192,6 +236,27 @@ class FakeLlmExecutor : public LlmExecutor {
     kDecode,
   };
   LastOp last_op_ = LastOp::kNone;
+
+  SpeculativeDecodingConfig last_decode_speculative_decoding_config_;
+
+  mutable std::optional<::litert::Environment> env_;
+};
+
+class DiffusionLlmFakeLlmExecutor : public FakeLlmExecutor {
+ public:
+  using FakeLlmExecutor::FakeLlmExecutor;
+
+  absl::StatusOr<std::vector<std::vector<int>>> Decode(
+      const ExecutorDecodeParams& decode_params) override;
+
+  void SetMockDecodeDelay(absl::Duration delay) { mock_decode_delay_ = delay; }
+
+  bool HasDecodeStarted() const { return decode_started_.load(); }
+  void ResetDecodeStarted() { decode_started_.store(false); }
+
+ private:
+  absl::Duration mock_decode_delay_ = absl::ZeroDuration();
+  std::atomic<bool> decode_started_ = false;
 };
 
 }  // namespace litert::lm

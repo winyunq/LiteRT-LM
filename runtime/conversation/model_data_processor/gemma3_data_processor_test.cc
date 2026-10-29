@@ -26,17 +26,19 @@
 #include <gtest/gtest.h>
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "litert/cc/litert_layout.h"  // from @litert
-#include "support/preprocessor/audio_preprocessor_miniaudio.h"  // from @litert
-#include "support/preprocessor/image_preprocessor.h"  // from @litert
 #include "runtime/components/prompt_template.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/gemma3_data_processor_config.h"
+#include "runtime/conversation/model_data_processor/model_data_processor.h"
 #include "runtime/conversation/model_data_processor/test_utils.h"
 #include "runtime/engine/io_types.h"
-#include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/test_utils.h"  // NOLINT
+#include "support/preprocessor/audio_preprocessor_miniaudio.h"
+#include "support/preprocessor/image_preprocessor.h"
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm {
 namespace {
@@ -44,6 +46,24 @@ namespace {
 using json = nlohmann::ordered_json;
 using ::testing::ElementsAre;
 using ::testing::status::IsOkAndHolds;
+
+class FakeNonSentencePieceTokenizer : public ::litert::support::Tokenizer {
+ public:
+  ::litert::support::TokenizerType GetTokenizerType() const override {
+    return ::litert::support::TokenizerType::kHuggingFace;
+  }
+  absl::StatusOr<std::vector<int>> TextToTokenIds(
+      absl::string_view text) override {
+    return std::vector<int>{};
+  }
+  absl::StatusOr<int> TokenToId(absl::string_view token) override { return 0; }
+  absl::StatusOr<std::string> TokenIdsToText(
+      absl::Span<const int> token_ids, bool skip_special_tokens) override {
+    return "";
+  }
+  std::vector<std::string> GetTokens() const override { return {}; }
+  int GetVocabSize() const override { return 0; }
+};
 
 class Gemma3DataProcessorTest : public ::testing::Test {
  protected:
@@ -79,11 +99,6 @@ TEST_F(Gemma3DataProcessorTest, ToInputDataVectorTextOnly) {
 
 TEST_P(Gemma3DataProcessorImageTest, ToInputDataVectorTextAndImage) {
   std::string image_name = GetParam();
-#ifdef LITERT_USE_SKIA
-  if (image_name == "apple.png") {
-    GTEST_SKIP() << "Skipping PNG test for SKIA";
-  }
-#endif
   ASSERT_OK_AND_ASSIGN(auto processor, Gemma3DataProcessor::Create(
                                            /*Gemma3DataProcessorConfig=*/
                                            {.image_tensor_height = 224,
@@ -353,11 +368,6 @@ What is the capital of France?<end_of_turn>
 TEST_P(Gemma3DataProcessorImageTest,
        PromptTemplateToInputDataVectorTextAndImage) {
   std::string image_name = GetParam();
-#ifdef LITERT_USE_SKIA
-  if (image_name == "apple.png") {
-    GTEST_SKIP() << "Skipping PNG test for SKIA";
-  }
-#endif
   const std::string test_file_path =
       GetTestdataPath("google-gemma-3-1b-it.jinja");
   ASSERT_OK_AND_ASSIGN(const std::string template_content,
@@ -510,10 +520,11 @@ TEST_F(Gemma3DataProcessorTest, MessageToTemplateInputWithStringContent) {
       {"content", "test prompt"},
   };
 
-  // The template input is identical to the original message if the content is
-  // a string.
   EXPECT_THAT(processor->MessageToTemplateInput(message),
-              IsOkAndHolds(message));
+              IsOkAndHolds(nlohmann::ordered_json({
+                  {"role", "user"},
+                  {"content", {{{"type", "text"}, {"text", "test prompt"}}}},
+              })));
 }
 
 TEST_F(Gemma3DataProcessorTest, MessageToTemplateInputWithTextContent) {
@@ -743,11 +754,17 @@ TEST_F(Gemma3DataProcessorTest,
   })json");
 
   // The "tool_response" in "content", which is an object rather than an array,
-  // is converted into a string representation of a Python dict.
+  // is converted into a string representation of a Python dict wrapped in an
+  // array of multimodal text parts.
   EXPECT_THAT(processor->MessageToTemplateInput(message),
               IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
                 "role": "tool",
-                "content": "{\"key1\": \"value1\", \"key2\": \"value2\"}"
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "{\"key1\": \"value1\", \"key2\": \"value2\"}"
+                  }
+                ]
               })json")));
 }
 
@@ -756,7 +773,7 @@ TEST_F(Gemma3DataProcessorTest,
   ASSERT_OK_AND_ASSIGN(auto processor, Gemma3DataProcessor::Create());
 
   // Case 1: tool_response key
-  const nlohmann::ordered_json message1 = nlohmann::ordered_json::parse(R"json({
+  nlohmann::ordered_json message1 = nlohmann::ordered_json::parse(R"json({
     "role": "tool",
     "content": {
       "tool_response": {
@@ -767,11 +784,16 @@ TEST_F(Gemma3DataProcessorTest,
   EXPECT_THAT(processor->MessageToTemplateInput(message1),
               IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
                 "role": "tool",
-                "content": "{\"key1\": \"value1\"}"
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "{\"key1\": \"value1\"}"
+                  }
+                ]
               })json")));
 
   // Case 2: response key
-  const nlohmann::ordered_json message2 = nlohmann::ordered_json::parse(R"json({
+  nlohmann::ordered_json message2 = nlohmann::ordered_json::parse(R"json({
     "role": "tool",
     "content": {
       "response": {
@@ -782,11 +804,16 @@ TEST_F(Gemma3DataProcessorTest,
   EXPECT_THAT(processor->MessageToTemplateInput(message2),
               IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
                 "role": "tool",
-                "content": "{\"key2\": \"value2\"}"
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "{\"key2\": \"value2\"}"
+                  }
+                ]
               })json")));
 
   // Case 3: Top-level fields
-  const nlohmann::ordered_json message3 = nlohmann::ordered_json::parse(R"json({
+  nlohmann::ordered_json message3 = nlohmann::ordered_json::parse(R"json({
     "role": "tool",
     "content": {
       "key3": "value3"
@@ -795,7 +822,12 @@ TEST_F(Gemma3DataProcessorTest,
   EXPECT_THAT(processor->MessageToTemplateInput(message3),
               IsOkAndHolds(nlohmann::ordered_json::parse(R"json({
                 "role": "tool",
-                "content": "{\"key3\": \"value3\"}"
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "{\"key3\": \"value3\"}"
+                  }
+                ]
               })json")));
 }
 
@@ -1087,6 +1119,34 @@ TEST_F(Gemma3DataProcessorTest, CreateConstraintAlternativeToolFormat) {
   ])json");
 
   ASSERT_OK_AND_ASSIGN(auto constraint, processor->CreateConstraint(tools));
+}
+
+TEST_F(Gemma3DataProcessorTest, CreateConstraintWithNonSentencePieceTokenizer) {
+  FakeNonSentencePieceTokenizer fake_tokenizer;
+  ASSERT_OK_AND_ASSIGN(
+      auto processor,
+      Gemma3DataProcessor::Create(Gemma3DataProcessorConfig(),
+                                  /*preface=*/std::nullopt, &fake_tokenizer,
+                                  /*stop_token_ids=*/{},
+                                  /*enable_constrained_decoding=*/true));
+  const nlohmann::ordered_json tools = nlohmann::ordered_json::parse(R"json([
+    {
+      "name": "get_weather",
+      "description": "Gets weather information.",
+      "parameters": {
+        "properties": {
+          "location": {
+            "type": "STRING",
+            "description": "Weather location."
+          }
+        },
+        "required": ["location"]
+      }
+    }
+  ])json");
+
+  ASSERT_OK_AND_ASSIGN(auto constraint, processor->CreateConstraint(tools));
+  EXPECT_EQ(constraint, nullptr);
 }
 
 TEST_F(Gemma3DataProcessorTest, CloneState) {

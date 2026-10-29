@@ -24,14 +24,17 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
-#include "support/tokenizer/tokenizer.h"  // from @litert
-#include "runtime/components/logits_processor/constrained_decoding/constraint.h"
-#include "runtime/components/logits_processor/repetition_penalty_config.h"
+#include "runtime/components/constrained_decoding/constraint.h"
+#include "runtime/components/constrained_decoding/no_repeat_ngram_config.h"
+#include "runtime/components/constrained_decoding/repetition_penalty_config.h"
+#include "runtime/components/constrained_decoding/suppress_tokens_config.h"
 #include "runtime/components/sampler.h"
 #include "runtime/components/stop_token_detector.h"
 #include "runtime/engine/io_types.h"
 #include "runtime/executor/llm_executor.h"
 #include "runtime/executor/llm_executor_io_types.h"
+#include "runtime/executor/speculative_decoding_mode.h"
+#include "support/tokenizer/tokenizer.h"
 
 namespace litert::lm::Tasks {
 
@@ -46,11 +49,17 @@ absl::StatusOr<Responses> Decode(
     const StopTokenDetector& stop_token_detector, int num_output_candidates,
     std::optional<BenchmarkInfo>& benchmark_info,
     std::optional<Sampler*> sampler,
-    RepetitionPenaltyConfig repetition_penalty_config, Constraint* constraint,
+    RepetitionPenaltyConfig repetition_penalty_config,
+    NoRepeatNgramConfig no_repeat_ngram_config,
+    SuppressTokensConfig suppress_tokens_config, Constraint* constraint,
     std::optional<litert::TensorBuffer> decoded_ids,
     absl::AnyInvocable<void(absl::StatusOr<Responses>)>& callback,
     std::atomic<bool>* cancelled,
-    int max_output_tokens = std::numeric_limits<int>::max());
+    int max_output_tokens = std::numeric_limits<int>::max(),
+    std::optional<int> thinking_token_budget = std::nullopt,
+    const std::vector<int>& thinking_end_token_ids = {},
+    const std::vector<int>& thinking_start_token_ids = {},
+    const SpeculativeDecodingConfig& speculative_decoding_config = {});
 
 absl::StatusOr<Responses> Score(
     LlmExecutor& executor, Tokenizer& tokenizer,

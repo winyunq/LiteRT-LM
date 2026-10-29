@@ -21,20 +21,27 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "absl/base/log_severity.h"  // from @com_google_absl
+#include "absl/container/btree_map.h"  // from @com_google_absl
 #include "absl/log/log_entry.h"  // from @com_google_absl
 #include "absl/log/log_sink.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
-#include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
+#include "absl/time/time.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
+#include "runtime/components/constrained_decoding/no_repeat_ngram_config.h"
+#include "runtime/components/constrained_decoding/repetition_penalty_config.h"
+#include "runtime/components/constrained_decoding/suppress_tokens_config.h"
 #include "runtime/engine/engine.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
+#include "runtime/executor/speculative_decoding_mode.h"
 
 namespace litert {
 namespace lm {
@@ -78,13 +85,20 @@ struct LiteRtLmSettings {
   std::optional<std::string> expected_output = std::nullopt;
   std::optional<std::string> log_sink_file = std::nullopt;
   int max_num_tokens = 0;
+  bool use_ringbuffers = false;
+  // The maximum number of tokens to generate. For thinking models, both
+  // thinking (reasoning) tokens and the final response tokens count towards
+  // this limit.
   int max_output_tokens = -1;
   int max_num_images = 0;
   int visual_token_budget = -1;
   absl::LogSeverity min_log_level = absl::LogSeverity::kInfo;
   std::set<int> prefill_batch_sizes;
+  // Empty preserves the model's default signature set.
+  std::vector<std::string> selected_signatures;
   int num_output_candidates = 1;
   bool benchmark = false;
+  bool enable_profiling = false;
   int benchmark_prefill_tokens = 0;
   int benchmark_decode_tokens = 0;
   bool async = true;
@@ -92,6 +106,8 @@ struct LiteRtLmSettings {
   bool force_f32 = false;
   bool multi_turns = false;
   int num_cpu_threads = 0;
+  // Delegate supported CPU operations to YNNPACK before XNNPACK.
+  bool enable_ynnpack = false;
   // Set external tensor mode false by default since it runs slightly faster
   // during decode as the layout changes optimized for GPU inference is done by
   // GPU, not by CPU.
@@ -102,6 +118,9 @@ struct LiteRtLmSettings {
   int num_logits_to_print_after_decode = 0;
   std::optional<std::string> score_target_text = std::nullopt;
   bool gpu_madvise_original_shared_tensors = true;
+  bool gpu_enable_metal_residency_set = false;
+  // std::nullopt means "default", which is currently disabled.
+  std::optional<bool> gpu_use_ir_model = std::nullopt;
   bool disable_cache = false;
   bool disable_weight_cache = false;
   bool disable_gpu_program_cache = false;
@@ -122,21 +141,90 @@ struct LiteRtLmSettings {
   bool sampler_handles_input = true;
   ConvType conv_type = ConvType::kAuto;
   bool cache_compiled_shaders_only = false;
+  RepetitionPenaltyConfig repetition_penalty_config =
+      RepetitionPenaltyConfig::Default();
+  NoRepeatNgramConfig no_repeat_ngram_config = NoRepeatNgramConfig::Default();
+  SuppressTokensConfig suppress_tokens_config = SuppressTokensConfig::Default();
   std::string constraint_regex = "";
   bool use_submodel = false;
+  // Default speculative decoding mode of the engine, which sessions inherit.
+  // kOn and kAdaptive load the MTP drafter when the engine is created.
+  // std::nullopt uses the runtime default (off).
+  std::optional<SpeculativeDecodingMode> speculative_decoding_mode;
+  // Deprecated: use `speculative_decoding_mode` instead. If true and
+  // `speculative_decoding_mode` is unset, equivalent to kOn.
   bool enable_speculative_decoding = false;
+  // Diagnostic overrides of the adaptive speculative decoding policy.
+  std::optional<double> mtp_gating_half_life;
+  std::optional<double> mtp_gating_deadband;
+  std::optional<double> mtp_gating_margin;
+  std::optional<int> mtp_gating_probe_interval;
+  std::optional<int> mtp_gating_probe_length;
+  std::optional<int> mtp_gating_forced_switch_period;
+  // Lenience factor of the speculative acceptance test.
+  std::optional<float> speculative_lenience;
+  // Session sampler overrides. If any of top-k, top-p or temperature is set,
+  // the session samples with TOP_P sampling; unset fields default to k=40, p=1
+  // and temperature=1. `sampler_seed` requires one of them: without a sampler
+  // type, the session takes the model's default sampler parameters, seed
+  // included.
+  std::optional<int> sampler_top_k;
+  std::optional<double> sampler_top_p;
+  std::optional<double> sampler_temperature;
+  std::optional<int> sampler_seed;
   bool enable_neon_for_npu_greedy_sampling = true;
   bool use_hw_masking_for_npu = true;
   bool use_hw_cache_update_for_npu = true;
   bool use_hw_ple_for_npu = true;
   bool enable_npu_debug_logging = false;
+  bool disable_input_prompt_as_hint = false;
 };
 
 struct LitertLmMetrics {
   std::optional<BenchmarkInfo> benchmark_info;
   float peak_mem_mb = 0.0f;
   float peak_private_mb = 0.0f;
+  // Peak accelerator (GPU / NPU) memory used by the process, in MB. Unset when
+  // accelerator memory tracking is not supported on the platform or peak memory
+  // reporting is disabled.
+  std::optional<float> peak_accelerator_mb;
+  // Breakdown of `peak_accelerator_mb` into platform-specific categories, in
+  // MB.
+  std::vector<std::pair<std::string, float>> peak_accelerator_breakdown_mb;
 };
+
+// Aggregated (median) statistics of the metrics collected over multiple
+// iterations of the same benchmark. Metrics which were not reported by any
+// iteration are left empty / unset.
+struct AggregatedLitertLmMetrics {
+  // The number of iterations the statistics are computed from.
+  int num_iterations = 0;
+  // Median duration of each initialization phase, keyed by the phase name.
+  absl::btree_map<std::string, absl::Duration> init_phases;
+  // Median duration of each profiling mark, keyed by the mark name.
+  absl::btree_map<std::string, absl::Duration> mark_durations;
+  // Median time to the first token, in seconds.
+  std::optional<double> time_to_first_token_sec;
+  // Median prefill / decode speed, in tokens per second, indexed by the turn
+  // index within an iteration.
+  std::vector<double> prefill_tokens_per_sec;
+  std::vector<double> decode_tokens_per_sec;
+  // Median peak memory usage, in MB.
+  std::optional<float> peak_mem_mb;
+  std::optional<float> peak_private_mb;
+  std::optional<float> peak_accelerator_mb;
+  // Median of each peak accelerator memory breakdown category, in MB, keyed by
+  // the category name. Like `init_phases`, each category is aggregated
+  // independently, so unlike a single iteration's breakdown the medians do not
+  // necessarily sum to `peak_accelerator_mb`.
+  absl::btree_map<std::string, float> peak_accelerator_breakdown_mb;
+};
+
+// Computes the median of each benchmark metric across the per-iteration
+// metrics collected by RunLiteRtLm. For an even number of values, the median is
+// the average of the two middle values.
+AggregatedLitertLmMetrics ComputeMedianMetrics(
+    const std::vector<LitertLmMetrics>& metrics);
 
 // Builds the content list from the input data.
 absl::StatusOr<nlohmann::json> BuildContentList(

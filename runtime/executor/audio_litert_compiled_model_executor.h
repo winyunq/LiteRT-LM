@@ -15,6 +15,7 @@
 #ifndef THIRD_PARTY_ODML_LITERT_LM_RUNTIME_EXECUTOR_AUDIO_LITERT_COMPILED_MODEL_EXECUTOR_H_
 #define THIRD_PARTY_ODML_LITERT_LM_RUNTIME_EXECUTOR_AUDIO_LITERT_COMPILED_MODEL_EXECUTOR_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -32,12 +33,14 @@
 #include "litert/cc/litert_environment.h"  // from @litert
 #include "litert/cc/litert_model.h"  // from @litert
 #include "litert/cc/litert_tensor_buffer.h"  // from @litert
+#include "litert/cc/litert_tensor_buffer_types.h"  // from @litert
 #include "runtime/components/lora_manager.h"
 #include "runtime/components/model_resources.h"
 #include "runtime/engine/io_types.h"
-#include "runtime/executor/audio_executor.h"
-#include "runtime/executor/audio_executor_settings.h"
+#include "runtime/executor/audio/audio_executor.h"
+#include "runtime/executor/audio/audio_executor_settings.h"
 #include "runtime/executor/executor_settings_base.h"
+#include "runtime/executor/executor_stats.h"
 #include "runtime/executor/llm_executor_io_types.h"
 
 namespace litert::lm {
@@ -57,11 +60,29 @@ class AudioStreamingContext : public AudioContext {
   state_buffers() {
     return state_buffers_;
   }
+  std::vector<float>& buffered_spectrogram() { return buffered_spectrogram_; }
+
+  // Returns whether the next encoded chunk is the first chunk of the stream.
+  //
+  // args: none.
+  // returns: true if no chunk has been encoded since the stream started.
+  bool IsFirstChunk() const;
+
+  // Sets whether the next encoded chunk is the first chunk of the stream.
+  //
+  // args:
+  //   - is_first_chunk: true if no chunk has been encoded yet.
+  // returns: none.
+  void SetIsFirstChunk(bool is_first_chunk);
 
  private:
   // The state buffers of the audio encoder model. It includes the kv caches and
   // the convolution features and masks of the last timestamp.
   absl::flat_hash_map<absl::string_view, ::litert::TensorBuffer> state_buffers_;
+  std::vector<float> buffered_spectrogram_;
+  // Whether the next encoded chunk starts the stream and needs the left
+  // context zero padding.
+  bool is_first_chunk_ = true;
 };
 
 // The Audio Executor that uses the LiteRT CompiledModel to run the audio
@@ -79,6 +100,19 @@ class AudioLiteRtCompiledModelExecutor : public AudioExecutor {
   //   or an error status if failed.
   static absl::StatusOr<std::unique_ptr<AudioLiteRtCompiledModelExecutor>>
   Create(AudioExecutorSettings executor_settings, Environment& env);
+
+  // Create an AudioLiteRtCompiledModelExecutor to encode the spectrogram
+  // LiteRT TensorBuffer into audio embeddings LiteRT TensorBuffer.
+  // Args:
+  //   - executor_settings: The audio executor settings.
+  //   - env: The LiteRT environment.
+  //   - resources: The model resources.
+  // Returns:
+  //   A unique pointer to the AudioLiteRtCompiledModelExecutor if successful,
+  //   or an error status if failed.
+  static absl::StatusOr<std::unique_ptr<AudioLiteRtCompiledModelExecutor>>
+  Create(AudioExecutorSettings executor_settings, Environment& env,
+         ModelResources& resources);
 
   // Run the audio encoder and audio adapter models to encode the spectrogram
   // tensor into audio embeddings. It is caller's responsibility to ensure the
@@ -114,6 +148,12 @@ class AudioLiteRtCompiledModelExecutor : public AudioExecutor {
   // model is used.
   absl::Status Reset() override { return audio_encoder_->Reset(); }
 
+  // Flush any buffered spectrogram frames from intermediate streaming Encode()
+  // calls. Processes remaining frames with zero-padding to produce final
+  // audio embeddings. Returns empty ExecutorAudioData (0 tokens) if nothing
+  // is buffered.
+  absl::StatusOr<ExecutorAudioData> Flush() override;
+
   // Get the audio executor properties.
   absl::StatusOr<AudioExecutorProperties> GetAudioExecutorProperties()
       const override {
@@ -144,6 +184,9 @@ class AudioLiteRtCompiledModelExecutor : public AudioExecutor {
   absl::Status UseLoRA(std::optional<uint32_t> lora_id) override {
     return audio_encoder_->UseLoRA(lora_id);
   }
+
+  absl::Status StartProfiling() override;
+  absl::StatusOr<ExecutorStats> StopProfiling() override;
 
  private:
   // The Audio Encoder LiteRT CompiledModel wrapper manage the input and
@@ -224,7 +267,18 @@ class AudioLiteRtCompiledModelExecutor : public AudioExecutor {
 
     LoraManager* GetMutableLoraManager() { return lora_manager_.get(); }
 
+    const std::vector<float>& GetBufferedSpectrogram() const {
+      return buffered_spectrogram_;
+    }
+
+    std::vector<float>& GetMutableBufferedSpectrogram() {
+      return buffered_spectrogram_;
+    }
+
    protected:
+    explicit AudioEncoder(ModelResources& resources) : resources_(resources) {}
+
+    ModelResources& resources_;
     CompiledModel compiled_model_;
 
     // The input buffer for the spectrogram mask.
@@ -248,6 +302,8 @@ class AudioLiteRtCompiledModelExecutor : public AudioExecutor {
     absl::flat_hash_map<absl::string_view, TensorBuffer> output_buffers_map_;
 
     std::unique_ptr<LoraManager> lora_manager_;
+
+    std::vector<float> buffered_spectrogram_;
   };
 
   // Audio Encoder for static LiteRT model, where the whole audio is provided at
@@ -264,7 +320,7 @@ class AudioLiteRtCompiledModelExecutor : public AudioExecutor {
     //   status if failed.
     static absl::StatusOr<std::unique_ptr<AudioStaticEncoder>> Create(
         const AudioExecutorSettings& executor_settings, Environment& env,
-        const Model* absl_nonnull model);
+        const Model* absl_nonnull model, ModelResources& resources);
 
     // Initialize the AudioStaticEncoder, which will create the input and output
     // buffers for the audio encoder model.
@@ -278,8 +334,12 @@ class AudioLiteRtCompiledModelExecutor : public AudioExecutor {
 
    private:
     AudioStaticEncoder(const AudioExecutorSettings& executor_settings,
-                       Environment& env, const Model* absl_nonnull model)
-        : executor_settings_(executor_settings), env_(env), model_(*model) {}
+                       Environment& env, const Model* absl_nonnull model,
+                       ModelResources& resources)
+        : AudioEncoder(resources),
+          executor_settings_(executor_settings),
+          env_(env),
+          model_(*model) {}
 
     const AudioExecutorSettings& executor_settings_;
     Environment& env_;
@@ -335,7 +395,7 @@ class AudioLiteRtCompiledModelExecutor : public AudioExecutor {
     //   error status if failed.
     static absl::StatusOr<std::unique_ptr<AudioStreamingEncoder>> Create(
         const AudioExecutorSettings& executor_settings, Environment& env,
-        const Model* absl_nonnull model);
+        const Model* absl_nonnull model, ModelResources& resources);
 
     // Initialize the AudioStreamingEncoder, which will create the input and
     // output buffers for the audio encoder model.
@@ -353,6 +413,21 @@ class AudioLiteRtCompiledModelExecutor : public AudioExecutor {
 
     bool IsStreaming() const override { return true; }
 
+    // Returns whether the next encoded chunk is the first chunk of the
+    // stream. The first chunk has no previous frames to use as the left
+    // context of the subsampling convolution, so it is zero padded.
+    //
+    // args: none.
+    // returns: true if no chunk has been encoded since the last reset.
+    bool IsFirstChunk() const;
+
+    // Sets whether the next encoded chunk is the first chunk of the stream.
+    //
+    // args:
+    //   - is_first_chunk: true if no chunk has been encoded yet.
+    // returns: none.
+    void SetIsFirstChunk(bool is_first_chunk);
+
     absl::StatusOr<std::unique_ptr<AudioStreamingContext>> CreateNewContext();
 
     absl::StatusOr<std::unique_ptr<AudioStreamingContext>> CloneContext();
@@ -362,13 +437,18 @@ class AudioLiteRtCompiledModelExecutor : public AudioExecutor {
 
    private:
     AudioStreamingEncoder(const AudioExecutorSettings& executor_settings,
-                          Environment& env, const Model* absl_nonnull model)
-        : executor_settings_(executor_settings), env_(env), model_(*model) {}
+                          Environment& env, const Model* absl_nonnull model,
+                          ModelResources& resources)
+        : AudioEncoder(resources),
+          executor_settings_(executor_settings),
+          env_(env),
+          model_(*model) {}
 
-    const AudioExecutorSettings& executor_settings_;
+    AudioExecutorSettings executor_settings_;
     Environment& env_;
     const Model& model_;
     int overlap_size_;
+    bool is_first_chunk_ = true;
   };
 
   // The Audio Adapter LiteRT CompiledModel wrapper manage the input and
@@ -387,7 +467,7 @@ class AudioLiteRtCompiledModelExecutor : public AudioExecutor {
     //   if failed.
     static absl::StatusOr<std::unique_ptr<AudioAdapter>> Create(
         const AudioExecutorSettings& executor_settings, Environment& env,
-        const Model* absl_nonnull model);
+        const Model* absl_nonnull model, ModelResources& resources);
 
     // Initialize the AudioAdapter, which will create the input and output
     // buffers for the audio adapter model.
@@ -422,12 +502,17 @@ class AudioLiteRtCompiledModelExecutor : public AudioExecutor {
 
    private:
     AudioAdapter(const AudioExecutorSettings& executor_settings,
-                 Environment& env, const Model* absl_nonnull model)
-        : executor_settings_(executor_settings), env_(env), model_(*model) {}
+                 Environment& env, const Model* absl_nonnull model,
+                 ModelResources& resources)
+        : executor_settings_(executor_settings),
+          env_(env),
+          model_(*model),
+          resources_(resources) {}
 
-    const AudioExecutorSettings& executor_settings_;
+    AudioExecutorSettings executor_settings_;
     Environment& env_;
     const Model& model_;
+    ModelResources& resources_;
     CompiledModel compiled_model_;
     // The input buffers for the audio adapter model.
     std::vector<TensorBuffer> input_buffers_;
@@ -445,10 +530,13 @@ class AudioLiteRtCompiledModelExecutor : public AudioExecutor {
       std::unique_ptr<ModelResources> resources,
       std::unique_ptr<AudioEncoder> audio_encoder,
       std::unique_ptr<AudioAdapter> audio_adapter, int sequence_length,
-      int spectrogram_feature_dimensions, int audio_embedding_dimensions,
+      int spectrogram_feature_dimensions,
+      int projected_audio_embedding_dimensions, int audio_embedding_dimensions,
       int encoder_shrinking_factor)
       : sequence_length_(sequence_length),
         spectrogram_feature_dimensions_(spectrogram_feature_dimensions),
+        projected_audio_embedding_dimensions_(
+            projected_audio_embedding_dimensions),
         audio_embedding_dimensions_(audio_embedding_dimensions),
         encoder_shrinking_factor_(encoder_shrinking_factor),
         executor_settings_(std::move(executor_settings)),
@@ -464,15 +552,59 @@ class AudioLiteRtCompiledModelExecutor : public AudioExecutor {
   //   - spectrogram_tensor: The spectrogram tensor buffer to encode.
   //   - spectrogram_mask: The spectrogram mask buffer to indicate the valid
   //   timestamps.
-  //   - audio_embeddings: The output buffer for the audio embeddings to write
-  //   into.
+  //   - projected_audio_embeddings: The output buffer for the projected audio
+  //   embeddings to write into.
+  //   - audio_embeddings: The output buffer for the audio
+  //   embeddings (conformer output before adapter) to write into.
   // Returns:
   //   The number of valid tokens in the audio embeddings.
-  absl::StatusOr<int> EncodeInternal(absl::Span<float> spectrogram_tensor,
-                                     absl::Span<uint8_t> spectrogram_mask,
-                                     absl::Span<float> audio_embeddings);
+  absl::StatusOr<int> EncodeInternal(
+      absl::Span<const float> spectrogram_tensor,
+      absl::Span<const uint8_t> spectrogram_mask,
+      absl::Span<float> projected_audio_embeddings,
+      absl::Span<float> audio_embeddings);
+
+  // Encode the spectrogram tensor and mask tensor into audio embeddings.
+  // Args:
+  //   - spectrogram_host_buffer: The spectrogram host buffer to encode.
+  //   - spectrogram_mask_host_buffer: The spectrogram mask host buffer to
+  //   indicate the valid timestamps.
+  //   - total_frames: The total number of frames in the spectrogram tensor.
+  //   - is_flush: Whether the encode is a flush operation.
+  // Returns:
+  //   The ExecutorAudioData if successful, or an error status if failed.
+  absl::StatusOr<ExecutorAudioData> EncodeSpecsAndMasks(
+      const std::vector<float>& spectrogram_host_buffer,
+      const std::vector<uint8_t>& spectrogram_mask_host_buffer,
+      int total_frames, bool is_flush);
+
+  struct LockedTensor {
+    ::litert::TensorBuffer tensor;
+    std::optional<::litert::TensorBufferScopedLock> lock;
+    float* ptr;
+
+    LockedTensor(::litert::TensorBuffer t, ::litert::TensorBufferScopedLock l,
+                 float* p)
+        : tensor(std::move(t)), lock(std::move(l)), ptr(p) {}
+  };
+
+  absl::StatusOr<LockedTensor> CreateAndLockAudioTensor(int num_tokens,
+                                                        int dimensions);
+
+  // Returns whether `consumer` should take `producer` directly as its input
+  // buffer instead of a host copy made by the executor.
+  static bool ShouldShareProducerBuffer(TensorBufferType producer_type,
+                                        size_t producer_packed_size,
+                                        TensorBufferType consumer_type,
+                                        size_t consumer_packed_size);
+  static absl::StatusOr<bool> ShouldShareProducerBuffer(
+      const TensorBuffer& producer, const TensorBuffer& consumer);
+
+  friend class AudioLiteRtCompiledModelExecutorTest;
+
   int sequence_length_;
   int spectrogram_feature_dimensions_;
+  int projected_audio_embedding_dimensions_;
   int audio_embedding_dimensions_;
   int encoder_shrinking_factor_;
   AudioExecutorSettings executor_settings_;
@@ -482,6 +614,8 @@ class AudioLiteRtCompiledModelExecutor : public AudioExecutor {
   std::unique_ptr<ModelResources> resources_;
   std::unique_ptr<AudioEncoder> audio_encoder_;
   std::unique_ptr<AudioAdapter> audio_adapter_;
+
+  std::optional<ExecutorStats> latency_stats_;
 };
 
 }  // namespace litert::lm

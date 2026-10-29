@@ -52,6 +52,15 @@ class EmbeddingLookupManager {
   //
   // If the provide text_embedding_model has more than one signature, the
   // signature_key must be provided.
+  //
+  // If the text_embedding_model has external weights that are being loaded from
+  // a file, the external_weight_file and external_weight_sections must be
+  // provided.
+  //
+  // To construct with an already compiled litert::CompiledModel rather than a
+  // litert::Model (such as when using a streaming loader), create an
+  // EmbeddingLookupText object with the compiled model and pass it to the
+  // Create function below.
   static absl::StatusOr<std::unique_ptr<EmbeddingLookupManager>> Create(
       litert::Environment& env,
       const litert::Model* absl_nonnull text_embedding_model,
@@ -60,7 +69,9 @@ class EmbeddingLookupManager {
       bool fully_supports_multi_modal = true,
       std::optional<std::string> signature_key = std::nullopt,
       std::optional<ScopedFile> external_weight_file = std::nullopt,
-      litert::Options::ScopedWeightSectionMap external_weight_sections = {});
+      litert::Options::ScopedWeightSectionMap external_weight_sections = {},
+      const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
+          weight_in_memory_map = nullptr);
 
   static absl::StatusOr<std::unique_ptr<EmbeddingLookupManager>> Create(
       litert::Environment& env,
@@ -72,7 +83,9 @@ class EmbeddingLookupManager {
       litert::HwAcceleratorSet hardware_accelerators,
       bool require_full_acceleration,
       std::optional<ScopedFile> external_weight_file = std::nullopt,
-      litert::Options::ScopedWeightSectionMap external_weight_sections = {});
+      litert::Options::ScopedWeightSectionMap external_weight_sections = {},
+      const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
+          weight_in_memory_map = nullptr);
 
   static absl::StatusOr<std::unique_ptr<EmbeddingLookupManager>> Create(
       litert::Environment& env,
@@ -80,7 +93,21 @@ class EmbeddingLookupManager {
       bool fully_supports_multi_modal = true,
       std::optional<std::string> signature_key = std::nullopt,
       std::optional<ScopedFile> external_weight_file = std::nullopt,
-      litert::Options::ScopedWeightSectionMap external_weight_sections = {});
+      litert::Options::ScopedWeightSectionMap external_weight_sections = {},
+      const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
+          weight_in_memory_map = nullptr);
+
+  static absl::StatusOr<std::unique_ptr<EmbeddingLookupManager>> Create(
+      litert::Environment& env,
+      std::unique_ptr<EmbeddingLookupText> text_embedding_lookup,
+      absl::flat_hash_map<int, const litert::Model*>&
+          end_of_multi_modal_embedding_models,
+      bool fully_supports_multi_modal = true);
+
+  static absl::StatusOr<std::unique_ptr<EmbeddingLookupManager>> Create(
+      litert::Environment& env,
+      std::unique_ptr<EmbeddingLookupText> text_embedding_lookup,
+      bool fully_supports_multi_modal = true);
 
   static absl::StatusOr<std::unique_ptr<EmbeddingLookupManager>> Create(
       litert::Environment& env,
@@ -90,7 +117,9 @@ class EmbeddingLookupManager {
       litert::HwAcceleratorSet hardware_accelerators,
       bool require_full_acceleration,
       std::optional<ScopedFile> external_weight_file = std::nullopt,
-      litert::Options::ScopedWeightSectionMap external_weight_sections = {});
+      litert::Options::ScopedWeightSectionMap external_weight_sections = {},
+      const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
+          weight_in_memory_map = nullptr);
 
   // Updates the multimodal embeddings for the given ExecutorInputs.
   // Intended to be called at the beginning of the prefill pass.
@@ -152,7 +181,16 @@ class EmbeddingLookupManager {
       litert::HwAcceleratorSet hardware_accelerators,
       bool require_full_acceleration,
       std::optional<ScopedFile> external_weight_file,
-      litert::Options::ScopedWeightSectionMap external_weight_sections);
+      litert::Options::ScopedWeightSectionMap external_weight_sections,
+      const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
+          weight_in_memory_map = nullptr);
+
+  absl::Status Initialize(
+      litert::Environment& env,
+      std::unique_ptr<EmbeddingLookupText> text_embedding_lookup,
+      absl::flat_hash_map<int, const litert::Model*>&
+          end_of_multi_modal_embedding_models,
+      bool fully_supports_multi_modal);
 
   std::unique_ptr<EmbeddingLookupText> text_embedding_lookup_;
   std::vector<std::unique_ptr<EmbeddingLookupMultiModal>>

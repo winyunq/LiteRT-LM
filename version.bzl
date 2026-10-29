@@ -16,7 +16,8 @@
 
 # The next version of LiteRT-LM (e.g. the version that is currently in development).
 # The minor version code usually should be bumped after every release.
-VERSION = "0.14.0"
+VERSION = "0.19.0"
 
 # C API Compatibility version.
-C_API_VERSION = "0.1.0"
+# Keep LITERT_LM_C_API_VERSION_* in c/engine.h in sync; engine_test checks this.
+C_API_VERSION = "1.0.0"

@@ -17,7 +17,7 @@
 import './chat_window';
 
 import {LlmChatStateController} from '../state_controller.js';
-import {ChatSessionStore} from '../stores/chat_session_store.js';
+import {ChatSessionStore, PromptMedia, PromptPart} from '../stores/chat_session_store.js';
 import {ModelLoaderService} from '../stores/model_loader_service.js';
 import {SettingsStore} from '../stores/settings_store.js';
 import {LitertChatWindow} from './chat_window.js';
@@ -29,15 +29,57 @@ describe('litert-chat-window', () => {
   let mockSettings: jasmine.SpyObj<SettingsStore>;
   let mockModelLoader: jasmine.SpyObj<ModelLoaderService>;
   let cachedModelsMap: Map<string, number>;
+  let createdMedia: Map<string, PromptMedia>;
+  const fakeImage: PromptMedia = {
+    id: 'img1',
+    kind: 'image',
+    name: 'cat.png',
+    blob: new Blob(),
+    url: 'blob:fake-url',
+  };
+
+  function getEditor(): HTMLDivElement {
+    return element.shadowRoot!.querySelector('#chat-input') as HTMLDivElement;
+  }
+
+  /** Adds a file through the hidden file input, as the '+' button does. */
+  async function addFileViaPicker(file: File): Promise<void> {
+    const input =
+        element.shadowRoot!.querySelector('#media-input') as HTMLInputElement;
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(file);
+    input.files = dataTransfer.files;
+    input.dispatchEvent(new Event('change'));
+    await new Promise(resolve => setTimeout(resolve, 0));
+  }
+
+  /** Adds an image through the hidden file input. */
+  async function addImageViaPicker(): Promise<File> {
+    const file =
+        new File([new Uint8Array([1])], 'cat.png', {type: 'image/png'});
+    await addFileViaPicker(file);
+    return file;
+  }
 
   beforeEach(async () => {
     mockChatSession = jasmine.createSpyObj('ChatSessionStore', [
       'sendMessage',
       'cancelGeneration',
+      'createMedia',
+      'getMedia',
     ]);
     // Initialize properties used during render
     mockChatSession.isGenerating = false;
     mockChatSession.messages = [];
+    createdMedia = new Map([[fakeImage.id, fakeImage]]);
+    mockChatSession.createMedia.and.callFake((kind, name, blob) => {
+      if (kind === 'image') return fakeImage;
+      const media: PromptMedia =
+          {id: `media${createdMedia.size}`, kind, name, blob, url: 'blob:x'};
+      createdMedia.set(media.id, media);
+      return media;
+    });
+    mockChatSession.getMedia.and.callFake((id: string) => createdMedia.get(id));
 
     mockSettings = jasmine.createSpyObj('SettingsStore', ['saveSettings']);
     mockSettings.selectedModelPath = 'path/to/model_file.litertlm';
@@ -94,18 +136,19 @@ describe('litert-chat-window', () => {
     element.requestUpdate();
     await element.updateComplete;
 
-    const textarea = element.shadowRoot!.querySelector('#chat-input') as HTMLTextAreaElement;
-    expect(textarea.disabled).toBeTrue();
-    expect(textarea.placeholder).toBe('Model is preparing, please wait...');
+    const editor = getEditor();
+    expect(editor.getAttribute('contenteditable')).toBe('false');
+    expect(editor.dataset['placeholder'])
+        .toBe('Model is preparing, please wait...');
 
     const sendBtn = element.shadowRoot!.querySelector('#btn-send') as HTMLButtonElement;
     expect(sendBtn.disabled).toBeTrue();
   });
 
   it('enables input when model is not loading', () => {
-    const textarea = element.shadowRoot!.querySelector('#chat-input') as HTMLTextAreaElement;
-    expect(textarea.disabled).toBeFalse();
-    expect(textarea.placeholder).toBe('Message LiteRT-LM...');
+    const editor = getEditor();
+    expect(editor.getAttribute('contenteditable')).toBe('true');
+    expect(editor.dataset['placeholder']).toContain('Message LiteRT-LM...');
 
     const sendBtn = element.shadowRoot!.querySelector('#btn-send') as HTMLButtonElement;
     expect(sendBtn.disabled).toBeFalse();
@@ -142,55 +185,143 @@ describe('litert-chat-window', () => {
   });
 
   it('sends message on send button click', async () => {
-    const textarea = element.shadowRoot!.querySelector('#chat-input') as HTMLTextAreaElement;
-    textarea.value = 'Test prompt';
+    const editor = getEditor();
+    editor.textContent = 'Test prompt';
     
     const sendBtn = element.shadowRoot!.querySelector('#btn-send') as HTMLButtonElement;
     sendBtn.click();
     await element.updateComplete;
 
     expect(mockChatSession.sendMessage).toHaveBeenCalledWith('Test prompt');
-    expect(textarea.value).toBe('');
+    expect(editor.textContent).toBe('');
   });
 
   it('sends message on Enter key press', async () => {
-    const textarea = element.shadowRoot!.querySelector('#chat-input') as HTMLTextAreaElement;
-    textarea.value = 'Test prompt Enter';
+    const editor = getEditor();
+    editor.textContent = 'Test prompt Enter';
     
     const event = new KeyboardEvent('keydown', {key: 'Enter', shiftKey: false});
-    textarea.dispatchEvent(event);
+    editor.dispatchEvent(event);
     await element.updateComplete;
 
     expect(mockChatSession.sendMessage).toHaveBeenCalledWith('Test prompt Enter');
-    expect(textarea.value).toBe('');
+    expect(editor.textContent).toBe('');
   });
 
   it('does not send message on Shift+Enter key press', async () => {
-    const textarea = element.shadowRoot!.querySelector('#chat-input') as HTMLTextAreaElement;
-    textarea.value = 'Test prompt Shift Enter';
+    const editor = getEditor();
+    editor.textContent = 'Test prompt Shift Enter';
     
     const event = new KeyboardEvent('keydown', {key: 'Enter', shiftKey: true});
-    textarea.dispatchEvent(event);
+    editor.dispatchEvent(event);
     await element.updateComplete;
 
     expect(mockChatSession.sendMessage).not.toHaveBeenCalled();
-    expect(textarea.value).toBe('Test prompt Shift Enter');
+    expect(editor.textContent).toBe('Test prompt Shift Enter');
   });
 
   it('inserts newline on Ctrl+J key press', async () => {
-    const textarea =
-        element.shadowRoot!.querySelector('#chat-input') as HTMLTextAreaElement;
-    textarea.value = 'Line 1Line 2';
-    textarea.selectionStart = 6;
-    textarea.selectionEnd = 6;
+    const editor = getEditor();
+    editor.textContent = 'Line 1Line 2';
+    editor.focus();
+    const range = document.createRange();
+    range.setStart(editor.firstChild!, 6);
+    range.collapse(true);
+    const selection = document.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
 
-    const event = new KeyboardEvent('keydown', {key: 'j', ctrlKey: true});
-    textarea.dispatchEvent(event);
+    editor.dispatchEvent(
+        new KeyboardEvent('keydown', {key: 'j', ctrlKey: true}));
+    editor.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter'}));
     await element.updateComplete;
 
-    expect(textarea.value).toBe('Line 1\nLine 2');
-    expect(textarea.selectionStart).toBe(7);
-    expect(textarea.selectionEnd).toBe(7);
+    expect(mockChatSession.sendMessage).toHaveBeenCalledWith('Line 1\nLine 2');
+  });
+
+  it('serializes <div> line wrappers as newlines', async () => {
+    const editor = getEditor();
+    editor.innerHTML = 'Line 1<div>Line 2</div><div><br></div><div>Line 4</div>';
+
+    editor.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter'}));
+    await element.updateComplete;
+
+    expect(mockChatSession.sendMessage)
+        .toHaveBeenCalledWith('Line 1\nLine 2\n\nLine 4');
+  });
+
+  it('does not send an empty message', async () => {
+    getEditor().textContent = '   ';
+    getEditor().dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter'}));
+    await element.updateComplete;
+
+    expect(mockChatSession.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('adds picked images inline and sends them in order', async () => {
+    const editor = getEditor();
+    editor.textContent = 'Describe ';
+
+    const file = await addImageViaPicker();
+
+    const chip = editor.querySelector('.media-chip') as HTMLElement;
+    expect(chip).toBeTruthy();
+    expect(chip.dataset['mediaId']).toBe(fakeImage.id);
+    expect(chip.querySelector('img.chip-thumb')).toBeTruthy();
+    expect(mockChatSession.createMedia)
+        .toHaveBeenCalledWith('image', 'cat.png', file);
+
+    editor.appendChild(document.createTextNode('please'));
+    editor.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter'}));
+    await element.updateComplete;
+
+    expect(mockChatSession.sendMessage).toHaveBeenCalledWith([
+      {type: 'text', text: 'Describe '},
+      {type: 'media', media: fakeImage},
+      // The non-breaking spacer after the chip is sent as a normal space.
+      {type: 'text', text: ' please'},
+    ]);
+    expect(editor.querySelector('.media-chip')).toBeNull();
+  });
+
+  it('adds picked audio files as playable chips', async () => {
+    const file =
+        new File([new Uint8Array([1])], 'meow.wav', {type: 'audio/wav'});
+    await addFileViaPicker(file);
+
+    expect(mockChatSession.createMedia)
+        .toHaveBeenCalledWith('audio', 'meow.wav', file);
+    const chip = getEditor().querySelector('.media-chip') as HTMLElement;
+    expect(chip).toBeTruthy();
+    expect(chip.querySelector('.chip-play-btn')).toBeTruthy();
+    expect(chip.querySelector('img')).toBeNull();
+
+    getEditor().dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter'}));
+    await element.updateComplete;
+
+    const media = createdMedia.get(chip.dataset['mediaId']!)!;
+    expect(mockChatSession.sendMessage).toHaveBeenCalledWith([
+      {type: 'media', media},
+      {type: 'text', text: ' '},
+    ]);
+  });
+
+  it('rejects files that are not images or audio', async () => {
+    await addFileViaPicker(
+        new File(['text'], 'notes.txt', {type: 'text/plain'}));
+
+    expect(mockChatSession.createMedia).not.toHaveBeenCalled();
+    expect(getEditor().querySelector('.media-chip')).toBeNull();
+  });
+
+  it('removes media when its chip delete button is clicked', async () => {
+    await addImageViaPicker();
+    const editor = getEditor();
+    const deleteBtn =
+        editor.querySelector('.chip-del-btn') as HTMLButtonElement;
+    deleteBtn.click();
+
+    expect(editor.querySelector('.media-chip')).toBeNull();
   });
 
   it('populates input when clicking quick starter', async () => {
@@ -200,9 +331,9 @@ describe('litert-chat-window', () => {
     firstStarter.click();
     await element.updateComplete;
 
-    const textarea = element.shadowRoot!.querySelector('#chat-input') as HTMLTextAreaElement;
-    expect(textarea.value).toBe('Explain WebGPU in simple terms.');
-    expect(element.shadowRoot!.activeElement).toBe(textarea);
+    const editor = getEditor();
+    expect(editor.textContent).toBe('Explain WebGPU in simple terms.');
+    expect(element.shadowRoot!.activeElement).toBe(editor);
   });
 
   it('handles edit-prompt event', async () => {
@@ -216,17 +347,25 @@ describe('litert-chat-window', () => {
     const bubble = element.shadowRoot!.querySelector('litert-chat-bubble');
     expect(bubble).toBeTruthy();
 
-    const textarea = element.shadowRoot!.querySelector('#chat-input') as HTMLTextAreaElement;
-    expect(textarea.value).toBe('');
+    const editor = getEditor();
+    expect(editor.textContent).toBe('');
 
+    const parts: PromptPart[] = [
+      {type: 'text', text: 'Edited '},
+      {type: 'media', media: fakeImage},
+      {type: 'text', text: ' Prompt'},
+    ];
     bubble!.dispatchEvent(new CustomEvent('edit-prompt', {
-      detail: {prompt: 'Edited Prompt'},
+      detail: {parts},
       bubbles: true,
       composed: true,
     }));
     await element.updateComplete;
 
-    expect(textarea.value).toBe('Edited Prompt');
-    expect(element.shadowRoot!.activeElement).toBe(textarea);
+    expect(editor.textContent).toContain('Edited ');
+    expect(editor.textContent).toContain(' Prompt');
+    const chip = editor.querySelector('.media-chip') as HTMLElement;
+    expect(chip.dataset['mediaId']).toBe(fakeImage.id);
+    expect(element.shadowRoot!.activeElement).toBe(editor);
   });
 });

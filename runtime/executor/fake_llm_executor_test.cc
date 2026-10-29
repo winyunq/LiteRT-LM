@@ -14,7 +14,6 @@
 
 #include "runtime/executor/fake_llm_executor.h"
 
-#include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -25,10 +24,11 @@
 #include "absl/time/clock.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
+#include "litert/cc/litert_common.h"  // from @litert
+#include "litert/cc/litert_tensor_buffer.h"  // from @litert
 #include "litert/test/matchers.h"  // from @litert
-#include "runtime/components/logits_processor/constrained_decoding/constrained_decoder.h"
-#include "runtime/components/logits_processor/constrained_decoding/fake_constraint.h"
-#include "runtime/components/logits_processor/logits_processor.h"
+#include "runtime/components/constrained_decoding/constrained_decoder.h"
+#include "runtime/components/constrained_decoding/fake_constraint.h"
 #include "runtime/executor/llm_executor_io_types.h"
 #include "runtime/util/convert_tensor_buffer.h"
 #include "runtime/util/test_utils.h"  // IWYU pragma: keep
@@ -82,9 +82,12 @@ TEST(FakeLlmExecutorTest, Prefill) {
               StatusIs(absl::StatusCode::kInvalidArgument));
 
   // Succeed because the input tokens match the expected prefill tokens.
-  auto ids_span = ReferTensorBufferAsSpan<int>(*(*inputs.GetTextTokenIdsPtr()));
-
-  (*ids_span)[2] = 3;
+  {
+    ASSERT_OK_AND_ASSIGN(auto token_ids, inputs.GetTextTokenIdsPtr());
+    LITERT_ASSERT_OK_AND_ASSIGN(auto ids_span,
+                                ReferTensorBufferAsSpan<int>(*token_ids));
+    ids_span[2] = 3;
+  }
   EXPECT_OK(fake_llm_executor.Prefill(inputs));
   EXPECT_EQ(fake_llm_executor.GetCurrentStep().value(), 3);
 }
@@ -92,9 +95,10 @@ TEST(FakeLlmExecutorTest, Prefill) {
 TEST(FakeLlmExecutorTest, PrefillWithAudio) {
   const std::vector<std::vector<int>> prefill_tokens_set = {{1, 2, 3}};
   const std::vector<std::vector<int>> decode_tokens_set = {{3, 2}, {0, 0}};
-  std::vector<float> audio_embeddings_set = {1.0f, 2.0f, 3.0f, 4.0f};
+  std::vector<float> projected_audio_embeddings_set = {1.0f, 2.0f, 3.0f, 4.0f};
   FakeLlmExecutor fake_llm_executor(3, prefill_tokens_set, decode_tokens_set,
-                                    /*batch_size=*/1, audio_embeddings_set);
+                                    /*batch_size=*/1,
+                                    projected_audio_embeddings_set);
 
   ExecutorInputs inputs;
   // Create a tensor buffer with 3 elements but only the first two elements
@@ -105,13 +109,14 @@ TEST(FakeLlmExecutorTest, PrefillWithAudio) {
       CopyToTensorBuffer<int>(absl::MakeSpan(input_tokens), {1, 3}));
   inputs.SetTextData(ExecutorTextData(std::move(input_tokens_buffer)));
 
-  const std::vector<float> input_audio_embedding = {1.0f, 2.0f, 3.0f, 0.0f};
+  const std::vector<float> input_projected_audio_embedding = {1.0f, 2.0f, 3.0f,
+                                                              0.0f};
   LITERT_ASSERT_OK_AND_ASSIGN(
-      auto input_audio_embedding_buffer,
-      CopyToTensorBuffer<float>(absl::MakeSpan(input_audio_embedding),
+      auto input_projected_audio_embedding_buffer,
+      CopyToTensorBuffer<float>(absl::MakeSpan(input_projected_audio_embedding),
                                 {1, 4, 1}));
-  inputs.SetAudioData(
-      ExecutorAudioData(std::move(input_audio_embedding_buffer), std::nullopt));
+  inputs.SetAudioData(ExecutorAudioData(
+      std::move(input_projected_audio_embedding_buffer), std::nullopt));
 
   // Fail because the input audio embedding does not match the expected the
   // audio embedding set.
@@ -120,9 +125,13 @@ TEST(FakeLlmExecutorTest, PrefillWithAudio) {
 
   // Succeed because the input audio embedding matches the expected audio
   // embedding set.
-  auto audio_embedding_span =
-      ReferTensorBufferAsSpan<float>(*(*inputs.GetAudioEmbeddingsPtr()));
-  (*audio_embedding_span)[3] = 4.0f;
+  {
+    ASSERT_OK_AND_ASSIGN(const TensorBuffer* projected_audio_embeddings_ptr,
+                         inputs.GetProjectedAudioEmbeddingsPtr());
+    auto projected_audio_embedding_span =
+        ReferTensorBufferAsSpan<float>(*projected_audio_embeddings_ptr);
+    (*projected_audio_embedding_span)[3] = 4.0f;
+  }
 
   EXPECT_OK(fake_llm_executor.Prefill(inputs));
   EXPECT_EQ(fake_llm_executor.GetCurrentStep().value(), 3);
@@ -197,20 +206,25 @@ TEST(FakeLlmExecutorTest, DecodeToLogits) {
   // [-inf, -inf, -inf, inf].
   EXPECT_OK(fake_llm_executor.Decode(inputs, *output_logits));
   EXPECT_EQ(fake_llm_executor.GetCurrentStep().value(), 4);
-  auto output_logits_span = ReferTensorBufferAsSpan<float>(*output_logits);
-  EXPECT_LE((*output_logits_span)[0], 0.0f);
-  EXPECT_LE((*output_logits_span)[1], 0.0f);
-  EXPECT_LE((*output_logits_span)[2], 0.0f);
-  EXPECT_GE((*output_logits_span)[3], 0.0f);
+  {
+    auto output_logits_span = ReferTensorBufferAsSpan<float>(*output_logits);
+    EXPECT_LE((*output_logits_span)[0], 0.0f);
+    EXPECT_LE((*output_logits_span)[1], 0.0f);
+    EXPECT_LE((*output_logits_span)[2], 0.0f);
+    EXPECT_GE((*output_logits_span)[3], 0.0f);
+  }
 
   // Call Decode for the 2nd time. The output logits should have values:
   // [inf, -inf, -inf, -inf].
   EXPECT_OK(fake_llm_executor.Decode(inputs, *output_logits));
   EXPECT_EQ(fake_llm_executor.GetCurrentStep().value(), 5);
-  EXPECT_GE((*output_logits_span)[0], 0.0f);
-  EXPECT_LE((*output_logits_span)[1], 0.0f);
-  EXPECT_LE((*output_logits_span)[2], 0.0f);
-  EXPECT_LE((*output_logits_span)[3], 0.0f);
+  {
+    auto output_logits_span = ReferTensorBufferAsSpan<float>(*output_logits);
+    EXPECT_GE((*output_logits_span)[0], 0.0f);
+    EXPECT_LE((*output_logits_span)[1], 0.0f);
+    EXPECT_LE((*output_logits_span)[2], 0.0f);
+    EXPECT_LE((*output_logits_span)[3], 0.0f);
+  }
 
   // Call Decode for the 3nd time. Should fail.
   EXPECT_THAT(fake_llm_executor.Decode(inputs, *output_logits),
@@ -243,24 +257,28 @@ TEST(FakeLlmExecutorTest, DecodeLogits) {
   auto output_logits = fake_llm_executor.DecodeLogits(inputs);
   // Call Decode for the 1st time. The output logits should have values:
   // [-inf, -inf, -inf, inf].
-  EXPECT_TRUE(output_logits.ok());
+  ASSERT_OK(output_logits);
   EXPECT_EQ(fake_llm_executor.GetCurrentStep().value(), 4);
-  auto output_logits_span = ReferTensorBufferAsSpan<float>(*output_logits);
-  EXPECT_LE((*output_logits_span)[0], 0.0f);
-  EXPECT_LE((*output_logits_span)[1], 0.0f);
-  EXPECT_LE((*output_logits_span)[2], 0.0f);
-  EXPECT_GE((*output_logits_span)[3], 0.0f);
+  {
+    auto output_logits_span = ReferTensorBufferAsSpan<float>(*output_logits);
+    EXPECT_LE((*output_logits_span)[0], 0.0f);
+    EXPECT_LE((*output_logits_span)[1], 0.0f);
+    EXPECT_LE((*output_logits_span)[2], 0.0f);
+    EXPECT_GE((*output_logits_span)[3], 0.0f);
+  }
 
   output_logits = fake_llm_executor.DecodeLogits(inputs);
   // Call Decode for the 2nd time. The output logits should have values:
   // [inf, -inf, -inf, -inf].
-  EXPECT_TRUE(output_logits.ok());
+  ASSERT_OK(output_logits);
   EXPECT_EQ(fake_llm_executor.GetCurrentStep().value(), 5);
-  output_logits_span = ReferTensorBufferAsSpan<float>(*output_logits);
-  EXPECT_GE((*output_logits_span)[0], 0.0f);
-  EXPECT_LE((*output_logits_span)[1], 0.0f);
-  EXPECT_LE((*output_logits_span)[2], 0.0f);
-  EXPECT_LE((*output_logits_span)[3], 0.0f);
+  {
+    auto output_logits_span = ReferTensorBufferAsSpan<float>(*output_logits);
+    EXPECT_GE((*output_logits_span)[0], 0.0f);
+    EXPECT_LE((*output_logits_span)[1], 0.0f);
+    EXPECT_LE((*output_logits_span)[2], 0.0f);
+    EXPECT_LE((*output_logits_span)[3], 0.0f);
+  }
 
   // Call Decode for the 3nd time. Should fail.
   EXPECT_THAT(fake_llm_executor.Decode(inputs, *output_logits),
@@ -366,13 +384,13 @@ TEST(FakeLlmExecutorTest, DecodeWithConstraint) {
   EXPECT_OK(fake_llm_executor.Prefill(inputs));
   EXPECT_EQ(fake_llm_executor.GetCurrentStep().value(), 3);
 
-  auto constrained_decoder =
-      std::make_unique<ConstrainedDecoder>(&constraint,
-                                           /*num_output_candidates=*/1);
   auto decode_params = ExecutorDecodeParams();
-  decode_params.SetLogitsProcessorList({
-      constrained_decoder.get(),
-  });
+  ASSERT_OK_AND_ASSIGN(
+      auto constrained_decoder,
+      ConstrainedDecoder::Create(&constraint, /*batch_size=*/1,
+                                 *fake_llm_executor.GetEnvironment(),
+                                 HwAccelerators::kCpu));
+  decode_params.SetConstrainedDecoder(constrained_decoder.get());
   // Call Decode for the 1st time. The output tokens should be the 1st decode
   // tokens: 4. (first constraint token)
   ASSERT_OK_AND_ASSIGN(auto output_tokens,

@@ -24,17 +24,21 @@ import prompt_toolkit
 from prompt_toolkit import key_binding
 
 import litert_lm
-from litert_lm_builder import litertlm_builder
 from litert_lm_cli import cli_helpers
 from litert_lm_cli import common
 from litert_lm_cli import help_formatter
 from litert_lm_cli import huggingface_download
 from litert_lm_cli import model
-from litert_lm_cli.commands import convert as _convert_module
+try:
+  # PyPI: litert-lm-builder bundles the protos under its own package.
+  from litert_lm_builder.runtime.proto import llm_metadata_pb2
+except ImportError:
+  # Bazel: the protos are importable from the workspace root.
+  from runtime.proto import llm_metadata_pb2
 
 try:
   # pylint: disable=g-import-not-at-top
-  from litert_lm.adb import adb_engine  # pytype: disable=import-error
+  from litert_lm.adb import adb_engine  # pyrefly: ignore[missing-import]
 
   _HAS_ADB = True
 except ImportError:
@@ -47,6 +51,11 @@ class SessionState:
   def __init__(self):
     self.active_channel = None
 
+  def close_channel(self):
+    if self.active_channel is not None:
+      click.echo(click.style(f" [/{self.active_channel}]", fg="blue"))
+      self.active_channel = None
+
 
 class LoggingToolEventHandler(litert_lm.ToolEventHandler):
   """Log tool call and tool response events."""
@@ -56,9 +65,7 @@ class LoggingToolEventHandler(litert_lm.ToolEventHandler):
 
   def approve_tool_call(self, tool_call):
     """Logs a tool call."""
-    if self.state.active_channel is not None:
-      click.echo("\n", nl=False)
-      self.state.active_channel = None
+    self.state.close_channel()
     click.echo(
         click.style(
             f"[tool_call] {json.dumps(tool_call['function'])}", fg="green"
@@ -103,30 +110,26 @@ def _execute_prompt(
 
   try:
     for chunk in stream:
-      content_list = chunk.get("content", [])
-      for item in content_list:
-        if item.get("type") == "text":
-          if state.active_channel is not None:
-            click.echo()
-            state.active_channel = None
-          click.echo(click.style(item.get("text", ""), fg="yellow"), nl=False)
+      text = str(chunk)
+      if text:
+        state.close_channel()
+        click.echo(click.style(text, fg="yellow"), nl=False)
 
-      channels = chunk.get("channels", {})
-      for channel_name, channel_content in channels.items():
+      for channel_name, channel_content in chunk.channels.items():
         if state.active_channel != channel_name:
-          if state.active_channel is not None:
-            click.echo()
+          state.close_channel()
           click.echo(click.style(f"[{channel_name}] ", fg="blue"), nl=False)
           state.active_channel = channel_name
-        click.echo(click.style(channel_content, fg="yellow"), nl=False)
+        click.echo(click.style(channel_content, fg="blue"), nl=False)
     if state.active_channel is not None:
-      click.echo()
+      state.close_channel()
     else:
       click.echo()
   except KeyboardInterrupt:
     conversation.cancel_process()
     for _ in stream:
       pass
+    state.close_channel()
     click.echo(click.style("\n[Generation cancelled]", dim=True))
 
 
@@ -178,11 +181,14 @@ def run_interactive(
     backend: str | None = None,
     preset: str | None = None,
     prompt: str | None = None,
-    enable_speculative_decoding: bool | None = None,
+    speculative_decoding: str | None = None,
     no_template: bool = False,
+    chat_template: str | None = None,
     max_num_tokens: int | None = None,
     max_num_images: int | None = None,
-    filter_channel_content_from_kv_cache: bool = False,
+    filter_channel_content_from_kv_cache: bool | None = None,
+    thinking: bool | None = None,
+    thinking_budget: int | None = None,
     vision_backend: str | None = None,
     audio_backend: str | None = None,
     attachments: tuple[str, ...] = (),
@@ -193,6 +199,9 @@ def run_interactive(
     cache: str | None = None,
     cpu_thread_count: int | None = None,
     activation_data_type: litert_lm.ActivationDataType | None = None,
+    ringbuffers_local_attention: bool | None = None,
+    gpu_decode_steps_per_sync: int | None = None,
+    enable_ynnpack: bool | None = None,
 ) -> None:
   """Runs the model interactively or with a single prompt."""
   if not model_obj.exists():
@@ -208,14 +217,52 @@ def run_interactive(
   state = SessionState()
 
   try:
+    speculative_decoding = common.normalize_speculative_decoding(
+        model.resolve_config_option(
+            speculative_decoding, model_obj, "speculative_decoding"
+        )
+    )
+    speculative_decoding_config = model.speculative_decoding_config_from_mode(
+        speculative_decoding
+    )
+    max_num_tokens = model.resolve_config_option(
+        max_num_tokens, model_obj, "max_num_tokens"
+    )
+    cache = model.resolve_config_option(cache, model_obj, "cache")
+    top_k = model.resolve_config_option(top_k, model_obj, "top_k")
+    top_p = model.resolve_config_option(top_p, model_obj, "top_p")
+    temperature = model.resolve_config_option(
+        temperature, model_obj, "temperature"
+    )
+    seed = model.resolve_config_option(seed, model_obj, "seed")
+    thinking = model.resolve_config_option(thinking, model_obj, "thinking")
+    thinking_budget = model.resolve_config_option(
+        thinking_budget, model_obj, "thinking_budget"
+    )
+    activation_data_type_opt = model.resolve_config_option(
+        activation_data_type, model_obj, "activation_data_type"
+    )
+    if isinstance(activation_data_type_opt, str):
+      activation_data_type_val = litert_lm.ActivationDataType.from_str(
+          activation_data_type_opt
+      )
+    else:
+      activation_data_type_val = activation_data_type_opt
+    enable_ynnpack = model.resolve_config_option(
+        enable_ynnpack, model_obj, "enable_ynnpack"
+    )
+
     backend_val = model.parse_backend(
-        backend, model_obj=model_obj, cpu_thread_count=cpu_thread_count
+        backend,
+        model_obj=model_obj,
+        cpu_thread_count=cpu_thread_count,
+        gpu_decode_steps_per_sync=gpu_decode_steps_per_sync,
     )
     vision_backend_val = model.parse_backend(
         vision_backend,
         model_obj=model_obj,
         target_model_types={
-            litertlm_builder.TfLiteModelType.VISION_ENCODER.value,
+            llm_metadata_pb2.LlmMetadata.TF_LITE_VISION_ENCODER,
         },
         label="vision",
     )
@@ -223,7 +270,7 @@ def run_interactive(
         audio_backend,
         model_obj=model_obj,
         target_model_types={
-            litertlm_builder.TfLiteModelType.AUDIO_ENCODER_HW.value,
+            llm_metadata_pb2.LlmMetadata.TF_LITE_AUDIO_ENCODER_HW,
         },
         label="audio",
     )
@@ -256,16 +303,21 @@ def run_interactive(
           cache_dir=cache_dir_val,
       )
     else:
+      ringbuffers_local_attention = model.resolve_ringbuffers_local_attention(
+          ringbuffers_local_attention, model_obj
+      )
       engine_cm = litert_lm.Engine(
           model_obj.model_path,
-          backend=backend_val,
-          enable_speculative_decoding=enable_speculative_decoding,
+          backend=backend_val,  # pyrefly: ignore[bad-argument-type]
+          speculative_decoding_config=speculative_decoding_config,
           max_num_tokens=max_num_tokens,
           max_num_images=max_num_images,
           vision_backend=vision_backend_val,
           audio_backend=audio_backend_val,
           cache_dir=cache_dir_val,
-          activation_data_type=activation_data_type,
+          activation_data_type=activation_data_type_val,
+          use_ringbuffers_local_attention=ringbuffers_local_attention,
+          enable_ynnpack=enable_ynnpack,
       )
 
     with engine_cm as engine:
@@ -284,13 +336,28 @@ def run_interactive(
 
         handler = LoggingToolEventHandler(state) if tools else None
 
+        if thinking is None and thinking_budget is None:
+          thinking_config = None
+        else:
+          if thinking is None:
+            thinking = thinking_budget != 0
+          if thinking_budget is None:
+            thinking_budget = -1 if thinking else 0
+
+          thinking_config = litert_lm.ThinkingConfig(
+              enable_thinking=thinking,
+              thinking_token_budget=thinking_budget,
+          )
+
         runner_cm = engine.create_conversation(
             tools=tools,
             messages=messages,
             tool_event_handler=handler,
             extra_context=extra_context,
             filter_channel_content_from_kv_cache=filter_channel_content_from_kv_cache,
+            thinking_config=thinking_config,
             sampler_config=sampler_config,
+            chat_template=chat_template,
         )
 
       with runner_cm as runner:
@@ -362,7 +429,7 @@ def run_interactive(
 
 @click.command(
     cls=help_formatter.ColorCommand,
-    help="""Runs a LiteRT-LM model interactively or with a single prompt.
+    help="""Runs a model interactively or with a single prompt.
   \b
   Examples:
     # Run interactively using a model ID from 'litert-lm list'
@@ -388,6 +455,15 @@ def run_interactive(
     ),
 )
 @click.option(
+    "--chat-template",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help=(
+        "Path to a Jinja file to use as the chat template. If not set, use"
+        " the default provided by the model or the engine."
+    ),
+)
+@click.option(
     "--no-template",
     is_flag=True,
     default=False,
@@ -408,9 +484,35 @@ def run_interactive(
 )
 @click.option(
     "--filter-channel-content-from-kv-cache",
-    is_flag=True,
-    default=False,
+    is_flag=False,
+    flag_value="true",
+    type=click.Choice(["true", "false"], case_sensitive=False),
+    default=None,
+    callback=common.parse_bool_opt,
     help="Whether to filter channel content from the KV cache.",
+)
+@click.option(
+    "--thinking",
+    is_flag=False,
+    flag_value="true",
+    type=click.Choice(["true", "false"], case_sensitive=False),
+    default=None,
+    callback=common.parse_bool_opt,
+    help=(
+        "Whether to enable thinking/reasoning generation. If set to true"
+        " without specifying --thinking-budget, the budget defaults to -1"
+        " (unlimited)."
+    ),
+)
+@click.option(
+    "--thinking-budget",
+    type=int,
+    default=None,
+    help=(
+        "Budget for reasoning tokens. 0 disables thinking. -1 enables unlimited"
+        " thinking. If set without specifying --thinking, thinking is"
+        " automatically enabled if budget != 0."
+    ),
 )
 @click.option(
     "--vision-backend",
@@ -482,13 +584,16 @@ def run(
     preset: str | None = None,
     backend: str | None = None,
     android: bool = False,
-    enable_speculative_decoding: bool | None = None,
+    speculative_decoding: str | None = None,
     verbose: bool = False,
     no_template: bool = False,
+    chat_template: str | None = None,
     from_huggingface_repo: str | None = None,
     huggingface_token: str | None = None,
     max_num_tokens: int | None = None,
-    filter_channel_content_from_kv_cache: bool = False,
+    filter_channel_content_from_kv_cache: bool | None = None,
+    thinking: bool | None = None,
+    thinking_budget: int | None = None,
     vision_backend: str | None = None,
     audio_backend: str | None = None,
     attachment: tuple[str, ...] = (),
@@ -499,6 +604,9 @@ def run(
     cache: str | None = None,
     cpu_thread_count: int | None = None,
     activation_data_type: str | None = None,
+    ringbuffers_local_attention: bool | None = None,
+    gpu_decode_steps_per_sync: int | None = None,
+    enable_ynnpack: bool | None = None,
 ) -> None:
   r"""Runs a LiteRT-LM model interactively or with a single prompt.
 
@@ -511,16 +619,21 @@ def run(
       instructions.
     backend: The backend to use (cpu or gpu).
     android: Run on Android via ADB.
-    enable_speculative_decoding: Speculative decoding mode (True, False, or None
-      for auto).
+    speculative_decoding: Speculative decoding mode ("on", "off", "adaptive", or
+      None for the model's configured value).
     verbose: Whether to enable verbose logging.
     no_template: Interact with the model directly without applying prompt
       templates or stripping stop tokens.
+    chat_template: Path to a Jinja file to use as the chat template. If not set,
+      use the default provided by the model or the engine.
     from_huggingface_repo: The HuggingFace repository ID.
     huggingface_token: The HuggingFace API token.
     max_num_tokens: Maximum number of tokens for the KV cache.
     filter_channel_content_from_kv_cache: Whether to filter channel content from
       the KV cache.
+    thinking: Whether to enable thinking/reasoning generation.
+    thinking_budget: Budget for reasoning tokens (0 disables thinking, -1
+      enables unlimited thinking).
     vision_backend: The backend to use for vision tasks.
     audio_backend: The backend to use for audio tasks.
     attachment: Path to an attachment (e.g., image or audio).
@@ -531,6 +644,12 @@ def run(
     cache: The cache mode to use (no, memory, or disk).
     cpu_thread_count: The number of threads to use for CPU backend.
     activation_data_type: The activation data type to use for inference.
+    ringbuffers_local_attention: Whether to use ringbuffers for local attention
+      KV cache to minimize memory usage.
+    gpu_decode_steps_per_sync: The number of decode steps per sync for GPU
+      backend. Only applied to supported GPU models. Otherwise, ignored.
+    enable_ynnpack: Whether to delegate supported CPU operations to YNNPACK
+      before XNNPACK.
   """
   if attachment and no_template:
     click.echo(
@@ -540,6 +659,20 @@ def run(
         )
     )
     return
+
+  if chat_template and no_template:
+    click.echo(
+        click.style(
+            "Error: --chat-template is not supported with --no-template.",
+            fg="red",
+        )
+    )
+    return
+
+  chat_template_content = None
+  if chat_template:
+    with open(chat_template, "r", encoding="utf-8") as f:
+      chat_template_content = f.read()
 
   expanded_attachments = []
   num_images = 0
@@ -589,28 +722,6 @@ def run(
     model_obj = model.Model.from_model_path(model_path)
   else:
     model_obj = model.Model.from_model_reference(model_reference)
-    if not model_obj.exists():
-      # Only auto-convert if it looks like a HuggingFace repo ID (account/repo)
-      # and is not a local path.
-      parts = model_reference.split("/")
-      if len(parts) == 2 and all(parts) and not os.path.exists(model_reference):
-        click.echo(
-            click.style(
-                f"Model '{model_reference}' not found. Attempting to convert"
-                f" from https://huggingface.co/{model_reference} ...",
-                fg="yellow",
-            )
-        )
-        model_obj = model.Model.from_model_reference(model_reference)
-
-      if not model_obj.exists():
-        click.echo(
-            click.style(
-                f"Failed to find or convert model '{model_reference}'.",
-                fg="red",
-            )
-        )
-        return
 
   max_num_images = None if num_images == 0 else num_images
 
@@ -620,11 +731,14 @@ def run(
       is_android=android,
       backend=backend,
       preset=preset,
-      enable_speculative_decoding=enable_speculative_decoding,
+      speculative_decoding=speculative_decoding,
       no_template=no_template,
+      chat_template=chat_template_content,
       max_num_tokens=max_num_tokens,
       max_num_images=max_num_images,
       filter_channel_content_from_kv_cache=filter_channel_content_from_kv_cache,
+      thinking=thinking,
+      thinking_budget=thinking_budget,
       vision_backend=vision_backend,
       audio_backend=audio_backend,
       attachments=tuple(expanded_attachments),
@@ -639,6 +753,9 @@ def run(
           if activation_data_type
           else None
       ),
+      ringbuffers_local_attention=ringbuffers_local_attention,
+      gpu_decode_steps_per_sync=gpu_decode_steps_per_sync,
+      enable_ynnpack=enable_ynnpack,
   )
 
 

@@ -3,3 +3,6 @@
 /libs
 /ThirdParty
 *.dll
+/js/packages/core/wasm/
+/js/packages/core/spec_dist/
+node_modules/

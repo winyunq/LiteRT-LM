@@ -32,22 +32,27 @@
 #include "absl/synchronization/mutex.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "litert/cc/litert_environment.h"  // from @litert
-#include "support/tokenizer/tokenizer.h"  // from @litert
-#include "runtime/components/logits_processor/constrained_decoding/constraint.h"
-#include "runtime/components/logits_processor/repetition_penalty_config.h"
+#include "litert/cc/litert_tensor_buffer.h"  // from @litert
+#include "runtime/components/constrained_decoding/constraint.h"
+#include "runtime/components/constrained_decoding/no_repeat_ngram_config.h"
+#include "runtime/components/constrained_decoding/repetition_penalty_config.h"
+#include "runtime/components/constrained_decoding/suppress_tokens_config.h"
 #include "runtime/components/model_resources.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/engine/io_types.h"
-#include "runtime/executor/audio_executor.h"
-#include "runtime/executor/audio_executor_settings.h"
+#include "runtime/executor/audio/audio_executor.h"
+#include "runtime/executor/audio/audio_executor_settings.h"
 #include "runtime/executor/llm_executor.h"
 #include "runtime/executor/llm_executor_io_types.h"
-#include "runtime/executor/vision_executor_settings.h"
+#include "runtime/executor/vision/vision_executor.h"
+#include "runtime/executor/vision/vision_executor_settings.h"
 #include "runtime/framework/resource_management/execution_manager.h"
 #include "runtime/framework/resource_management/resource_manager.h"
 #include "runtime/framework/threadpool.h"
 
 namespace litert::lm {
+
+class RuntimeDebugger;
 
 // The execution manager is responsible for managing the execution of the tasks.
 // It will handle the scheduling of the tasks and the dependencies between them.
@@ -67,6 +72,8 @@ class ThreadedExecutionManager : public ExecutionManager {
   //   the audio executor. This can be null if no audio modality is used.
   // - litert_env: The LIRTER environment used for creating the LLM context.
   //   This can be null if no LLM context is needed.
+  // - vision_executor: An optional pre-built vision executor. If null, the
+  //   vision executor is lazily created from vision_executor_settings.
   static absl::StatusOr<std::unique_ptr<ThreadedExecutionManager>> Create(
       Tokenizer* absl_nonnull tokenizer,
       ModelResources* absl_nullable model_resources,
@@ -76,7 +83,9 @@ class ThreadedExecutionManager : public ExecutionManager {
       std::unique_ptr<AudioExecutorSettings> absl_nullable
       audio_executor_settings,
       ::litert::Environment* absl_nullable litert_env,
-      std::unique_ptr<AudioExecutor> absl_nullable audio_executor = nullptr);
+      std::unique_ptr<AudioExecutor> absl_nullable audio_executor = nullptr,
+      std::shared_ptr<RuntimeDebugger> absl_nullable runtime_debugger = nullptr,
+      std::unique_ptr<VisionExecutor> absl_nullable vision_executor = nullptr);
 
   ~ThreadedExecutionManager() override;
 
@@ -111,6 +120,9 @@ class ThreadedExecutionManager : public ExecutionManager {
   // Releases the session with the given session ID.
   absl::Status ReleaseSession(SessionId session_id) override
       ABSL_LOCKS_EXCLUDED(session_and_task_lookup_mutex_);
+
+  absl::Status UpdateGpuEnableMetalResidencySet(
+      bool enable_metal_residency_set) override;
 
   // Cancels all tasks in the session with the given session ID.
   absl::Status CancelAllTasksInSession(SessionId session_id) override
@@ -158,6 +170,10 @@ class ThreadedExecutionManager : public ExecutionManager {
   // - task_id: The task ID of the task.
   // - dep_tasks: The dependent tasks that should be done before the decode
   //   task starts.
+  // - repetition_penalty_config: The repetition penalty config for the decode
+  //   task.
+  // - no_repeat_ngram_config: The no repeat ngram config for the decode task.
+  // - suppress_tokens_config: The suppress tokens config for the decode task.
   // - constraint: The constraint for the decode task.
   // - cancelled: The cancelled flag for the decode task.
   // - callback: The callback function.
@@ -167,10 +183,15 @@ class ThreadedExecutionManager : public ExecutionManager {
       SessionId session_id, TaskId task_id,
       absl::flat_hash_set<TaskId> dep_tasks,
       RepetitionPenaltyConfig repetition_penalty_config,
+      NoRepeatNgramConfig no_repeat_ngram_config,
+      SuppressTokensConfig suppress_tokens_config,
       Constraint* absl_nullable constraint,
       std::shared_ptr<std::atomic<bool>> absl_nonnull cancelled,
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback,
-      int max_output_tokens) override
+      int max_output_tokens,
+      std::optional<int> thinking_token_budget = std::nullopt,
+      std::vector<int> thinking_start_token_ids = {},
+      std::vector<int> thinking_end_token_ids = {}) override
       ABSL_LOCKS_EXCLUDED(session_and_task_lookup_mutex_);
 
   // Adds a clone session task to the execution manager.
@@ -224,9 +245,32 @@ class ThreadedExecutionManager : public ExecutionManager {
   absl::Status SetCurrentStep(const SessionInfo& session_info,
                               int target_step) override;
 
+  // Saves the processed context of the session.
+  absl::StatusOr<std::unique_ptr<ProcessedContext>> SaveContext(
+      const SessionInfo& session_info) override;
+
+  // Restores the processed context of the session.
+  absl::Status RestoreContext(
+      const SessionInfo& session_info,
+      std::unique_ptr<ProcessedContext> processed_context) override;
+
   // Returns the audio executor properties.
   absl::StatusOr<AudioExecutorProperties> GetAudioExecutorProperties()
       const override;
+
+  // Synchronously encodes an audio spectrogram tensor into audio soft tokens
+  // within the context of the given session.
+  absl::StatusOr<ExecutorAudioData> EncodeAudio(
+      const SessionInfo& session_info,
+      const TensorBuffer& spectrogram_tensor) override;
+
+  // Resets the audio executor for the given session.
+  absl::Status ResetAudio(const SessionInfo& session_info) override;
+
+  // Flushes remaining buffered audio frames from the audio executor for the
+  // given session.
+  absl::StatusOr<ExecutorAudioData> FlushAudio(
+      const SessionInfo& session_info) override;
 
   // Returns the vision executor properties.
   absl::StatusOr<VisionExecutorProperties> GetVisionExecutorProperties()
@@ -236,7 +280,9 @@ class ThreadedExecutionManager : public ExecutionManager {
   ThreadedExecutionManager(
       Tokenizer* absl_nonnull tokenizer,
       std::unique_ptr<ResourceManager> absl_nonnull resource_manager,
-      ::litert::Environment* absl_nullable litert_env = nullptr);
+      ::litert::Environment* absl_nullable litert_env = nullptr,
+      std::shared_ptr<RuntimeDebugger> absl_nullable runtime_debugger =
+          nullptr);
 
   // Creates a task with the given task ID, task, dependent tasks, and callback.
   // - session_id: The ID of the session that created the task.
@@ -355,6 +401,8 @@ class ThreadedExecutionManager : public ExecutionManager {
   std::unique_ptr<ResourceManager> absl_nonnull resource_manager_;
   // LiteRT environment used for creating the sampler.
   ::litert::Environment* absl_nullable litert_env_;
+  // Process-wide debugger telemetry handle (borrowed/unowned).
+  std::shared_ptr<RuntimeDebugger> absl_nullable runtime_debugger_ = nullptr;
   // Thread pool used for executing the tasks.
   std::unique_ptr<ThreadPool> absl_nonnull execution_thread_pool_;
   // Thread pool used for executing the callbacks.

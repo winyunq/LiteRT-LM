@@ -23,15 +23,22 @@
 
 #include "runtime/engine/litert_lm_lib.h"
 
+#include "runtime/util/memory_profiling/accelerator_memory_monitor.h"
+
 #if defined(_WIN32)
 #include <io.h>
 #else
 #include <unistd.h>
 #endif
 
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>  // NOLINT
+#include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <sstream>
@@ -40,22 +47,26 @@
 #include <variant>
 #include <vector>
 
+#include "absl/container/btree_map.h"  // from @com_google_absl
+#include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/functional/any_invocable.h"  // from @com_google_absl
 #include "absl/log/absl_log.h"  // from @com_google_absl
 #include "absl/log/log_sink_registry.h"  // from @com_google_absl
 #include "absl/status/status.h"  // from @com_google_absl
+#include "absl/status/status_macros.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/strings/escaping.h"  // from @com_google_absl
 #include "absl/strings/match.h"  // from @com_google_absl
 #include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/strings/str_format.h"  // from @com_google_absl
+#include "absl/strings/str_join.h"  // from @com_google_absl
 #include "absl/strings/string_view.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "litert/cc/internal/scoped_file.h"  // from @litert
-#include "runtime/components/logits_processor/constrained_decoding/constraint.h"
-#include "runtime/components/logits_processor/constrained_decoding/constraint_provider_factory.h"
-#include "runtime/components/logits_processor/constrained_decoding/llg_constraint_config.h"
+#include "runtime/components/constrained_decoding/constraint.h"
+#include "runtime/components/constrained_decoding/constraint_provider_factory.h"
+#include "runtime/components/constrained_decoding/llg_constraint_config.h"
 #include "runtime/conversation/conversation.h"
 #include "runtime/conversation/io_types.h"
 #include "runtime/conversation/model_data_processor/gemma4_data_processor_config.h"
@@ -65,6 +76,8 @@
 #include "runtime/engine/io_types.h"
 #include "runtime/executor/executor_settings_base.h"
 #include "runtime/executor/llm_executor_settings.h"
+#include "runtime/executor/mtp_gating_policy.h"
+#include "runtime/executor/speculative_decoding_mode.h"
 #include "runtime/proto/sampler_params.pb.h"
 #include "runtime/util/scoped_file.h"
 #include "runtime/util/status_macros.h"  // NOLINT
@@ -114,11 +127,12 @@ absl::StatusOr<ModelAssets> CreateModelAssets(
   if (settings.model_path.empty()) {
     return absl::InvalidArgumentError("Model path is empty.");
   }
-  ABSL_LOG(INFO) << "Model path: " << settings.model_path;
+  ABSL_VLOG(1) << "Model path: " << settings.model_path;
   if (!settings.load_model_from_descriptor) {
     return ModelAssets::Create(settings.model_path);
   }
-  ASSIGN_OR_RETURN(auto scoped_file, ScopedFile::Open(settings.model_path));
+  ABSL_ASSIGN_OR_RETURN(auto scoped_file,
+                        ScopedFile::Open(settings.model_path));
   return ModelAssets::Create(
       std::make_shared<ScopedFile>(std::move(scoped_file)));
 }
@@ -140,6 +154,30 @@ std::optional<Backend> GetSamplerBackend(const LiteRtLmSettings& settings) {
   return *sampler_backend;
 }
 
+// Returns the adaptive speculative decoding policy configuration with the
+// `mtp_gating_*` overrides of `settings` applied to the defaults, or
+// std::nullopt if no override is set.
+std::optional<MtpGatingConfig> GetMtpGatingConfig(
+    const LiteRtLmSettings& settings) {
+  MtpGatingConfig config;
+  bool overridden = false;
+  auto apply = [&overridden](const auto& flag, auto& field) {
+    if (flag.has_value()) {
+      field = *flag;
+      overridden = true;
+    }
+  };
+  apply(settings.mtp_gating_half_life, config.ema_half_life_steps);
+  apply(settings.mtp_gating_deadband, config.deadband);
+  apply(settings.mtp_gating_margin, config.profit_margin);
+  apply(settings.mtp_gating_probe_interval, config.probe_interval);
+  apply(settings.mtp_gating_probe_length, config.probe_length);
+  apply(settings.mtp_gating_forced_switch_period, config.forced_switch_period);
+  if (!overridden) {
+    return std::nullopt;
+  }
+  return config;
+}
 
 absl::AnyInvocable<void(absl::StatusOr<Message>)> CreatePrintMessageCallback(
     std::stringstream& captured_output) {
@@ -188,7 +226,7 @@ absl::StatusOr<std::unique_ptr<Constraint>> CreateRegexConstraint(
     const Tokenizer& tokenizer,
     const std::vector<std::vector<int>>& stop_token_ids,
     std::string constraint_regex) {
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       auto constraint_provider,
       CreateConstraintProvider(LlGuidanceConfig(), tokenizer, stop_token_ids));
   return constraint_provider->CreateConstraint(
@@ -201,6 +239,16 @@ absl::StatusOr<Message> RunSingleTurnConversation(
     litert::lm::Engine* engine, Conversation* conversation) {
   std::stringstream captured_output;
   OptionalArgs optional_args;
+  if (settings.repetition_penalty_config.enabled()) {
+    optional_args.repetition_penalty_config =
+        settings.repetition_penalty_config;
+  }
+  if (settings.no_repeat_ngram_config.enabled()) {
+    optional_args.no_repeat_ngram_config = settings.no_repeat_ngram_config;
+  }
+  if (settings.suppress_tokens_config.enabled()) {
+    optional_args.suppress_tokens_config = settings.suppress_tokens_config;
+  }
   if (settings.max_output_tokens > 0) {
     optional_args.max_output_tokens = settings.max_output_tokens;
   }
@@ -218,23 +266,23 @@ absl::StatusOr<Message> RunSingleTurnConversation(
     auto print_message_callback =
         should_print_output ? CreatePrintMessageCallback(captured_output)
                             : [](absl::StatusOr<Message> message) {};
-    RETURN_IF_ERROR(conversation->SendMessageAsync(
+    ABSL_RETURN_IF_ERROR(conversation->SendMessageAsync(
         json::object({{"role", "user"}, {"content", content_list}}),
         std::move(print_message_callback), std::move(optional_args)));
-    RETURN_IF_ERROR(engine->WaitUntilDone(kWaitUntilDoneTimeout));
-    RETURN_IF_ERROR(CheckExpectedOutput(captured_output.str(), settings));
+    ABSL_RETURN_IF_ERROR(engine->WaitUntilDone(kWaitUntilDoneTimeout));
+    ABSL_RETURN_IF_ERROR(CheckExpectedOutput(captured_output.str(), settings));
     return conversation->GetHistory().back();
   } else {
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         auto model_message,
         conversation->SendMessage(
             json::object({{"role", "user"}, {"content", content_list}}),
             std::move(optional_args)));
     if (should_print_output) {
-      RETURN_IF_ERROR(PrintMessage(model_message, captured_output, nullptr,
-                                   /*streaming=*/false));
+      ABSL_RETURN_IF_ERROR(PrintMessage(model_message, captured_output, nullptr,
+                                        /*streaming=*/false));
     }
-    RETURN_IF_ERROR(CheckExpectedOutput(captured_output.str(), settings));
+    ABSL_RETURN_IF_ERROR(CheckExpectedOutput(captured_output.str(), settings));
     return model_message;
   }
 }
@@ -264,6 +312,16 @@ absl::Status RunMultiTurnConversation(const LiteRtLmSettings& settings,
       continue;
     }
     OptionalArgs optional_args;
+    if (settings.repetition_penalty_config.enabled()) {
+      optional_args.repetition_penalty_config =
+          settings.repetition_penalty_config;
+    }
+    if (settings.no_repeat_ngram_config.enabled()) {
+      optional_args.no_repeat_ngram_config = settings.no_repeat_ngram_config;
+    }
+    if (settings.suppress_tokens_config.enabled()) {
+      optional_args.suppress_tokens_config = settings.suppress_tokens_config;
+    }
     if (settings.max_output_tokens > 0) {
       optional_args.max_output_tokens = settings.max_output_tokens;
     }
@@ -276,22 +334,22 @@ absl::Status RunMultiTurnConversation(const LiteRtLmSettings& settings,
     }
 
     if (settings.async) {
-      RETURN_IF_ERROR(conversation->SendMessageAsync(
+      ABSL_RETURN_IF_ERROR(conversation->SendMessageAsync(
           json::object({{"role", "user"}, {"content", content_list}}),
           CreatePrintMessageCallback(captured_output),
           std::move(optional_args)));
-      RETURN_IF_ERROR(engine->WaitUntilDone(kWaitUntilDoneTimeout));
+      ABSL_RETURN_IF_ERROR(engine->WaitUntilDone(kWaitUntilDoneTimeout));
     } else {
-      ASSIGN_OR_RETURN(
+      ABSL_ASSIGN_OR_RETURN(
           auto model_message,
           conversation->SendMessage(
               json::object({{"role", "user"}, {"content", content_list}}),
               std::move(optional_args)));
-      RETURN_IF_ERROR(PrintMessage(model_message, captured_output, nullptr,
-                                   /*streaming=*/false));
+      ABSL_RETURN_IF_ERROR(PrintMessage(model_message, captured_output, nullptr,
+                                        /*streaming=*/false));
     }
   } while (true);
-  RETURN_IF_ERROR(CheckExpectedOutput(captured_output.str(), settings));
+  ABSL_RETURN_IF_ERROR(CheckExpectedOutput(captured_output.str(), settings));
   return absl::OkStatus();
 }
 
@@ -304,15 +362,25 @@ absl::Status RunSingleTurnSession(const std::string& input_prompt,
         "Async mode is not supported for single turn session.");
   }
 
-  ABSL_LOG(INFO) << "Running single turn session with prompt: " << input_prompt;
+  ABSL_VLOG(1) << "Running single turn session with prompt: " << input_prompt;
   DecodeConfig decode_config = DecodeConfig::CreateDefault();
+  if (settings.repetition_penalty_config.enabled()) {
+    decode_config.SetRepetitionPenaltyConfig(
+        settings.repetition_penalty_config);
+  }
+  if (settings.no_repeat_ngram_config.enabled()) {
+    decode_config.SetNoRepeatNgramConfig(settings.no_repeat_ngram_config);
+  }
+  if (settings.suppress_tokens_config.enabled()) {
+    decode_config.SetSuppressTokensConfig(settings.suppress_tokens_config);
+  }
   if (settings.max_output_tokens > 0) {
     decode_config.SetMaxOutputTokens(settings.max_output_tokens);
   }
 
   std::unique_ptr<Constraint> constraint;
   if (!settings.constraint_regex.empty()) {
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         constraint,
         CreateRegexConstraint(engine->GetTokenizer(),
                               session->GetSessionConfig().GetStopTokenIds(),
@@ -322,13 +390,13 @@ absl::Status RunSingleTurnSession(const std::string& input_prompt,
 
   std::vector<InputData> inputs;
   inputs.emplace_back(InputText(input_prompt));
-  RETURN_IF_ERROR(session->RunPrefill(inputs));
-  ASSIGN_OR_RETURN(auto responses, session->RunDecode(decode_config));
+  ABSL_RETURN_IF_ERROR(session->RunPrefill(inputs));
+  ABSL_ASSIGN_OR_RETURN(auto responses, session->RunDecode(decode_config));
   for (const auto& response : responses.GetTexts()) {
     captured_output << response << std::endl << std::flush;
   }
-  ABSL_LOG(INFO) << "output: " << captured_output.str();
-  RETURN_IF_ERROR(CheckExpectedOutput(captured_output.str(), settings));
+  std::cout << "output: " << captured_output.str();
+  ABSL_RETURN_IF_ERROR(CheckExpectedOutput(captured_output.str(), settings));
   return absl::OkStatus();
 }
 
@@ -339,16 +407,16 @@ absl::StatusOr<std::vector<litert::lm::ScorerOutput>> RunScoreText(
     bool store_char_and_token_lengths = false) {
   std::vector<litert::lm::InputData> inputs;
   inputs.emplace_back(InputText(std::string(input_prompt)));
-  RETURN_IF_ERROR(session->RunPrefill(inputs));
-  ASSIGN_OR_RETURN(litert::lm::Responses response,
-                   session->RunTextScoring(target_text_vector,
-                                           store_char_and_token_lengths));
+  ABSL_RETURN_IF_ERROR(session->RunPrefill(inputs));
+  ABSL_ASSIGN_OR_RETURN(litert::lm::Responses response,
+                        session->RunTextScoring(target_text_vector,
+                                                store_char_and_token_lengths));
   const std::vector<float>& scores = response.GetScores();
   if (scores.empty()) {
     ABSL_LOG(WARNING) << "No score found.";
   } else {
     // Multiply by -1 to get the negative log likelihood.
-    ABSL_LOG(INFO) << "Score: " << -1 * (scores[0]) << std::endl;
+    ABSL_VLOG(1) << "Score: " << -1 * (scores[0]) << std::endl;
   }
   if (scores.size() != target_text_vector.size()) {
     return absl::InternalError(absl::StrCat("Scores size ", scores.size(),
@@ -384,37 +452,88 @@ absl::StatusOr<std::vector<litert::lm::ScorerOutput>> RunScoreText(
 void LogBenchmarkInfo(const litert::lm::BenchmarkInfo& benchmark_info,
                       const LiteRtLmSettings& settings) {
   if (!settings.log_sink_file.has_value()) {
-    ABSL_LOG(INFO) << benchmark_info;
+    std::stringstream ss;
+    ss << benchmark_info;
+    std::string line;
+    bool is_first_line = true;
+    while (std::getline(ss, line)) {
+      if (is_first_line) {
+        ABSL_LOG(INFO) << line;
+        is_first_line = false;
+      } else {
+        ABSL_LOG(INFO).NoPrefix() << line;
+      }
+    }
   } else {
-    std::string model_name_flag = "";
+    std::string extra_flags = "";
     if (settings.model_name.has_value() && !settings.model_name->empty()) {
-      model_name_flag = absl::StrFormat(",model_name=%s", *settings.model_name);
+      absl::StrAppend(&extra_flags, ",model_name=", *settings.model_name);
+    }
+    if (settings.vision_backend.has_value() &&
+        !settings.vision_backend->empty()) {
+      absl::StrAppend(&extra_flags,
+                      ",vision_backend=", *settings.vision_backend);
+    }
+    if (settings.audio_backend.has_value() &&
+        !settings.audio_backend->empty()) {
+      absl::StrAppend(&extra_flags, ",audio_backend=", *settings.audio_backend);
     }
     ABSL_LOG(INFO) << absl::StrFormat(
         "Benchmark flags: "
         "benchmark_prefill_tokens=%d,benchmark_decode_tokens=%d,backend=%s%s",
         benchmark_info.GetBenchmarkParams().num_prefill_tokens(),
         benchmark_info.GetBenchmarkParams().num_decode_tokens(),
-        settings.backend, model_name_flag);
+        settings.backend, extra_flags);
     for (const auto& phase : benchmark_info.GetInitPhases()) {
       ABSL_LOG(INFO) << absl::StrFormat(
           "%s: %.2f ms", phase.first, absl::ToDoubleMilliseconds(phase.second));
+    }
+    for (const auto& mark : benchmark_info.GetMarkDurations()) {
+      ABSL_LOG(INFO) << absl::StrFormat(
+          "%s: %.2f ms", mark.first, absl::ToDoubleMilliseconds(mark.second));
     }
     ABSL_LOG(INFO) << absl::StrFormat("Time to first token: %.2f s",
                                       benchmark_info.GetTimeToFirstToken());
     for (int i = 0; i < benchmark_info.GetTotalPrefillTurns(); ++i) {
       ABSL_LOG(INFO) << absl::StrFormat(
           "Prefill speed turn %d: %.2f tk/s", i,
-          benchmark_info.GetPrefillTokensPerSec(0));
+          benchmark_info.GetPrefillTokensPerSec(i));
       ABSL_LOG(INFO) << absl::StrFormat(
           "Decode speed turn %d: %.2f tk/s", i,
-          benchmark_info.GetDecodeTokensPerSec(0));
+          benchmark_info.GetDecodeTokensPerSec(i));
     }
   }
 }
 
+// Logs the peak accelerator memory usage: the headline total, the per-category
+// breakdown and the largest individual allocations.
+void LogAcceleratorMemoryUsage(const LiteRtLmSettings& settings,
+                               const AcceleratorMemoryUsage& peak_accelerator) {
+  const float peak_accelerator_mb =
+      AcceleratorMemoryBytesToMb(peak_accelerator.total_bytes);
+  if (!settings.log_sink_file.has_value()) {
+    ABSL_LOG(INFO) << "Peak accelerator memory usage: " << peak_accelerator_mb
+                   << "MB.";
+  } else {
+    ABSL_LOG(INFO) << absl::StrFormat("Peak accelerator memory usage: %.2f MB",
+                                      peak_accelerator_mb);
+  }
+  // The lines below are diagnostic only. They deliberately avoid the
+  // "<name>: <value> <unit>" shape so that they are not picked up as metrics
+  // by the log parsers.
+  if (!peak_accelerator.breakdown.empty()) {
+    ABSL_LOG(INFO) << "Peak accelerator memory usage breakdown: "
+                   << FormatAcceleratorMemoryBreakdown(peak_accelerator);
+  }
+  for (const std::string& line :
+       FormatAcceleratorMemoryAllocations(peak_accelerator)) {
+    ABSL_LOG(INFO) << line;
+  }
+}
+
 void LogMemoryUsage(const LiteRtLmSettings& settings, float peak_mem_mb,
-                    float peak_private_mb) {
+                    float peak_private_mb,
+                    const AcceleratorMemoryUsage* peak_accelerator = nullptr) {
   if (!settings.log_sink_file.has_value()) {
     ABSL_LOG(INFO) << "Peak system ram usage: " << peak_mem_mb << "MB.";
     ABSL_LOG(INFO) << "Memory usage: "
@@ -422,7 +541,7 @@ void LogMemoryUsage(const LiteRtLmSettings& settings, float peak_mem_mb,
     ABSL_LOG(INFO) << "Peak private footprint: " << peak_private_mb << "MB.";
   } else {
     ABSL_LOG(INFO) << absl::StrFormat("Peak system ram usage: %.2f MB",
-                                      peak_private_mb);
+                                      peak_mem_mb);
     ABSL_LOG(INFO) << absl::StrFormat("Peak private footprint: %.2f MB",
                                       peak_private_mb);
     auto memory_usage = tflite::profiling::memory::GetMemoryUsage();
@@ -440,36 +559,212 @@ void LogMemoryUsage(const LiteRtLmSettings& settings, float peak_mem_mb,
           memory_usage.private_footprint_bytes / 1000.0 / 1000.0);
     }
   }
+  if (peak_accelerator != nullptr) {
+    LogAcceleratorMemoryUsage(settings, *peak_accelerator);
+  }
+}
+
+// Returns the median of `values`, or zero if there is nothing to aggregate. For
+// an even number of values, the average of the two middle values is returned.
+double Median(std::vector<double> values) {
+  if (values.empty()) {
+    return 0.0;
+  }
+  std::sort(values.begin(), values.end());
+  const size_t middle = values.size() / 2;
+  if (values.size() % 2 == 1) {
+    return values[middle];
+  }
+  return (values[middle - 1] + values[middle]) / 2.0;
+}
+
+// Same as above, for durations.
+absl::Duration MedianDuration(std::vector<absl::Duration> values) {
+  if (values.empty()) {
+    return absl::ZeroDuration();
+  }
+  std::sort(values.begin(), values.end());
+  const size_t middle = values.size() / 2;
+  if (values.size() % 2 == 1) {
+    return values[middle];
+  }
+  return (values[middle - 1] + values[middle]) / 2;
+}
+
+// Formats the aggregated accelerator memory breakdown as
+// "name=1.00 MB, other=2.00 MB", matching the per-iteration format produced by
+// FormatAcceleratorMemoryBreakdown().
+std::string FormatAggregatedAcceleratorMemoryBreakdown(
+    const absl::btree_map<std::string, float>& breakdown_mb) {
+  return absl::StrJoin(
+      breakdown_mb, ", ", [](std::string* out, const auto& entry) {
+        absl::StrAppendFormat(out, "%s=%.2f MB", entry.first, entry.second);
+      });
+}
+
+// Logs the aggregated (median) metrics of a multi-iteration benchmark run.
+//
+// The metric labels are deliberately identical to the ones used by
+// LogBenchmarkInfo() and LogMemoryUsage() so that the log parsers, which keep
+// the last occurrence of each metric, report the median of all the iterations
+// rather than the values of the last one.
+void LogAggregatedMetrics(const AggregatedLitertLmMetrics& aggregated,
+                          const LiteRtLmSettings& settings) {
+  if (!settings.log_sink_file.has_value()) {
+    std::stringstream ss;
+    ss << std::fixed << std::setprecision(2);
+    ss << "Aggregated BenchmarkInfo (median of " << aggregated.num_iterations
+       << " iterations):" << std::endl;
+    if (!aggregated.init_phases.empty()) {
+      ss << "  Init Phases (" << aggregated.init_phases.size()
+         << "):" << std::endl;
+      for (const auto& [phase_name, duration] : aggregated.init_phases) {
+        ss << "    - " << phase_name << ": "
+           << absl::ToDoubleMilliseconds(duration) << " ms" << std::endl;
+      }
+      ss << "--------------------------------------------------" << std::endl;
+    }
+    if (aggregated.time_to_first_token_sec.has_value()) {
+      ss << "  Time to first token: " << *aggregated.time_to_first_token_sec
+         << " s" << std::endl;
+      ss << "--------------------------------------------------" << std::endl;
+    }
+    for (size_t i = 0; i < aggregated.prefill_tokens_per_sec.size(); ++i) {
+      ss << "    Prefill Turn " << i + 1 << ":" << std::endl;
+      ss << "      Prefill Speed: " << aggregated.prefill_tokens_per_sec[i]
+         << " tokens/sec." << std::endl;
+    }
+    for (size_t i = 0; i < aggregated.decode_tokens_per_sec.size(); ++i) {
+      ss << "    Decode Turn " << i + 1 << ":" << std::endl;
+      ss << "      Decode Speed: " << aggregated.decode_tokens_per_sec[i]
+         << " tokens/sec." << std::endl;
+    }
+    if (!aggregated.mark_durations.empty()) {
+      ss << "--------------------------------------------------" << std::endl;
+      ss << "  Mark Durations (" << aggregated.mark_durations.size()
+         << "):" << std::endl;
+      for (const auto& [mark_name, duration] : aggregated.mark_durations) {
+        ss << "    - " << mark_name << ": " << duration << std::endl;
+      }
+    }
+    ss << "--------------------------------------------------" << std::endl;
+    if (aggregated.peak_mem_mb.has_value()) {
+      ss << "  Peak system ram usage: " << *aggregated.peak_mem_mb << "MB."
+         << std::endl;
+    }
+    if (aggregated.peak_private_mb.has_value()) {
+      ss << "  Peak private footprint: " << *aggregated.peak_private_mb << "MB."
+         << std::endl;
+    }
+    if (aggregated.peak_accelerator_mb.has_value()) {
+      ss << "  Peak accelerator memory usage: "
+         << *aggregated.peak_accelerator_mb << " MB." << std::endl;
+      if (!aggregated.peak_accelerator_breakdown_mb.empty()) {
+        ss << "  Peak accelerator memory usage breakdown: "
+           << FormatAggregatedAcceleratorMemoryBreakdown(
+                  aggregated.peak_accelerator_breakdown_mb)
+           << std::endl;
+      }
+    }
+    std::string line;
+    bool is_first_line = true;
+    while (std::getline(ss, line)) {
+      if (is_first_line) {
+        ABSL_LOG(INFO) << line;
+        is_first_line = false;
+      } else {
+        ABSL_LOG(INFO).NoPrefix() << line;
+      }
+    }
+  } else {
+    ABSL_LOG(INFO) << absl::StrFormat("Aggregated metrics (median of %d runs)",
+                                      aggregated.num_iterations);
+    for (const auto& [phase_name, duration] : aggregated.init_phases) {
+      ABSL_LOG(INFO) << absl::StrFormat("%s: %.2f ms", phase_name,
+                                        absl::ToDoubleMilliseconds(duration));
+    }
+    for (const auto& [mark_name, duration] : aggregated.mark_durations) {
+      ABSL_LOG(INFO) << absl::StrFormat("%s: %.2f ms", mark_name,
+                                        absl::ToDoubleMilliseconds(duration));
+    }
+    if (aggregated.time_to_first_token_sec.has_value()) {
+      ABSL_LOG(INFO) << absl::StrFormat("Time to first token: %.2f s",
+                                        *aggregated.time_to_first_token_sec);
+    }
+    for (size_t i = 0; i < aggregated.prefill_tokens_per_sec.size(); ++i) {
+      ABSL_LOG(INFO) << absl::StrFormat("Prefill speed turn %zu: %.2f tk/s", i,
+                                        aggregated.prefill_tokens_per_sec[i]);
+    }
+    for (size_t i = 0; i < aggregated.decode_tokens_per_sec.size(); ++i) {
+      ABSL_LOG(INFO) << absl::StrFormat("Decode speed turn %zu: %.2f tk/s", i,
+                                        aggregated.decode_tokens_per_sec[i]);
+    }
+    if (aggregated.peak_mem_mb.has_value()) {
+      ABSL_LOG(INFO) << absl::StrFormat("Peak system ram usage: %.2f MB",
+                                        *aggregated.peak_mem_mb);
+    }
+    if (aggregated.peak_private_mb.has_value()) {
+      ABSL_LOG(INFO) << absl::StrFormat("Peak private footprint: %.2f MB",
+                                        *aggregated.peak_private_mb);
+    }
+    if (aggregated.peak_accelerator_mb.has_value()) {
+      ABSL_LOG(INFO) << absl::StrFormat(
+          "Peak accelerator memory usage: %.2f MB",
+          *aggregated.peak_accelerator_mb);
+      if (!aggregated.peak_accelerator_breakdown_mb.empty()) {
+        ABSL_LOG(INFO) << "Peak accelerator memory usage breakdown: "
+                       << FormatAggregatedAcceleratorMemoryBreakdown(
+                              aggregated.peak_accelerator_breakdown_mb);
+      }
+    }
+  }
 }
 }  // namespace
 
 absl::StatusOr<EngineSettings> CreateEngineSettings(
     const LiteRtLmSettings& settings) {
-  ASSIGN_OR_RETURN(ModelAssets model_assets, CreateModelAssets(settings));
+  ABSL_ASSIGN_OR_RETURN(ModelAssets model_assets, CreateModelAssets(settings));
   auto backend_str = settings.backend;
   ABSL_LOG(INFO) << "Choose backend: " << backend_str;
-  ASSIGN_OR_RETURN(Backend backend,
-                   litert::lm::GetBackendFromString(backend_str));
+  ABSL_ASSIGN_OR_RETURN(Backend backend,
+                        litert::lm::GetBackendFromString(backend_str));
   std::optional<Backend> vision_backend = std::nullopt;
   if (settings.vision_backend.has_value()) {
     ABSL_LOG(INFO) << "Provided vision backend: " << *settings.vision_backend;
-    ASSIGN_OR_RETURN(vision_backend, litert::lm::GetBackendFromString(
-                                         *settings.vision_backend));
+    ABSL_ASSIGN_OR_RETURN(vision_backend, litert::lm::GetBackendFromString(
+                                              *settings.vision_backend));
   }
   std::optional<Backend> audio_backend = std::nullopt;
   if (settings.audio_backend.has_value()) {
     ABSL_LOG(INFO) << "Provided audio backend: " << *settings.audio_backend;
-    ASSIGN_OR_RETURN(audio_backend,
-                     litert::lm::GetBackendFromString(*settings.audio_backend));
+    ABSL_ASSIGN_OR_RETURN(audio_backend, litert::lm::GetBackendFromString(
+                                             *settings.audio_backend));
   }
 
-  ASSIGN_OR_RETURN(
+  ABSL_ASSIGN_OR_RETURN(
       EngineSettings engine_settings,
       EngineSettings::CreateDefault(std::move(model_assets), backend,
                                     vision_backend, audio_backend));
+  backend = engine_settings.GetMainExecutorSettings().GetBackend();
+  // The deprecated `enable_speculative_decoding` means kOn when no mode is set.
+  std::optional<SpeculativeDecodingMode> speculative_decoding_mode =
+      settings.speculative_decoding_mode;
+  if (settings.enable_speculative_decoding) {
+    ABSL_LOG(WARNING) << "--enable_speculative_decoding is deprecated; use "
+                         "--speculative_decoding=on instead.";
+    if (!speculative_decoding_mode.has_value()) {
+      speculative_decoding_mode = SpeculativeDecodingMode::kOn;
+    }
+  }
+  engine_settings.SetSpeculativeDecodingConfig(
+      {.mode = speculative_decoding_mode,
+       .lenience = settings.speculative_lenience});
   if (settings.max_num_tokens > 0) {
     engine_settings.GetMutableMainExecutorSettings().SetMaxNumTokens(
         settings.max_num_tokens);
+  }
+  if (settings.visual_token_budget > 0) {
+    engine_settings.SetMaxVisionTokensPerImage(settings.visual_token_budget);
   }
   if (settings.force_f32) {
     engine_settings.GetMutableMainExecutorSettings().SetActivationDataType(
@@ -512,41 +807,77 @@ absl::StatusOr<EngineSettings> CreateEngineSettings(
       configure_caches(*engine_settings.GetMutableAudioExecutorSettings());
     }
   }
+  engine_settings.GetMutableMainExecutorSettings().SetUseIrModel(
+      settings.gpu_use_ir_model);
+  if (settings.vision_backend.has_value() &&
+      engine_settings.GetMutableVisionExecutorSettings().has_value()) {
+    engine_settings.GetMutableVisionExecutorSettings()->SetUseIrModel(
+        settings.gpu_use_ir_model);
+  }
+  if (settings.audio_backend.has_value() &&
+      engine_settings.GetMutableAudioExecutorSettings().has_value()) {
+    engine_settings.GetMutableAudioExecutorSettings()->SetUseIrModel(
+        settings.gpu_use_ir_model);
+  }
   if (!settings.litert_dispatch_lib_dir.empty()) {
     engine_settings.GetMutableMainExecutorSettings().SetLitertDispatchLibDir(
         settings.litert_dispatch_lib_dir);
   }
+  if (!settings.selected_signatures.empty()) {
+    engine_settings.GetMutableMainExecutorSettings().SetSelectedSignatures(
+        settings.selected_signatures);
+  }
   if (backend == Backend::CPU) {
     auto& executor_settings = engine_settings.GetMutableMainExecutorSettings();
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         auto cpu_settings,
         executor_settings.MutableBackendConfig<litert::lm::CpuConfig>());
     if (settings.num_cpu_threads > 0) {
       cpu_settings.number_of_threads = settings.num_cpu_threads;
     }
+    cpu_settings.enable_ynnpack = settings.enable_ynnpack;
     cpu_settings.prefill_chunk_size = settings.prefill_chunk_size;
     executor_settings.SetBackendConfig(cpu_settings);
   }
   if (backend == Backend::GPU) {
     auto& executor_settings = engine_settings.GetMutableMainExecutorSettings();
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         auto gpu_settings,
         executor_settings.MutableBackendConfig<litert::lm::GpuConfig>());
     gpu_settings.external_tensor_mode = settings.gpu_external_tensor_mode;
+    if (settings.sampler_top_k.has_value() &&
+        *settings.sampler_top_k > static_cast<int>(gpu_settings.max_top_k)) {
+      gpu_settings.max_top_k = static_cast<uint32_t>(*settings.sampler_top_k);
+    }
     executor_settings.SetBackendConfig(gpu_settings);
   }
   if (backend == Backend::GPU_ARTISAN) {
     auto& executor_settings = engine_settings.GetMutableMainExecutorSettings();
     executor_settings.SetMaxNumImages(settings.max_num_images);
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         auto gpu_artisan_settings,
         executor_settings.MutableBackendConfig<litert::lm::GpuArtisanConfig>());
     gpu_artisan_settings.use_submodel = settings.use_submodel;
+    if (settings.use_ringbuffers) {
+      gpu_artisan_settings.use_autosized_ringbuffers = true;
+    }
+    if (settings.benchmark) {
+      gpu_artisan_settings.wait_for_weight_uploads =
+          settings.wait_for_weights_conversion_complete_in_benchmark;
+    }
+    // The GPU artisan runner fixes its top-k capacity at creation and rejects
+    // a larger session k, so make room for `--sampler_top_k`.
+    if (settings.sampler_top_k.has_value() &&
+        *settings.sampler_top_k >
+            static_cast<int>(gpu_artisan_settings.max_top_k)) {
+      gpu_artisan_settings.max_top_k =
+          static_cast<uint32_t>(*settings.sampler_top_k);
+    }
     executor_settings.SetBackendConfig(gpu_artisan_settings);
   }
   if (backend == Backend::NPU) {
     auto& executor_settings = engine_settings.GetMutableMainExecutorSettings();
-    ASSIGN_OR_RETURN(
+    ABSL_ASSIGN_OR_RETURN(
         auto npu_settings,
         executor_settings.MutableBackendConfig<litert::lm::NpuConfig>());
     npu_settings.enable_neon_for_npu_greedy_sampling =
@@ -574,7 +905,9 @@ absl::StatusOr<EngineSettings> CreateEngineSettings(
           static_cast<uint32_t>(settings.num_logits_to_print_after_decode),
       .gpu_madvise_original_shared_tensors =
           settings.gpu_madvise_original_shared_tensors,
+      .gpu_enable_metal_residency_set = settings.gpu_enable_metal_residency_set,
       .is_benchmark = settings.benchmark,
+      .enable_profiling = settings.enable_profiling,
       .preferred_device_substr = settings.preferred_device_substr,
       .num_threads_to_upload = settings.num_threads_to_upload,
       .num_threads_to_compile = settings.num_threads_to_compile,
@@ -585,8 +918,50 @@ absl::StatusOr<EngineSettings> CreateEngineSettings(
       .cache_compiled_shaders_only = settings.cache_compiled_shaders_only,
       .share_constant_tensors = settings.share_constant_tensors,
       .sampler_handles_input = settings.sampler_handles_input,
-      .enable_speculative_decoding = settings.enable_speculative_decoding,
+      .mtp_gating_config = GetMtpGatingConfig(settings),
   };
+  if (advanced_settings.mtp_gating_config.has_value()) {
+    ABSL_RETURN_IF_ERROR(
+        ValidateMtpGatingConfig(*advanced_settings.mtp_gating_config));
+  }
+  if (settings.speculative_lenience.has_value() &&
+      !(*settings.speculative_lenience >= 0.0f &&
+        *settings.speculative_lenience <= 1.0f)) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "Invalid speculative_lenience: ", *settings.speculative_lenience,
+        ". Expected a value in [0, 1]."));
+  }
+  if (settings.sampler_seed.has_value() &&
+      !settings.sampler_top_k.has_value() &&
+      !settings.sampler_top_p.has_value() &&
+      !settings.sampler_temperature.has_value()) {
+    // Without a sampler type, `SessionConfig::MaybeUpdateAndValidate()`
+    // replaces the session sampler parameters, seed included, with the model's
+    // defaults, so the seed would be silently ignored.
+    return absl::InvalidArgumentError(
+        "sampler_seed requires sampler_top_k, sampler_top_p or "
+        "sampler_temperature.");
+  }
+  // The session sampler is updated in place rather than recreated, which skips
+  // the samplers' creation-time checks, so the overrides are validated here.
+  if (settings.sampler_top_k.has_value() && *settings.sampler_top_k < 1) {
+    return absl::InvalidArgumentError(absl::StrCat(
+        "sampler_top_k must be >= 1, but got ", *settings.sampler_top_k, "."));
+  }
+  // Negated comparisons so that NaN is rejected too.
+  if (settings.sampler_top_p.has_value() &&
+      !(*settings.sampler_top_p >= 0.0 && *settings.sampler_top_p <= 1.0)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("sampler_top_p must be in [0, 1], but got ",
+                     *settings.sampler_top_p, "."));
+  }
+  if (settings.sampler_temperature.has_value() &&
+      !(std::isfinite(*settings.sampler_temperature) &&
+        *settings.sampler_temperature >= 0.0)) {
+    return absl::InvalidArgumentError(
+        absl::StrCat("sampler_temperature must be finite and >= 0, but got ",
+                     *settings.sampler_temperature, "."));
+  }
   if (settings.conv_type == ConvType::kFloat) {
     advanced_settings.allow_src_quantized_fc_conv_ops = false;
   } else if (settings.conv_type == ConvType::kInt8) {
@@ -624,6 +999,8 @@ absl::StatusOr<EngineSettings> CreateEngineSettings(
     benchmark_params.set_num_prefill_tokens(settings.benchmark_prefill_tokens);
     benchmark_params.set_num_decode_tokens(settings.benchmark_decode_tokens);
     engine_settings.GetMutableBenchmarkParams() = benchmark_params;
+    // Set the single threaded execution for benchmarking.
+    engine_settings.SetSingleThreadedExecution(true);
   }
 
   return engine_settings;
@@ -632,18 +1009,21 @@ absl::StatusOr<EngineSettings> CreateEngineSettings(
 absl::StatusOr<std::unique_ptr<litert::lm::Engine>> CreateEngine(
     const LiteRtLmSettings& settings, const EngineSettings& engine_settings) {
   ABSL_LOG(INFO) << "Creating engine";
-  ASSIGN_OR_RETURN(auto engine,
-                   litert::lm::EngineFactory::CreateDefault(
-                       std::move(engine_settings), settings.input_prompt));
+  absl::string_view input_prompt_as_hint =
+      (settings.disable_input_prompt_as_hint) ? absl::string_view()
+                                              : settings.input_prompt;
+  ABSL_ASSIGN_OR_RETURN(auto engine,
+                        litert::lm::EngineFactory::CreateDefault(
+                            std::move(engine_settings), input_prompt_as_hint));
   if (settings.vision_backend.has_value()) {
-    ASSIGN_OR_RETURN(auto vision_executor_properties,
-                     engine->GetVisionExecutorProperties());
+    ABSL_ASSIGN_OR_RETURN(auto vision_executor_properties,
+                          engine->GetVisionExecutorProperties());
     ABSL_LOG(INFO) << "Vision executor properties: "
                    << vision_executor_properties;
   }
   if (settings.audio_backend.has_value()) {
-    ASSIGN_OR_RETURN(auto audio_executor_properties,
-                     engine->GetAudioExecutorProperties());
+    ABSL_ASSIGN_OR_RETURN(auto audio_executor_properties,
+                          engine->GetAudioExecutorProperties());
     ABSL_LOG(INFO) << "Audio executor properties: "
                    << audio_executor_properties;
   }
@@ -664,7 +1044,124 @@ SessionConfig CreateSessionConfig(const LiteRtLmSettings& settings) {
   if (settings.audio_backend.has_value()) {
     session_config.SetAudioModalityEnabled(true);
   }
+  if (settings.sampler_top_k.has_value() ||
+      settings.sampler_top_p.has_value() ||
+      settings.sampler_temperature.has_value()) {
+    // `--sampler_top_p` / `--sampler_temperature` alone ask for stochastic
+    // sampling, so top-k must not default to 1 (greedy): use a conventional
+    // top-k of 40 unless `--sampler_top_k` is given.
+    constexpr int kDefaultTopK = 40;
+    proto::SamplerParameters& sampler_params =
+        session_config.GetMutableSamplerParams();
+    sampler_params.set_type(proto::SamplerParameters::TOP_P);
+    sampler_params.set_k(settings.sampler_top_k.value_or(kDefaultTopK));
+    sampler_params.set_p(settings.sampler_top_p.value_or(1.0));
+    sampler_params.set_temperature(settings.sampler_temperature.value_or(1.0));
+    if (settings.sampler_seed.has_value()) {
+      sampler_params.set_seed(*settings.sampler_seed);
+    }
+  }
   return session_config;
+}
+
+AggregatedLitertLmMetrics ComputeMedianMetrics(
+    const std::vector<LitertLmMetrics>& metrics) {
+  AggregatedLitertLmMetrics aggregated;
+  aggregated.num_iterations = static_cast<int>(metrics.size());
+
+  // Values of each metric, collected over all the iterations.
+  absl::flat_hash_map<std::string, std::vector<absl::Duration>> init_phases;
+  absl::flat_hash_map<std::string, std::vector<absl::Duration>> mark_durations;
+  std::vector<double> time_to_first_token_sec;
+  // Prefill / decode speeds, grouped by the turn index within an iteration.
+  std::vector<std::vector<double>> prefill_tokens_per_sec;
+  std::vector<std::vector<double>> decode_tokens_per_sec;
+  std::vector<double> peak_mem_mb;
+  std::vector<double> peak_private_mb;
+  std::vector<double> peak_accelerator_mb;
+  absl::flat_hash_map<std::string, std::vector<double>>
+      peak_accelerator_breakdown_mb;
+
+  for (const LitertLmMetrics& metric : metrics) {
+    // Memory usage is only reported when --report_peak_memory_footprint is set.
+    if (metric.peak_mem_mb > 0.0f) {
+      peak_mem_mb.push_back(metric.peak_mem_mb);
+    }
+    if (metric.peak_private_mb > 0.0f) {
+      peak_private_mb.push_back(metric.peak_private_mb);
+    }
+    // Unset when accelerator memory tracking is unsupported. A supported
+    // platform reporting zero is a real measurement and is aggregated.
+    if (metric.peak_accelerator_mb.has_value()) {
+      peak_accelerator_mb.push_back(*metric.peak_accelerator_mb);
+      for (const auto& [category, mb] : metric.peak_accelerator_breakdown_mb) {
+        peak_accelerator_breakdown_mb[category].push_back(mb);
+      }
+    }
+    if (!metric.benchmark_info.has_value()) {
+      continue;
+    }
+    const BenchmarkInfo& benchmark_info = *metric.benchmark_info;
+    for (const auto& [phase_name, duration] : benchmark_info.GetInitPhases()) {
+      init_phases[phase_name].push_back(duration);
+    }
+    for (const auto& [mark_name, duration] :
+         benchmark_info.GetMarkDurations()) {
+      mark_durations[mark_name].push_back(duration);
+    }
+    if (const double ttft = benchmark_info.GetTimeToFirstToken(); ttft > 0.0) {
+      time_to_first_token_sec.push_back(ttft);
+    }
+    if (prefill_tokens_per_sec.size() < benchmark_info.GetTotalPrefillTurns()) {
+      prefill_tokens_per_sec.resize(benchmark_info.GetTotalPrefillTurns());
+    }
+    for (uint64_t turn = 0; turn < benchmark_info.GetTotalPrefillTurns();
+         ++turn) {
+      prefill_tokens_per_sec[turn].push_back(
+          benchmark_info.GetPrefillTokensPerSec(static_cast<int>(turn)));
+    }
+    if (decode_tokens_per_sec.size() < benchmark_info.GetTotalDecodeTurns()) {
+      decode_tokens_per_sec.resize(benchmark_info.GetTotalDecodeTurns());
+    }
+    for (uint64_t turn = 0; turn < benchmark_info.GetTotalDecodeTurns();
+         ++turn) {
+      decode_tokens_per_sec[turn].push_back(
+          benchmark_info.GetDecodeTokensPerSec(static_cast<int>(turn)));
+    }
+  }
+
+  for (const auto& [phase_name, durations] : init_phases) {
+    aggregated.init_phases[phase_name] = MedianDuration(durations);
+  }
+  for (const auto& [mark_name, durations] : mark_durations) {
+    aggregated.mark_durations[mark_name] = MedianDuration(durations);
+  }
+  if (!time_to_first_token_sec.empty()) {
+    aggregated.time_to_first_token_sec = Median(time_to_first_token_sec);
+  }
+  aggregated.prefill_tokens_per_sec.reserve(prefill_tokens_per_sec.size());
+  for (const std::vector<double>& speeds : prefill_tokens_per_sec) {
+    aggregated.prefill_tokens_per_sec.push_back(Median(speeds));
+  }
+  aggregated.decode_tokens_per_sec.reserve(decode_tokens_per_sec.size());
+  for (const std::vector<double>& speeds : decode_tokens_per_sec) {
+    aggregated.decode_tokens_per_sec.push_back(Median(speeds));
+  }
+  if (!peak_mem_mb.empty()) {
+    aggregated.peak_mem_mb = static_cast<float>(Median(peak_mem_mb));
+  }
+  if (!peak_private_mb.empty()) {
+    aggregated.peak_private_mb = static_cast<float>(Median(peak_private_mb));
+  }
+  if (!peak_accelerator_mb.empty()) {
+    aggregated.peak_accelerator_mb =
+        static_cast<float>(Median(peak_accelerator_mb));
+    for (const auto& [category, values] : peak_accelerator_breakdown_mb) {
+      aggregated.peak_accelerator_breakdown_mb[category] =
+          static_cast<float>(Median(values));
+    }
+  }
+  return aggregated;
 }
 
 // TODO(b/453071109): Check if returning the content list is more appropriate.
@@ -689,7 +1186,7 @@ absl::StatusOr<nlohmann::json> BuildContentList(
 
   for (const auto& data : input_data) {
     if (const auto* text = std::get_if<InputText>(&data)) {
-      ASSIGN_OR_RETURN(auto prompt_view, text->GetRawTextString());
+      ABSL_ASSIGN_OR_RETURN(auto prompt_view, text->GetRawTextString());
       absl::string_view whole_prompt(prompt_view);
       int last_pos = 0;
       std::string media_type;
@@ -716,13 +1213,13 @@ absl::StatusOr<nlohmann::json> BuildContentList(
           return absl::InvalidArgumentError(
               "Image backend is not specified. Please specify the vision "
               "backend "
-              "with --vision_backend=<cpu|gpu>");
+              "with --vision_backend=<cpu|gpu|npu>");
         }
         if (media_type == "audio" && !settings.audio_backend.has_value()) {
           return absl::InvalidArgumentError(
               "Audio backend is not specified. Please specify the audio "
               "backend "
-              "with --audio_backend=<cpu|gpu>");
+              "with --audio_backend=<cpu|gpu|npu>");
         }
         // Add media part
         content_list.push_back({{"type", media_type}, {"path", media_path}});
@@ -733,11 +1230,11 @@ absl::StatusOr<nlohmann::json> BuildContentList(
         content_list.push_back({{"type", "text"}, {"text", prompt_view}});
       }
     } else if (const auto* image = std::get_if<InputImage>(&data)) {
-      ASSIGN_OR_RETURN(auto raw_bytes, image->GetRawImageBytes());
+      ABSL_ASSIGN_OR_RETURN(auto raw_bytes, image->GetRawImageBytes());
       content_list.push_back(
           {{"type", "image"}, {"blob", absl::Base64Escape(raw_bytes)}});
     } else if (const auto* audio = std::get_if<InputAudio>(&data)) {
-      ASSIGN_OR_RETURN(auto raw_bytes, audio->GetRawAudioBytes());
+      ABSL_ASSIGN_OR_RETURN(auto raw_bytes, audio->GetRawAudioBytes());
       content_list.push_back(
           {{"type", "audio"}, {"blob", absl::Base64Escape(raw_bytes)}});
     }
@@ -754,20 +1251,30 @@ absl::Status RunLiteRtLm(const LiteRtLmSettings& settings,
     absl::AddLogSink(log_sink.get());
   }
 
-  ASSIGN_OR_RETURN(EngineSettings engine_settings,
-                   CreateEngineSettings(settings));
-  ASSIGN_OR_RETURN(auto engine, CreateEngine(settings, engine_settings));
+  ABSL_ASSIGN_OR_RETURN(EngineSettings engine_settings,
+                        CreateEngineSettings(settings));
+  ABSL_ASSIGN_OR_RETURN(auto engine, CreateEngine(settings, engine_settings));
 
   // Get the session config.
   SessionConfig session_config = CreateSessionConfig(settings);
 
+  // Metrics of each iteration. They are always collected so that the median
+  // over all the iterations can be reported at the end of the run.
+  std::vector<LitertLmMetrics> iteration_metrics;
+  iteration_metrics.reserve(settings.num_iterations);
+
   for (int i = 0; i < settings.num_iterations; ++i) {
     std::unique_ptr<tflite::profiling::memory::MemoryUsageMonitor> mem_monitor;
+    std::unique_ptr<AcceleratorMemoryMonitor> accelerator_mem_monitor;
     if (settings.report_peak_memory_footprint) {
       mem_monitor =
           std::make_unique<tflite::profiling::memory::MemoryUsageMonitor>(
               kMemoryCheckIntervalMs);
       mem_monitor->Start();
+      // No-op on platforms where accelerator memory tracking is unsupported.
+      accelerator_mem_monitor = std::make_unique<AcceleratorMemoryMonitor>(
+          absl::Milliseconds(kMemoryCheckIntervalMs));
+      accelerator_mem_monitor->Start();
     }
 
     // Session and Conversation are mutually exclusive. Only when
@@ -778,45 +1285,45 @@ absl::Status RunLiteRtLm(const LiteRtLmSettings& settings,
       if (settings.score_target_text.has_value() &&
           !settings.score_target_text->empty()) {
       ABSL_LOG(INFO) << "Creating session";
-      ASSIGN_OR_RETURN(session, engine->CreateSession(session_config));
+      ABSL_ASSIGN_OR_RETURN(session, engine->CreateSession(session_config));
       std::string input_prompt = settings.input_prompt;
       std::string score_target_text = settings.score_target_text.value();
-      RETURN_IF_ERROR(RunScoreText(engine.get(), session.get(), input_prompt,
-                                   {score_target_text},
-                                   /*store_char_and_token_lengths=*/false)
-                          .status());
+      ABSL_RETURN_IF_ERROR(RunScoreText(engine.get(), session.get(),
+                                        input_prompt, {score_target_text},
+                                        /*store_char_and_token_lengths=*/false)
+                               .status());
     } else if (settings.use_session) {
       ABSL_LOG(INFO) << "Creating session";
-      ASSIGN_OR_RETURN(session, engine->CreateSession(session_config));
+      ABSL_ASSIGN_OR_RETURN(session, engine->CreateSession(session_config));
       if (settings.multi_turns) {
         return absl::UnimplementedError(
             "Multi-turns is not supported with Session.");
       } else {
-        RETURN_IF_ERROR(RunSingleTurnSession(settings.input_prompt, settings,
-                                             engine.get(), session.get()));
+        ABSL_RETURN_IF_ERROR(RunSingleTurnSession(
+            settings.input_prompt, settings, engine.get(), session.get()));
       }
     } else {
       ABSL_LOG(INFO) << "Creating conversation";
-      ASSIGN_OR_RETURN(auto conversation_config,
-                       ConversationConfig::Builder()
-                           .SetSessionConfig(session_config)
-                           .Build(*engine));
-      ASSIGN_OR_RETURN(conversation,
-                       Conversation::Create(*engine, conversation_config));
+      ABSL_ASSIGN_OR_RETURN(auto conversation_config,
+                            ConversationConfig::Builder()
+                                .SetSessionConfig(session_config)
+                                .Build(*engine));
+      ABSL_ASSIGN_OR_RETURN(conversation,
+                            Conversation::Create(*engine, conversation_config));
       if (settings.multi_turns) {
         ABSL_LOG(INFO) << "Running multi-turns conversation";
-        RETURN_IF_ERROR(RunMultiTurnConversation(settings, engine.get(),
-                                                 conversation.get()));
+        ABSL_RETURN_IF_ERROR(RunMultiTurnConversation(settings, engine.get(),
+                                                      conversation.get()));
       } else {
         ABSL_LOG(INFO) << "Running single-turn conversation";
         std::vector<InputData> input_data;
         input_data.push_back(InputText(settings.input_prompt));
-        ASSIGN_OR_RETURN(auto content_list,
-                         BuildContentList(input_data, settings));
-        RETURN_IF_ERROR(RunSingleTurnConversation(content_list, settings,
-                                                  engine.get(),
-                                                  conversation.get())
-                            .status());
+        ABSL_ASSIGN_OR_RETURN(auto content_list,
+                              BuildContentList(input_data, settings));
+        ABSL_RETURN_IF_ERROR(RunSingleTurnConversation(content_list, settings,
+                                                       engine.get(),
+                                                       conversation.get())
+                                 .status());
       }
     }
     LitertLmMetrics metric;
@@ -831,9 +1338,7 @@ absl::Status RunLiteRtLm(const LiteRtLmSettings& settings,
       }
       if (benchmark_info.ok()) {
         LogBenchmarkInfo(*benchmark_info, settings);
-        if (metrics != nullptr) {
-          metric.benchmark_info = *benchmark_info;
-        }
+        metric.benchmark_info = *benchmark_info;
       }
     }
 
@@ -850,16 +1355,40 @@ absl::Status RunLiteRtLm(const LiteRtLmSettings& settings,
         mem_monitor->Stop();
         peak_mem_mb = mem_monitor->GetPeakMemUsageInMB();
         peak_private_mb = mem_monitor->GetPeakPrivateFootprintInMB();
-        if (metrics != nullptr) {
-          metric.peak_mem_mb = peak_mem_mb;
-          metric.peak_private_mb = peak_private_mb;
+        metric.peak_mem_mb = peak_mem_mb;
+        metric.peak_private_mb = peak_private_mb;
+      }
+      std::optional<AcceleratorMemoryUsage> peak_accelerator;
+      if (accelerator_mem_monitor != nullptr) {
+        accelerator_mem_monitor->Stop();
+        peak_accelerator = accelerator_mem_monitor->GetPeakUsage();
+      }
+      if (peak_accelerator.has_value()) {
+        metric.peak_accelerator_mb =
+            AcceleratorMemoryBytesToMb(peak_accelerator->total_bytes);
+        metric.peak_accelerator_breakdown_mb.reserve(
+            peak_accelerator->breakdown.size());
+        for (const auto& [category, bytes] : peak_accelerator->breakdown) {
+          metric.peak_accelerator_breakdown_mb.emplace_back(
+              category, AcceleratorMemoryBytesToMb(bytes));
         }
       }
-      LogMemoryUsage(settings, peak_mem_mb, peak_private_mb);
+      LogMemoryUsage(
+          settings, peak_mem_mb, peak_private_mb,
+          peak_accelerator.has_value() ? &*peak_accelerator : nullptr);
     }
-    if (metrics != nullptr) {
-      metrics->push_back(metric);
-    }
+    iteration_metrics.push_back(std::move(metric));
+  }
+
+  // Report the median of the per-iteration metrics. A single iteration is
+  // already fully reported by the logs above.
+  if (iteration_metrics.size() > 1) {
+    LogAggregatedMetrics(ComputeMedianMetrics(iteration_metrics), settings);
+  }
+  if (metrics != nullptr) {
+    metrics->insert(metrics->end(),
+                    std::make_move_iterator(iteration_metrics.begin()),
+                    std::make_move_iterator(iteration_metrics.end()));
   }
 
   if (log_sink) {
