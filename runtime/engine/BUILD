@@ -331,7 +331,7 @@ cc_binary(
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/time",
         "@nlohmann_json//:json",
-        "//runtime/components/logits_processor/constrained_decoding:llg_constraint_config",
+        "//runtime/components/constrained_decoding:llg_constraint_config",
         "//runtime/conversation",
         "//runtime/executor:llm_executor_settings",
         "//runtime/proto:sampler_params_cc_proto",

@@ -123,3 +123,22 @@ checkout the stable
 tag.
 
 --------------------------------------------------------------------------------
+
+## Fork Windows DLL releases
+
+This fork retains its custom wrapper while merging Google LiteRT-LM upstream.
+`UPSTREAM_REVISION` records the exact upstream commit; `WRAPPER_VERSION` records
+our DLL release revision. The current upstream main is a development version,
+so `0.19.0-dev.1` is published as a prerelease.
+
+Run **Build and release Windows wrapper DLL** from the GitHub Actions page.
+The workflow compiles the fork's current source on a GitHub Windows runner,
+reuses Bazel download and action caches, and publishes the SDK ZIP to Releases.
+It creates a `codex/version/wrap-v<version>` branch and a `wrap-v<version>` tag
+for each successful release. Increment `WRAPPER_VERSION` for the next release.
+Pushing a matching `wrap-v*` tag also runs the workflow.
+
+The SDK contains `litert-lm.dll` (upstream C API), `litert_lm_wrapper.dll` (our
+wrapper), import libraries, matching headers, runtime DLL dependencies, and
+`version.json` with source commits and DLL SHA-256 hashes. Builds run on GitHub;
+download the release SDK for local integration.

@@ -77,7 +77,7 @@ static bool SafeExecuteWithSehGuard(SafeFunc func, void* arg) {
 #define LITERT_LM_WRAPPER_IMPLEMENTATION
 #include "litert_lm_wrapper.h"
 
-#include "runtime/components/logits_processor/constrained_decoding/llg_constraint_config.h"
+#include "runtime/components/constrained_decoding/llg_constraint_config.h"
 #include "runtime/util/litert_util.h"
 
 using namespace litert::lm;
@@ -122,7 +122,7 @@ DLL_EXPORT int LiteRtLm_GetApiVersion() {
 }
 
 DLL_EXPORT const char* LiteRtLm_GetBuildInfo() {
-    return "LiteRT-LM wrapper API 2; explicit-conversation-reset; "
+    return "LiteRT-LM 0.19.0-dev.1; wrapper API 2; upstream 2c1c9a67; explicit-conversation-reset; "
            "engine-backend-evidence; tools-preface-persistent; " __DATE__ " " __TIME__;
 }
 

@@ -39,7 +39,7 @@
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/time/time.h"  // from @com_google_absl
 #include "nlohmann/json.hpp"  // from @nlohmann_json
-#include "runtime/components/logits_processor/constrained_decoding/llg_constraint_config.h"
+#include "runtime/components/constrained_decoding/llg_constraint_config.h"
 #include "runtime/conversation/conversation.h"
 #include "runtime/engine/engine_factory.h"
 #include "runtime/engine/engine_settings.h"

@@ -1,0 +1,80 @@
+name: Build and release Windows wrapper DLL
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'wrap-v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wrap-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  windows-dll:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CARGO_BAZEL_REPIN: 'true'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch Windows runtime files
+        run: git lfs pull --include='prebuilt/windows_x86_64/**'
+
+      - name: Restore Bazel caches
+        uses: actions/cache@v6
+        with:
+          path: |
+            C:/b/repository-cache
+            C:/b/disk-cache
+          key: wrap-windows-${{ hashFiles('.bazelversion', 'WORKSPACE', 'Cargo.lock', 'PATCH.*') }}-${{ github.sha }}
+          restore-keys: |
+            wrap-windows-${{ hashFiles('.bazelversion', 'WORKSPACE', 'Cargo.lock', 'PATCH.*') }}-
+            wrap-windows-
+
+      - name: Install Bazelisk
+        run: |
+          New-Item -ItemType Directory -Path C:/b/tools -Force | Out-Null
+          gh release download --repo bazelbuild/bazelisk --pattern bazelisk-windows-amd64.exe --output C:/b/tools/bazel.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          'C:/b/tools' >> $env:GITHUB_PATH
+
+      - name: Build DLLs and package SDK
+        run: ./Gemini_build_wrapper.ps1 -OutputDirectory out/LiteRtLm -BazelOutputBase C:/b/output -BazelUserRoot C:/b/user
+
+      - name: Upload SDK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: LiteRtLm-Win64-${{ github.sha }}
+          path: out/*.zip
+          if-no-files-found: error
+
+      - name: Archive version branch and publish release
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $version = [IO.File]::ReadAllText('WRAPPER_VERSION').Trim()
+          $tag = "wrap-v$version"
+          if ($env:REF_TYPE -eq 'tag' -and $env:REF_NAME -ne $tag) { throw 'Tag and WRAPPER_VERSION differ' }
+          $branch = "codex/version/$tag"
+          gh api "repos/$env:REPOSITORY/git/refs" -X POST -f "ref=refs/heads/$branch" -f "sha=$env:SOURCE_SHA"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $archive = (Get-ChildItem -LiteralPath out -Filter *.zip).FullName
+          $releaseArgs = @('release', 'create', $tag, $archive, '--repo', $env:REPOSITORY, '--target', $env:SOURCE_SHA, '--title', "LiteRT-LM wrapper $version", '--generate-notes')
+          if ($version.Contains('-')) { $releaseArgs += '--prerelease' }
+          gh @releaseArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
