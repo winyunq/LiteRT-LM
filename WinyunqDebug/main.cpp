@@ -7,40 +7,10 @@
 #include <filesystem>
 #include <fstream>
 #include <gdiplus.h>
+#include <thread>
+#include "../runtime/engine/litert_lm_wrapper.h"
 
 #pragma comment(lib, "gdiplus.lib")
-
-// --- Wrapper Types ---
-typedef struct {
-    const char* model_path;
-    const char* backend;
-    int max_num_tokens;
-    int num_threads;
-    int bEnableBenchmark;
-    int bOptimizeShader;
-    int bEnableVision;
-    int bEnableAudio;
-    int prefill_chunk_size;
-} LiteRtLm_Config;
-
-typedef struct {
-    float temperature;
-    float top_p;
-    int top_k;
-    int max_tokens;
-    int constraint_type;
-    const char* constraint_string;
-} LiteRtLm_SamplingParams;
-
-typedef struct {
-    const char* text_chunk;
-    const char* full_json_chunk;
-    const char* error_msg;
-    int bIsDone;
-    float tokens_per_sec;
-} LiteRtLm_Result;
-
-typedef void (*LiteRtLmCallback)(LiteRtLm_Result result, void* user_ptr);
 
 // --- Function Pointers ---
 typedef const char* (*PN_GetAvailableBackends)();
@@ -214,6 +184,10 @@ void MyCallback(LiteRtLm_Result result, void* user_ptr) {
     if (result.text_chunk) {
         std::cout << result.text_chunk << std::flush;
     }
+    if (result.full_json_chunk && !result.text_chunk) {
+        // 当 text_chunk 为空时，模型可能生成了 tool_call，在此打印完整 JSON 便于诊断
+        std::cout << "\n[full_json] " << result.full_json_chunk << std::endl;
+    }
     if (result.error_msg) {
         std::cerr << "\n[ERROR] " << result.error_msg << std::endl;
     }
@@ -359,13 +333,14 @@ int main(int argc, char* argv[]) {
     config.model_path = "D:\\gemma-4-E4B-it.litertlm";
     config.backend = "gpu";
     config.max_num_tokens = 65536;
-    config.bOptimizeShader = 1;
+    config.bOptimizeShader = 0;
     /// 启用多模态视觉（Vision）引擎以支持图像推理，防止拖入图片时发生空指针崩溃
     config.bEnableVision = 1;
     config.prefill_chunk_size = 32768; // 单次处理的最长上下文，作为初始化参数传入！
 
     std::cout << "Initializing Engine (GPU) & Global Single Conversation..." << std::endl;
     void* engine = CreateEngine(config);
+
     if (!engine) {
         std::cerr << "Failed to create engine." << std::endl;
         FreeLibrary(hDll);

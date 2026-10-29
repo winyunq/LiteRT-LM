@@ -84,8 +84,9 @@ bool IsEmptyPreface(const Preface& preface) {
 }
 
 bool IsUserMessage(const nlohmann::ordered_json& json_msg) {
-  return json_msg.contains(kRoleKey) && json_msg[kRoleKey].is_string() &&
-         json_msg[kRoleKey].get<absl::string_view>() == kUser;
+  const std::string role_key(kRoleKey);
+  return json_msg.contains(role_key) && json_msg[role_key].is_string() &&
+         json_msg[role_key].get<absl::string_view>() == kUser;
 }
 
 }  // namespace
@@ -490,6 +491,14 @@ absl::Status Conversation::SendMessageAsync(
     }
   }
 
+  // Winyunq: 如果开启了逻辑追加模式，则在更新 history_ 向量后直接返回，不触发物理计算。
+  if (optional_args.skip_prefill) {
+    if (user_callback) {
+      user_callback(Message()); // 主动触发回调，通知逻辑层追加已完成
+    }
+    return absl::OkStatus();
+  }
+
   // If channel content (e.g. reasoning) needs to be filtered from the KV cache,
   // we rewind the session to the last user message and compute the inputs that
   // need to be "refilled" into the session.
@@ -570,7 +579,7 @@ absl::Status Conversation::SendMessageAsync(
         // variable indicating the session needs to be rewound to the last user
         // message.
         if (config_.filter_channel_content_from_kv_cache() &&
-            complete_message.contains(kChannelsKey)) {
+            complete_message.contains(std::string(kChannelsKey))) {
           channel_content_since_last_user_message_ = true;
         }
       };

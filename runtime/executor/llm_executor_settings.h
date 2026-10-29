@@ -100,6 +100,12 @@ struct GpuConfig {
 
   // Whether to use external tensor mode.
   bool external_tensor_mode = false;
+
+  // Reject any LiteRT compiled submodel that cannot prove full GPU
+  // acceleration. This includes the main prefill/decode model and optional
+  // text/per-layer embedding models. Disabled by default for compatibility;
+  // strict product wrappers should enable it explicitly.
+  bool require_full_acceleration = false;
 };
 std::ostream& operator<<(std::ostream& os, const GpuConfig& config);
 

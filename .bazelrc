@@ -1,5 +1,7 @@
 # LiteRT Bazel configuration file.
 # This file tries to group and simplify build options for LiteRT
+# Keep Bazel's install base and default output data off the system drive.
+startup --output_user_root=D:/bzl_u
 #
 # ----CONFIG OPTIONS----
 # Android options:

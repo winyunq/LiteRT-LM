@@ -153,6 +153,30 @@ absl::Status CreateStatusAndFreeErrorMsg(int error_code, char* error_msg) {
                          : CreateStatus(error_code, error_msg);
 }
 
+bool HasSameSamplerConfig(const proto::SamplerParameters& lhs,
+                          const proto::SamplerParameters& rhs) {
+  return lhs.type() == rhs.type() && lhs.k() == rhs.k() &&
+         lhs.p() == rhs.p() && lhs.temperature() == rhs.temperature() &&
+         lhs.has_seed() == rhs.has_seed() &&
+         (!lhs.has_seed() || lhs.seed() == rhs.seed());
+}
+
+template <typename T>
+T LookupOptionalSymbol(const SharedLibrary& lib, const char* lib_name,
+                       const char* symbol_name) {
+  if (symbol_name == nullptr) {
+    return nullptr;
+  }
+  auto symbol_or = lib.LookupSymbol<T>(symbol_name);
+  if (!symbol_or.HasValue()) {
+    ABSL_LOG(INFO) << "Optional sampler capability " << symbol_name
+                   << " is not exported by " << lib_name << ": "
+                   << symbol_or.Error();
+    return nullptr;
+  }
+  return std::move(symbol_or.Value());
+}
+
 // A base wrapper of TopK Sampler C API functions.
 class TopKCApiSampler : public Sampler {
  public:
@@ -201,7 +225,7 @@ class TopKCApiSampler : public Sampler {
         std::optional<SharedLibrary> lib, LiteRtTopKSampler_Create create_func,
         LiteRtTopKSampler_Destroy destroy_func,
         LiteRtTopKSampler_SampleToIdAndScoreBuffer sample_func,
-        LiteRtTopKSampler_UpdateConfig update_config_func,
+        LiteRtTopKSampler_UpdateConfig update_config_func = nullptr,
         LiteRtTopKSampler_CanHandleInput can_handle_input_func = nullptr,
         LiteRtTopKSampler_HandlesInput handles_input_func = nullptr,
         LiteRtTopKSampler_SetInputTensorsAndInferenceFunc
@@ -213,7 +237,21 @@ class TopKCApiSampler : public Sampler {
           update_config_func(update_config_func),
           can_handle_input_func(can_handle_input_func),
           handles_input_func(handles_input_func),
-          set_input_tensors_func(set_input_tensors_func) {}
+          set_input_tensors_func(set_input_tensors_func) {
+      const bool has_any_input_capability =
+          this->can_handle_input_func != nullptr ||
+          this->handles_input_func != nullptr ||
+          this->set_input_tensors_func != nullptr;
+      const bool has_complete_input_capability =
+          this->can_handle_input_func != nullptr &&
+          this->handles_input_func != nullptr &&
+          this->set_input_tensors_func != nullptr;
+      if (has_any_input_capability && !has_complete_input_capability) {
+        this->can_handle_input_func = nullptr;
+        this->handles_input_func = nullptr;
+        this->set_input_tensors_func = nullptr;
+      }
+    }
   };
 
   ~TopKCApiSampler() override { capi_->destroy_func(sampler_); }
@@ -235,10 +273,27 @@ class TopKCApiSampler : public Sampler {
   absl::Status UpdateConfig(
       const proto::SamplerParameters& sampler_params, int batch_size,
       std::shared_ptr<std::default_random_engine> rand_gen) override {
+    if (capi_->update_config_func == nullptr) {
+      if (batch_size == configured_batch_size_ &&
+          HasSameSamplerConfig(sampler_params, configured_sampler_params_)) {
+        // Legacy GPU sampler libraries receive this fixed configuration in
+        // Create(). They do not need an UpdateConfig export for a no-op update.
+        return absl::OkStatus();
+      }
+      return absl::UnimplementedError(
+          "The loaded GPU sampler does not export UpdateConfig; recreate the "
+          "sampler to apply different sampling parameters or batch size.");
+    }
     char* error_msg = nullptr;
     int error_code = capi_->update_config_func(
         sampler_, &sampler_params, batch_size, &rand_gen, &error_msg);
-    return CreateStatusAndFreeErrorMsg(error_code, error_msg);
+    absl::Status status =
+        CreateStatusAndFreeErrorMsg(error_code, error_msg);
+    if (status.ok()) {
+      configured_sampler_params_ = sampler_params;
+      configured_batch_size_ = batch_size;
+    }
+    return status;
   }
 
   bool CanHandleInput() const override {
@@ -277,8 +332,13 @@ class TopKCApiSampler : public Sampler {
 
  protected:
   TopKCApiSampler(std::unique_ptr<TopKSamplerCApi> capi,
-                  LiteRtTopKSampler_Sampler* sampler)
-      : capi_(std::move(capi)), sampler_(sampler) {}
+                  LiteRtTopKSampler_Sampler* sampler,
+                  proto::SamplerParameters configured_sampler_params,
+                  int configured_batch_size)
+      : capi_(std::move(capi)),
+        sampler_(sampler),
+        configured_sampler_params_(std::move(configured_sampler_params)),
+        configured_batch_size_(configured_batch_size) {}
 
   static absl::StatusOr<std::unique_ptr<TopKSamplerCApi>> GetSamplerCApi(
       const char* lib_name, const char* create_func_name,
@@ -304,38 +364,40 @@ class TopKCApiSampler : public Sampler {
         auto sampler_sample_func,
         lib.LookupSymbol<LiteRtTopKSampler_SampleToIdAndScoreBuffer>(
             sample_func_name));
-    LITERT_ASSIGN_OR_RETURN(auto sampler_update_config_func,
-                            lib.LookupSymbol<LiteRtTopKSampler_UpdateConfig>(
-                                update_config_func_name));
     RET_CHECK_NE(sampler_sample_func, nullptr)
         << "Failed to load " << sample_func_name;
 
-    LiteRtTopKSampler_CanHandleInput sampler_can_handle_input_func = nullptr;
-    if (can_handle_input_func_name != nullptr) {
-      LITERT_ASSIGN_OR_RETURN(
-          sampler_can_handle_input_func,
-          lib.LookupSymbol<LiteRtTopKSampler_CanHandleInput>(
-              can_handle_input_func_name));
-      RET_CHECK_NE(sampler_can_handle_input_func, nullptr)
-          << "Failed to load " << can_handle_input_func_name;
-    }
-    LiteRtTopKSampler_HandlesInput sampler_handles_input_func = nullptr;
-    if (handles_input_func_name != nullptr) {
-      LITERT_ASSIGN_OR_RETURN(sampler_handles_input_func,
-                              lib.LookupSymbol<LiteRtTopKSampler_HandlesInput>(
-                                  handles_input_func_name));
-      RET_CHECK_NE(sampler_handles_input_func, nullptr)
-          << "Failed to load " << handles_input_func_name;
-    }
-    LiteRtTopKSampler_SetInputTensorsAndInferenceFunc
-        sampler_set_input_tensors_func = nullptr;
-    if (set_input_tensors_func_name != nullptr) {
-      LITERT_ASSIGN_OR_RETURN(
-          sampler_set_input_tensors_func,
-          lib.LookupSymbol<LiteRtTopKSampler_SetInputTensorsAndInferenceFunc>(
-              set_input_tensors_func_name));
-      RET_CHECK_NE(sampler_set_input_tensors_func, nullptr)
-          << "Failed to load " << set_input_tensors_func_name;
+    auto sampler_update_config_func =
+        LookupOptionalSymbol<LiteRtTopKSampler_UpdateConfig>(
+            lib, lib_name, update_config_func_name);
+    auto sampler_can_handle_input_func =
+        LookupOptionalSymbol<LiteRtTopKSampler_CanHandleInput>(
+            lib, lib_name, can_handle_input_func_name);
+    auto sampler_handles_input_func =
+        LookupOptionalSymbol<LiteRtTopKSampler_HandlesInput>(
+            lib, lib_name, handles_input_func_name);
+    auto sampler_set_input_tensors_func =
+        LookupOptionalSymbol<LiteRtTopKSampler_SetInputTensorsAndInferenceFunc>(
+            lib, lib_name, set_input_tensors_func_name);
+
+    // Input handling is one capability made up of three entry points. Never
+    // advertise a partial implementation to the executor.
+    const bool has_any_input_capability =
+        sampler_can_handle_input_func != nullptr ||
+        sampler_handles_input_func != nullptr ||
+        sampler_set_input_tensors_func != nullptr;
+    const bool has_complete_input_capability =
+        sampler_can_handle_input_func != nullptr &&
+        sampler_handles_input_func != nullptr &&
+        sampler_set_input_tensors_func != nullptr;
+    if (has_any_input_capability && !has_complete_input_capability) {
+      ABSL_LOG(WARNING)
+          << lib_name
+          << " exports only part of the input-handling sampler extension; "
+             "that capability will be disabled.";
+      sampler_can_handle_input_func = nullptr;
+      sampler_handles_input_func = nullptr;
+      sampler_set_input_tensors_func = nullptr;
     }
 
     return std::make_unique<TopKSamplerCApi>(
@@ -347,6 +409,8 @@ class TopKCApiSampler : public Sampler {
 
   std::unique_ptr<TopKSamplerCApi> capi_;
   LiteRtTopKSampler_Sampler* const sampler_;
+  proto::SamplerParameters configured_sampler_params_;
+  int configured_batch_size_;
 };
 
 // A wrapper of TopKOpenClSampler C API functions.
@@ -389,21 +453,24 @@ class TopKOpenClCApiSampler : public TopKCApiSampler {
         &sampler_params, &sampler, &error_msg);
     RETURN_IF_ERROR(CreateStatusAndFreeErrorMsg(error_code, error_msg));
     RET_CHECK(sampler) << "Failed to create sampler";
-    return absl::WrapUnique(
-        new TopKOpenClCApiSampler(std::move(capi), sampler));
+    return absl::WrapUnique(new TopKOpenClCApiSampler(
+        std::move(capi), sampler, std::move(sampler_params), batch_size));
   }
 
  private:
   TopKOpenClCApiSampler(std::unique_ptr<TopKSamplerCApi> capi,
-                        LiteRtTopKSampler_Sampler* sampler)
-      : TopKCApiSampler(std::move(capi), sampler) {}
+                        LiteRtTopKSampler_Sampler* sampler,
+                        proto::SamplerParameters configured_sampler_params,
+                        int configured_batch_size)
+      : TopKCApiSampler(std::move(capi), sampler,
+                       std::move(configured_sampler_params),
+                       configured_batch_size) {}
 
   static absl::StatusOr<std::unique_ptr<TopKSamplerCApi>>
   GetStaticTopKOpenClSamplerCApi() {
     if (LiteRtTopKOpenClSampler_Create_Static == nullptr ||
         LiteRtTopKOpenClSampler_Destroy_Static == nullptr ||
-        LiteRtTopKOpenClSampler_SampleToIdAndScoreBuffer_Static == nullptr ||
-        LiteRtTopKOpenClSampler_UpdateConfig_Static == nullptr) {
+        LiteRtTopKOpenClSampler_SampleToIdAndScoreBuffer_Static == nullptr) {
       return absl::UnavailableError(
           "Static LiteRtTopKOpenClSampler C API not available.");
     }
@@ -465,25 +532,24 @@ class TopKWebGpuCApiSampler : public TopKCApiSampler {
         &sampler_params, &sampler, &error_msg);
     RETURN_IF_ERROR(CreateStatusAndFreeErrorMsg(error_code, error_msg));
     RET_CHECK(sampler) << "Failed to create sampler";
-    return absl::WrapUnique(
-        new TopKWebGpuCApiSampler(std::move(capi), sampler));
+    return absl::WrapUnique(new TopKWebGpuCApiSampler(
+        std::move(capi), sampler, std::move(sampler_params), batch_size));
   }
 
  private:
   TopKWebGpuCApiSampler(std::unique_ptr<TopKSamplerCApi> capi,
-                        LiteRtTopKSampler_Sampler* sampler)
-      : TopKCApiSampler(std::move(capi), sampler) {}
+                        LiteRtTopKSampler_Sampler* sampler,
+                        proto::SamplerParameters configured_sampler_params,
+                        int configured_batch_size)
+      : TopKCApiSampler(std::move(capi), sampler,
+                       std::move(configured_sampler_params),
+                       configured_batch_size) {}
 
   static absl::StatusOr<std::unique_ptr<TopKSamplerCApi>>
   GetStaticTopKWebGpuSamplerCApi() {
     if (LiteRtTopKWebGpuSampler_Create_Static == nullptr ||
         LiteRtTopKWebGpuSampler_Destroy_Static == nullptr ||
-        LiteRtTopKWebGpuSampler_SampleToIdAndScoreBuffer_Static == nullptr ||
-        LiteRtTopKWebGpuSampler_UpdateConfig_Static == nullptr ||
-        LiteRtTopKWebGpuSampler_CanHandleInput_Static == nullptr ||
-        LiteRtTopKWebGpuSampler_HandlesInput_Static == nullptr ||
-        LiteRtTopKWebGpuSampler_SetInputTensorsAndInferenceFunc_Static ==
-            nullptr) {
+        LiteRtTopKWebGpuSampler_SampleToIdAndScoreBuffer_Static == nullptr) {
       return absl::UnavailableError(
           "Static LiteRtTopKWebGpuSampler C API not available.");
     }
@@ -544,24 +610,24 @@ class TopKMetalCApiSampler : public TopKCApiSampler {
         &sampler_params, &sampler, &error_msg);
     RETURN_IF_ERROR(CreateStatusAndFreeErrorMsg(error_code, error_msg));
     RET_CHECK(sampler);
-    return absl::WrapUnique(new TopKMetalCApiSampler(std::move(capi), sampler));
+    return absl::WrapUnique(new TopKMetalCApiSampler(
+        std::move(capi), sampler, std::move(sampler_params), batch_size));
   }
 
  private:
   TopKMetalCApiSampler(std::unique_ptr<TopKSamplerCApi> capi,
-                       LiteRtTopKSampler_Sampler* sampler)
-      : TopKCApiSampler(std::move(capi), sampler) {}
+                       LiteRtTopKSampler_Sampler* sampler,
+                       proto::SamplerParameters configured_sampler_params,
+                       int configured_batch_size)
+      : TopKCApiSampler(std::move(capi), sampler,
+                       std::move(configured_sampler_params),
+                       configured_batch_size) {}
 
   static absl::StatusOr<std::unique_ptr<TopKSamplerCApi>>
   GetStaticTopKMetalSamplerCApi() {
     if (LiteRtTopKMetalSampler_Create_Static == nullptr ||
         LiteRtTopKMetalSampler_Destroy_Static == nullptr ||
-        LiteRtTopKMetalSampler_SampleToIdAndScoreBuffer_Static == nullptr ||
-        LiteRtTopKMetalSampler_UpdateConfig_Static == nullptr ||
-        LiteRtTopKMetalSampler_CanHandleInput_Static == nullptr ||
-        LiteRtTopKMetalSampler_HandlesInput_Static == nullptr ||
-        LiteRtTopKMetalSampler_SetInputTensorsAndInferenceFunc_Static ==
-            nullptr) {
+        LiteRtTopKMetalSampler_SampleToIdAndScoreBuffer_Static == nullptr) {
       return absl::UnavailableError(
           "Static LiteRtTopKMetalSampler C API not available.");
     }
@@ -623,8 +689,8 @@ absl::StatusOr<std::unique_ptr<Sampler>> CreateGpuSampler(
         webgpu_sampler.status().code() != absl::StatusCode::kUnavailable) {
       return webgpu_sampler;
     }
-    ABSL_LOG(INFO) << "WebGPU sampler explicitly requested but "
-                      "failed/unavailable, falling back.";
+    ABSL_LOG(INFO) << "WebGPU sampler failed/unavailable; trying another GPU "
+                      "sampler.";
 #endif  // LITERT_HAS_WEBGPU_SUPPORT
   }
 
@@ -637,7 +703,7 @@ absl::StatusOr<std::unique_ptr<Sampler>> CreateGpuSampler(
     return opencl_sampler;
   }
   ABSL_LOG(INFO)
-      << "OpenCL sampler not available, falling back to other sampler options.";
+      << "OpenCL sampler not available; trying another GPU sampler.";
 #endif  // LITERT_HAS_OPENCL_SUPPORT
 
 #if LITERT_HAS_WEBGPU_SUPPORT  // NOLINT(misc-include-cleaner)
@@ -649,8 +715,8 @@ absl::StatusOr<std::unique_ptr<Sampler>> CreateGpuSampler(
         webgpu_sampler.status().code() != absl::StatusCode::kUnavailable) {
       return webgpu_sampler;
     }
-    ABSL_LOG(INFO) << "WebGPU sampler not available, falling back to other "
-                      "sampler options.";
+    ABSL_LOG(INFO)
+        << "WebGPU sampler not available; trying another GPU sampler.";
   }
 #endif  // LITERT_HAS_WEBGPU_SUPPORT
 
@@ -668,8 +734,8 @@ absl::StatusOr<std::unique_ptr<Sampler>> CreateGpuSampler(
       ABSL_LOG(WARNING)
           << "Metal sampler explicitly requested but failed/unavailable.";
     } else {
-      ABSL_LOG(INFO) << "Metal sampler not available, falling back to other "
-                        "sampler options.";
+      ABSL_LOG(INFO)
+          << "Metal sampler not available; trying another GPU sampler.";
     }
   }
 #endif  // __APPLE__
@@ -683,7 +749,7 @@ absl::StatusOr<std::unique_ptr<Sampler>> CreateGpuSampler(
     return webgpu_sampler;
   }
   ABSL_LOG(INFO)
-      << "WebGPU sampler not available, falling back to other sampler options.";
+      << "WebGPU sampler not available; trying another GPU sampler.";
 #endif                         // LITERT_HAS_WEBGPU_SUPPORT
 
 #if LITERT_HAS_OPENCL_SUPPORT  // NOLINT(misc-include-cleaner)
@@ -695,7 +761,7 @@ absl::StatusOr<std::unique_ptr<Sampler>> CreateGpuSampler(
     return opencl_sampler;
   }
   ABSL_LOG(INFO)
-      << "OpenCL sampler not available, falling back to other sampler options.";
+      << "OpenCL sampler not available; trying another GPU sampler.";
 #endif                         // LITERT_HAS_OPENCL_SUPPORT
 #endif                         // !__ANDROID__
 
@@ -719,18 +785,14 @@ absl::StatusOr<std::unique_ptr<Sampler>> CreateSampler(
       auto sampler_or =
           CreateGpuSampler(batch_size, sampler_params, env, sequence_size_value,
                            vocab_size.value(), activation_data_type);
-      if (sampler_or.ok() ||
-          sampler_or.status().code() != absl::StatusCode::kUnavailable) {
-        // For a normal failure or success, return the result.
-        return sampler_or;
+      if (!sampler_or.ok()) {
+        return absl::Status(
+            sampler_or.status().code(),
+            absl::StrCat(
+                "Strict GPU sampling requested; CPU fallback is disabled: ",
+                sampler_or.status().message()));
       }
-      // For a failure due to GPU sampler unavailable, fall back to CPU.
-      ABSL_LOG(WARNING)
-          << "GPU sampler unavailable. Falling back to CPU sampling. To use "
-             "GPU sampling, please make sure libLiteRtTopKWebGpuSampler.so or "
-             "libLiteRtTopKOpenClSampler.so is available at LD_LIBRARY_PATH "
-             "on device. You can find the shared library under prebuilt/";
-      ABSL_FALLTHROUGH_INTENDED;
+      return sampler_or;
     }
     case Backend::CPU:
       return CreateCpuSampler(batch_size, sequence_size_value, sampler_params);

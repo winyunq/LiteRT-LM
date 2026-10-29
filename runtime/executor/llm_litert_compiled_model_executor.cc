@@ -79,10 +79,35 @@ constexpr absl::string_view kPrefillSignatureRunner = "prefill";
 constexpr absl::string_view kDecodeSignatureRunner = "decode";
 constexpr int kDynamicDimValue = -1;
 
+absl::StatusOr<bool> RequiresFullGpuAcceleration(
+    const LlmExecutorSettings& executor_settings) {
+  if (executor_settings.GetBackend() != Backend::GPU) {
+    return false;
+  }
+  ASSIGN_OR_RETURN(const auto gpu_config,
+                   executor_settings.GetBackendConfig<GpuConfig>());
+  return gpu_config.require_full_acceleration;
+}
+
 absl::Status InitializeEmbeddingLookups(
     litert::Environment& env, ModelResources& resources,
+    const LlmExecutorSettings& executor_settings,
     std::unique_ptr<EmbeddingLookupManager>& embedding_lookup,
     std::unique_ptr<EmbeddingLookupManager>& per_layer_embedding_lookup) {
+#if defined(__ANDROID__)
+  litert::HwAcceleratorSet embedding_accelerators =
+      litert::HwAccelerators::kNpu | litert::HwAccelerators::kCpu;
+#else
+  litert::HwAcceleratorSet embedding_accelerators(
+      litert::HwAccelerators::kCpu);
+#endif
+  ASSIGN_OR_RETURN(const bool require_full_acceleration,
+                   RequiresFullGpuAcceleration(executor_settings));
+  if (require_full_acceleration) {
+    embedding_accelerators =
+        litert::HwAcceleratorSet(litert::HwAccelerators::kGpu);
+  }
+
   absl::flat_hash_map<int, const Model*> end_of_multi_modal_embedding_models;
   {
     auto end_of_audio_model =
@@ -107,7 +132,11 @@ absl::Status InitializeEmbeddingLookups(
     ASSIGN_OR_RETURN(
         embedding_lookup,
         EmbeddingLookupManager::Create(env, *text_embedder_model,
-                                       end_of_multi_modal_embedding_models));
+                                       end_of_multi_modal_embedding_models,
+                                       /*fully_supports_multi_modal=*/true,
+                                       /*signature_key=*/std::nullopt,
+                                       embedding_accelerators,
+                                       require_full_acceleration));
   }
 
   // Create per layer embedding lookups from the resources.
@@ -132,8 +161,34 @@ absl::Status InitializeEmbeddingLookups(
                          env, *per_layer_embedder_model,
                          /*fully_supports_multi_modal=*/false,
                          /*signature_key=*/std::nullopt,
+                         embedding_accelerators,
+                         require_full_acceleration,
                          std::move(per_layer_external_weight_file),
                          std::move(per_layer_external_weight_sections)));
+  }
+  return absl::OkStatus();
+}
+
+absl::Status VerifyRequiredFullAcceleration(
+    CompiledModel& compiled_model,
+    const LlmExecutorSettings& executor_settings,
+    absl::string_view model_description) {
+  ASSIGN_OR_RETURN(const bool require_full_acceleration,
+                   RequiresFullGpuAcceleration(executor_settings));
+  if (!require_full_acceleration) {
+    return absl::OkStatus();
+  }
+
+  auto fully_accelerated = compiled_model.IsFullyAccelerated();
+  if (!fully_accelerated.HasValue()) {
+    return absl::UnavailableError(absl::StrCat(
+        "Could not verify full GPU acceleration for ", model_description,
+        ": ", fully_accelerated.Error().Message()));
+  }
+  if (!fully_accelerated.Value()) {
+    return absl::UnavailableError(absl::StrCat(
+        model_description,
+        " is not fully GPU accelerated; CPU fallback is disabled."));
   }
   return absl::OkStatus();
 }
@@ -1674,12 +1729,23 @@ LlmLiteRtCompiledModelExecutorStatic::Create(
 
   std::unique_ptr<CompiledModel> compiled_model;
   {
+    auto compiled_model_result = CompiledModel::Create(
+        lrt_env, litert_model->Get(), compilation_options);
+    ASSIGN_OR_RETURN(const bool require_full_acceleration,
+                     RequiresFullGpuAcceleration(executor_settings));
+    if (require_full_acceleration && !compiled_model_result.HasValue()) {
+      return absl::UnavailableError(absl::StrCat(
+          "Strict GPU compilation failed for the main prefill/decode model: ",
+          compiled_model_result.Error().Message(),
+          ". CPU fallback is disabled."));
+    }
     LITERT_ASSIGN_OR_RETURN(auto compiled_model_tmp,
-                            CompiledModel::Create(lrt_env, litert_model->Get(),
-                                                  compilation_options));
+                            std::move(compiled_model_result));
     compiled_model =
         std::make_unique<CompiledModel>(std::move(compiled_model_tmp));
   }
+  RETURN_IF_ERROR(VerifyRequiredFullAcceleration(
+      *compiled_model, executor_settings, "the main prefill/decode model"));
   absl::flat_hash_map<absl::string_view, TensorBuffer> decode_input_buffers;
   absl::flat_hash_map<absl::string_view, TensorBuffer> decode_output_buffers;
   absl::flat_hash_map<absl::string_view, TensorBuffer> input_kv_cache_buffers;
@@ -1830,7 +1896,8 @@ LlmLiteRtCompiledModelExecutorStatic::Create(
   std::unique_ptr<EmbeddingLookupManager> embedding_lookup;
   std::unique_ptr<EmbeddingLookupManager> per_layer_embedding_lookup;
   RETURN_IF_ERROR(InitializeEmbeddingLookups(
-      lrt_env, resources, embedding_lookup, per_layer_embedding_lookup));
+      lrt_env, resources, executor_settings, embedding_lookup,
+      per_layer_embedding_lookup));
   std::unique_ptr<LlmLiteRtMtpDrafter> mtp_drafter;
   {
     const auto& advanced_settings = executor_settings.GetAdvancedSettings();
@@ -2094,6 +2161,8 @@ LlmLiteRtCompiledModelExecutorDynamic::Create(
     compiled_model =
         std::make_unique<CompiledModel>(std::move(compiled_model_tmp));
   }
+  RETURN_IF_ERROR(VerifyRequiredFullAcceleration(
+      *compiled_model, executor_settings, "the main dynamic model"));
 
   absl::flat_hash_map<absl::string_view, TensorBuffer> decode_input_buffers;
   absl::flat_hash_map<absl::string_view, TensorBuffer> decode_output_buffers;
@@ -2165,7 +2234,8 @@ LlmLiteRtCompiledModelExecutorDynamic::Create(
   std::unique_ptr<EmbeddingLookupManager> embedding_lookup;
   std::unique_ptr<EmbeddingLookupManager> per_layer_embedding_lookup;
   RETURN_IF_ERROR(InitializeEmbeddingLookups(
-      lrt_env, resources, embedding_lookup, per_layer_embedding_lookup));
+      lrt_env, resources, executor_settings, embedding_lookup,
+      per_layer_embedding_lookup));
   return absl::WrapUnique(new LlmLiteRtCompiledModelExecutorDynamic(
       std::move(executor_settings), lrt_env, litert_model,
       std::move(compiled_model), std::move(decode_input_buffers),

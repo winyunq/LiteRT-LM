@@ -1,3 +1,9 @@
-- 在 litert_lm_wrapper 中深度整合物理 KV 缓存锁显存零拷贝上下文切换架构
-- 自动适配 Session 状态自检，动态导出与灌写 KV cache 字节大包
-- 整理与优化引擎构建生命周期的日志调试防线，白纸黑字呈现底层初始化细节
+- 物理恢复被 git restore 误覆盖的 litert_lm_wrapper.cc 终极 debug 资产与 SEH 崩溃防御沙箱层（SafeExecuteWithSehGuard 与 FilterException）。
+- 还原 LiteRtLm_Config 结构体为含有 bitfields 位域的最初定义版本，完全对齐 Unreal 插件侧结构。
+- 修复 Step 3.3 中 CpuConfig 的拷贝未回写机制，显式调用 SetBackendConfig 写回以使其生效。
+- 修复 Step 3.6 中 AdvancedSettings 覆盖默认值问题，仅在 config 标志为 true 时覆盖，防范 GPU 优化被错误关闭。
+- 补齐 Step 3.4 中 GPU 模式下对 GpuConfig 的显式获取与回写。
+- 补齐 Step 3.7 中 Benchmark 模式下 BenchmarkParams 的显式初始化，消灭 benchmark 时 nullptr optional 解引用崩溃。
+- 重构 SessionConfig 中 Vision/Audio 模态的自动启用判定，对齐官方上游 e475adc5 提交，由底层 ExecutorSettings 状态决定。
+- 完美适配底座 API 变动，彻底删除已废弃的头文件引用及已弃用的 CreateAny 接口。
+- 保留 SessionAdvanced 上的 KV Cache 序列化接口与 ContextHandler 公有访问通道。

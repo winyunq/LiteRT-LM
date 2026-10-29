@@ -1,0 +1,23 @@
+--- tflite/delegates/xnnpack/BUILD
++++ tflite/delegates/xnnpack/BUILD
+@@ -221,7 +221,9 @@ cc_library(
+     name = "xnnpack_delegate",
+     srcs = ["xnnpack_delegate.cc"],
+     hdrs = ["xnnpack_delegate.h"],
+     compatible_with = get_compatible_with_portable(),
+-    copts = tflite_copts() + select({
++    # This target is always a static archive. Suppress TFL_CAPI_EXPORT so its
++    # object does not inject TfLiteXNNPackDelegate* into a final DLL's exports.
++    copts = tflite_copts() + ["-DTFL_STATIC_LIBRARY_BUILD"] + select({
+         ":xnnpack_force_float_precision_explicit_fp16": ["-DXNNPACK_DELEGATE_FORCE_PRECISION_FP16=1"],
+         "//conditions:default": [],
+     }) + select({
+--- litert/c/BUILD
++++ litert/c/BUILD
+@@ -918,5 +918,5 @@
+ filegroup(
+     name = "libLiteRt.so",
+     srcs = SELECT_LITERT_RUNTIME_C_API_SHARED_LIB,
+-    visibility = ["//litert:litert_public"],
++    visibility = ["//visibility:public"],
+ )

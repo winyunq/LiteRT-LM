@@ -1,0 +1,13 @@
+--- build.rs
++++ build.rs
+@@ -88,6 +88,10 @@ fn compile() {
+     let os = env::var("CARGO_CFG_TARGET_OS");
+     let bits = env::var("CARGO_CFG_TARGET_POINTER_WIDTH").unwrap();
+     if let Ok("windows") = os.as_ref().map(String::as_str) {
++        // This crate builds bundled Oniguruma as a static library. Without
++        // ONIG_STATIC its headers emit __declspec(dllexport), leaking every
++        // onig_* symbol from any final Windows DLL that links this archive.
++        cc.define("ONIG_STATIC", Some("1"));
+         fs::copy(src.join(format!("config.h.win{}", bits)), config_h)
+             .expect("Can't copy config.h.win??");
+     } else {

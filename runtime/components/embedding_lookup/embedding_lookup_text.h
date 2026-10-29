@@ -40,7 +40,8 @@
 
 namespace litert::lm {
 
-// Class used for looking up text embeddings on the CPU.
+// Class used for looking up text embeddings with an explicitly selected
+// LiteRT accelerator set.
 //
 // Ideally text embedding lookups should be a part of the main model but there
 // are cases where the embedding lookup needs to be done separately for now. For
@@ -58,6 +59,18 @@ class EmbeddingLookupText : public EmbeddingLookup {
   static absl::StatusOr<std::unique_ptr<EmbeddingLookupText>> Create(
       litert::Environment& env, const litert::Model* absl_nonnull model,
       std::optional<std::string> signature_key = std::nullopt,
+      std::optional<ScopedFile> external_weight_file = std::nullopt,
+      litert::Options::ScopedWeightSectionMap external_weight_sections = {});
+
+  // Creates an embedding lookup with explicit accelerator requirements.
+  // When require_full_acceleration is true, initialization fails unless LiteRT
+  // proves that the complete embedding model is assigned to the requested
+  // accelerator.
+  static absl::StatusOr<std::unique_ptr<EmbeddingLookupText>> Create(
+      litert::Environment& env, const litert::Model* absl_nonnull model,
+      std::optional<std::string> signature_key,
+      litert::HwAcceleratorSet hardware_accelerators,
+      bool require_full_acceleration,
       std::optional<ScopedFile> external_weight_file = std::nullopt,
       litert::Options::ScopedWeightSectionMap external_weight_sections = {});
 
@@ -121,11 +134,15 @@ class EmbeddingLookupText : public EmbeddingLookup {
   EmbeddingLookupText(
       litert::Environment& env, const litert::Model* absl_nonnull model,
       std::optional<std::string> signature_key,
+      litert::HwAcceleratorSet hardware_accelerators,
+      bool require_full_acceleration,
       std::optional<ScopedFile> external_weight_file,
       litert::Options::ScopedWeightSectionMap external_weight_sections)
       : env_(env),
         model_(*model),
         signature_key_(std::move(signature_key)),
+        hardware_accelerators_(hardware_accelerators),
+        require_full_acceleration_(require_full_acceleration),
         external_weight_file_(std::move(external_weight_file)),
         external_weight_sections_(std::move(external_weight_sections)) {}
 
@@ -167,6 +184,8 @@ class EmbeddingLookupText : public EmbeddingLookup {
   // constants have been moved into the LiteRT-LM container.
   std::optional<ScopedFile> external_weight_file_;
   litert::Options::ScopedWeightSectionMap external_weight_sections_;
+  litert::HwAcceleratorSet hardware_accelerators_;
+  bool require_full_acceleration_ = false;
 };
 
 }  // namespace litert::lm

@@ -6,9 +6,7 @@ echo "LiteRT-LM 纯净编译启动 (13900HX + RTX 4060)"
 echo "=========================================="
 
 # 1. 清理
-echo "[1/4] 清理旧环境..."
-bazel shutdown
-if (Test-Path "bin") { Remove-Item -Recurse -Force "bin" -ErrorAction SilentlyContinue }
+echo "[1/4] 准备编译环境..."
 
 # 1.1 系统化集成：处理 SentencePiece 源码 (绕过损坏的 WSL2)
 if (!(Test-Path "libs")) { New-Item -ItemType Directory -Path "libs" }
@@ -61,9 +59,10 @@ if (!(Test-Path "$spDir/WORKSPACE")) {
 
 # 2. 编译
 echo "[2/4] 正在调用 Bazel 编译 (本地依赖覆盖模式 + GPU 优化)..."
-if (!(Test-Path "C:\bzl")) { New-Item -ItemType Directory -Path "C:\bzl" }
+if (!(Test-Path "D:\bzl_a")) { New-Item -ItemType Directory -Path "D:\bzl_a" }
 # 强制指定 Git Bash 短路径，规避路径中包含空格的问题，并屏蔽未安装 of Android SDK 干扰
 $env:BAZEL_SH = "C:/PROGRA~1/Git/bin/bash.exe"
+$env:BAZEL_VC = "C:\Program Files\Microsoft Visual Studio\18\Insiders\VC"
 $env:ANDROID_HOME = $null
 $env:ANDROID_SDK_ROOT = $null
 $env:ANDROID_NDK_HOME = $null
@@ -74,12 +73,14 @@ $env:ANDROID_NDK_HOME = $null
 # --define=litert_link_capi_so=true 链接 C API 共享库
 # --define=resolve_symbols_in_exec=false 解决 GPU 驱动符号解析问题
 $env:CARGO_BAZEL_REPIN="true"
-bazel --output_base=C:\bzl build //runtime/engine:litert_lm_main `
+bazel --output_base=D:\bzl_a build //runtime/engine:litert_lm_main `
     --config=windows `
     --distdir=. `
+    --features=static_link_msvc_runtimes `
     --define=litert_link_capi_so=true `
     --define=resolve_symbols_in_exec=false `
     --repo_env=BAZEL_SH=C:/PROGRA~1/Git/bin/bash.exe `
+    --repo_env=BAZEL_VC="C:\Program Files\Microsoft Visual Studio\18\Insiders\VC" `
     --override_repository=sentencepiece=libs/sentencepiece
 $env:CARGO_BAZEL_REPIN="false"
 

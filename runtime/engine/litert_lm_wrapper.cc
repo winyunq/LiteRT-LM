@@ -8,29 +8,15 @@
 #include <chrono>
 #include <iomanip>
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 
 #ifdef _MSC_VER
 #include <windows.h>
-#pragma comment(linker, "/EXPORT:LiteRtLm_CreateEngine")
-#pragma comment(linker, "/EXPORT:LiteRtLm_DestroyEngine")
-#pragma comment(linker, "/EXPORT:LiteRtLm_AppendUserMessage")
-#pragma comment(linker, "/EXPORT:LiteRtLm_AppendAssistantMessage")
-#pragma comment(linker, "/EXPORT:LiteRtLm_RunInference")
-#pragma comment(linker, "/EXPORT:LiteRtLm_StopMessage")
-#pragma comment(linker, "/EXPORT:LiteRtLm_WaitUntilDone")
-#pragma comment(linker, "/EXPORT:LiteRtLm_GetKVCache")
-#pragma comment(linker, "/EXPORT:LiteRtLm_SetKVCache")
 #endif
 
 inline void LogDebug(const std::string& msg) {
-    try {
-        std::ofstream log_file("D:\\LiteRT-LM\\WinyunqDebug\\litert_lm_wrapper_debug.log", std::ios::app);
-        if (log_file.is_open()) {
-            auto now = std::chrono::system_clock::now();
-            auto time_t_now = std::chrono::system_clock::to_time_t(now);
-            log_file << "[" << std::put_time(std::localtime(&time_t_now), "%Y-%m-%d %H:%M:%S") << "] " << msg << std::endl;
-        }
-    } catch (...) {}
+    std::cout << "[Wrapper] " << msg << std::endl;
 }
 
 #ifdef _MSC_VER
@@ -88,9 +74,10 @@ static bool SafeExecuteWithSehGuard(SafeFunc func, void* arg) {
 #include "runtime/executor/llm_executor_settings.h"
 #include "absl/types/span.h"
 #include "nlohmann/json.hpp"
+#define LITERT_LM_WRAPPER_IMPLEMENTATION
 #include "litert_lm_wrapper.h"
 
-#include "runtime/components/constrained_decoding/llg_constraint_config.h"
+#include "runtime/components/logits_processor/constrained_decoding/llg_constraint_config.h"
 #include "runtime/util/litert_util.h"
 
 using namespace litert::lm;
@@ -100,9 +87,18 @@ using json = nlohmann::json;
  * 内部状态容器，确保 Wrapper 能像 CLI 一样管理全局唯一的对话
  */
 struct LiteRtLm_ConversationContext {
+    // Keep the immutable conversation configuration for the entire Engine
+    // lifetime.  Recreating only Conversation preserves model weights, the
+    // resolved backend and the complete tool preface without retaining any
+    // player's logical history or KV cache.
+    std::unique_ptr<ConversationConfig> conversation_config;
     std::unique_ptr<Conversation> conversation;
     std::string pending_json_msg; // 缓存多模态 JSON 消息
     std::mutex mtx;
+    bool inference_in_flight = false;
+    uint64_t conversation_generation = 1;
+    int loaded_tools_count = 0;
+    std::string resolved_backend;
 
     // 持久化回调字符串缓冲区，彻底消除跨 DLL 异步 lambda 野指针悬空崩溃 (Jun 2026)
     std::string cb_text_buffer;
@@ -119,6 +115,15 @@ extern "C" {
 
 DLL_EXPORT const char* LiteRtLm_GetAvailableBackends() {
     return "cpu,gpu"; 
+}
+
+DLL_EXPORT int LiteRtLm_GetApiVersion() {
+    return 2;
+}
+
+DLL_EXPORT const char* LiteRtLm_GetBuildInfo() {
+    return "LiteRT-LM wrapper API 2; explicit-conversation-reset; "
+           "engine-backend-evidence; tools-preface-persistent; " __DATE__ " " __TIME__;
 }
 
 static Engine* CreateEngineAndConversationInternal(LiteRtLm_Config config, std::string& out_err) {
@@ -247,20 +252,31 @@ static Engine* CreateEngineAndConversationInternal(LiteRtLm_Config config, std::
     builder.SetEnableConstrainedDecoding(false);
     builder.SetConstraintProviderConfig(LlGuidanceConfig());
 
+    int loaded_tools_count = 0;
     if (config.tools_json && strlen(config.tools_json) > 0) {
         try {
             JsonPreface preface;
             preface.tools = nlohmann::ordered_json::parse(config.tools_json);
+            if (!preface.tools.is_array()) {
+                out_err = "tools_json must be a JSON array.";
+                LogDebug("[Trace] Step 5 FAILED: " + out_err);
+                delete engine;
+                return nullptr;
+            }
+            loaded_tools_count = static_cast<int>(preface.tools.size());
             builder.SetPreface(preface);
-            LogDebug("[Trace] Preface tools successfully parsed and set.");
+            LogDebug("[Trace] Preface tools successfully parsed and set. count=" +
+                     std::to_string(loaded_tools_count));
         } catch (const std::exception& e) {
-            LogDebug("[Trace] WARNING - Parse tools_json failed: " + std::string(e.what()));
+            out_err = "Parse tools_json failed: " + std::string(e.what());
+            LogDebug("[Trace] Step 5 FAILED: " + out_err);
+            delete engine;
+            return nullptr;
         }
     }
 
     // 创建默认的会话配置
     auto sess_cfg = SessionConfig::CreateDefault();
-
     if (engine->GetEngineSettings().GetVisionExecutorSettings().has_value()) {
         sess_cfg.SetVisionModalityEnabled(true);
         LogDebug("[Trace] Vision modality detected and enabled in SessionConfig.");
@@ -272,7 +288,7 @@ static Engine* CreateEngineAndConversationInternal(LiteRtLm_Config config, std::
     }
 
     LogDebug("[Trace] Step 6: Building ConversationConfig...");
-    auto conv_cfg_or = builder.SetSessionConfig(sess_cfg).Build(*engine);
+    auto conv_cfg_or = builder.SetSessionConfig(sess_cfg).BuildUnique(*engine);
     if (!conv_cfg_or.ok()) {
         out_err = "Build ConversationConfig failed: " + std::string(conv_cfg_or.status().message());
         LogDebug("[Trace] Step 6 FAILED: " + out_err);
@@ -282,7 +298,7 @@ static Engine* CreateEngineAndConversationInternal(LiteRtLm_Config config, std::
     LogDebug("[Trace] Step 6 SUCCESS: ConversationConfig built.");
 
     LogDebug("[Trace] Step 7: Creating Conversation instance...");
-    auto conv_or = Conversation::Create(*engine, *conv_cfg_or);
+    auto conv_or = Conversation::Create(*engine, **conv_cfg_or);
     if (!conv_or.ok()) {
         out_err = "Conversation::Create failed: " + std::string(conv_or.status().message());
         LogDebug("[Trace] Step 7 FAILED: " + out_err);
@@ -292,8 +308,11 @@ static Engine* CreateEngineAndConversationInternal(LiteRtLm_Config config, std::
     LogDebug("[Trace] Step 7 SUCCESS: Conversation created successfully.");
 
     g_GlobalConversationContext = std::make_unique<LiteRtLm_ConversationContext>();
+    g_GlobalConversationContext->conversation_config = std::move(*conv_cfg_or);
     g_GlobalConversationContext->conversation = std::move(*conv_or);
-
+    g_GlobalConversationContext->loaded_tools_count = loaded_tools_count;
+    g_GlobalConversationContext->resolved_backend = GetBackendString(
+        engine->GetEngineSettings().GetMainExecutorSettings().GetBackend());
     LogDebug("[Trace] CreateEngineAndConversationInternal: Full flow completed SUCCESS.");
     return engine;
 }
@@ -379,7 +398,32 @@ DLL_EXPORT void LiteRtLm_AppendUserMessage(const char* json_msg) {
     auto* ctx = g_GlobalConversationContext.get();
     std::lock_guard<std::mutex> lock(ctx->mtx);
     ctx->pending_json_msg = json_msg;
-    LogDebug("LiteRtLm_AppendUserMessage cached pending JSON: " + std::string(json_msg));
+    LogDebug("LiteRtLm_AppendUserMessage: Prepared pending JSON: " + std::string(json_msg));
+}
+
+DLL_EXPORT void LiteRtLm_AppendHistoryMessage(const char* json_msg) {
+    if (!json_msg) return;
+    try {
+        json msg = json::parse(json_msg);
+        std::lock_guard<std::mutex> global_lock(g_GlobalContextMutex);
+        if (!g_GlobalConversationContext) {
+            LogDebug("LiteRtLm_AppendHistoryMessage: FAILED - No active conversation context.");
+            return;
+        }
+        auto* ctx = g_GlobalConversationContext.get();
+        OptionalArgs args;
+        args.skip_prefill = true;
+        auto status = ctx->conversation->SendMessageAsync(
+            msg, [](absl::StatusOr<Message>) {}, std::move(args));
+        if (!status.ok()) {
+            LogDebug("LiteRtLm_AppendHistoryMessage: FAILED - " +
+                     std::string(status.message()));
+            return;
+        }
+        LogDebug("LiteRtLm_AppendHistoryMessage: Logically appended history message (Async).");
+    } catch (const std::exception& e) {
+        LogDebug("LiteRtLm_AppendHistoryMessage: FAILED to parse history JSON: " + std::string(e.what()));
+    }
 }
 
 DLL_EXPORT void LiteRtLm_AppendAssistantMessage(const char* text) {
@@ -403,6 +447,14 @@ DLL_EXPORT void LiteRtLm_RunInference(LiteRtLm_SamplingParams params, LiteRtLmCa
         return;
     }
     auto* ctx = g_GlobalConversationContext.get();
+
+    if (ctx->inference_in_flight) {
+        LogDebug("LiteRtLm_RunInference: FAILED - Another inference is already active.");
+        LiteRtLm_Result res = {nullptr, nullptr, "Another inference is already active.", 1, 0.0f};
+        callback(res, user_ptr);
+        return;
+    }
+    ctx->inference_in_flight = true;
 
     // 构建触发消息
     json msg_to_send;
@@ -474,16 +526,16 @@ DLL_EXPORT void LiteRtLm_RunInference(LiteRtLm_SamplingParams params, LiteRtLmCa
         if (!chunk.ok()) {
             ctx->cb_error_buffer = chunk.status().message();
             LogDebug("LiteRtLm_RunInference Callback: Status Error - " + ctx->cb_error_buffer);
-            res.error_msg = ctx->cb_error_buffer.c_str(); 
+            res.error_msg = ctx->cb_error_buffer.c_str();
             res.bIsDone = 1;
-            callback(res, user_ptr); 
+            ctx->inference_in_flight = false;
+            callback(res, user_ptr);
             return;
         }
-        
+
         if (chunk->is_null() || chunk->empty()) {
             LogDebug("LiteRtLm_RunInference Callback: Generation Done (empty chunk).");
-            
-            // [绝杀修复] 从全局会话的历史中提取刚完成生成的完美、完整 Message
+
             try {
                 auto history = ctx->conversation->GetHistory();
                 if (!history.empty()) {
@@ -497,42 +549,127 @@ DLL_EXPORT void LiteRtLm_RunInference(LiteRtLm_SamplingParams params, LiteRtLmCa
             }
 
             res.bIsDone = 1;
-            callback(res, user_ptr); 
+            ctx->inference_in_flight = false;
+            callback(res, user_ptr);
             return;
         }
 
         ctx->cb_json_buffer = chunk->dump();
         if (chunk->contains("tool_calls")) {
             res.full_json_chunk = ctx->cb_json_buffer.c_str();
-        } else {
-            res.full_json_chunk = nullptr;
         }
 
         ctx->cb_text_buffer.clear();
         if (chunk->contains("content")) {
-            auto& content = (*chunk)["content"];
-            if (content.is_array()) {
+            const auto& content = (*chunk)["content"];
+            if (content.is_string()) {
+                ctx->cb_text_buffer = content.get<std::string>();
+            } else if (content.is_array()) {
                 for (const auto& part : content) {
-                    if (part.is_object() && part.contains("text")) {
+                    if (part.is_object() && part.contains("text") &&
+                        part["text"].is_string()) {
                         ctx->cb_text_buffer += part["text"].get<std::string>();
                     }
                 }
             }
         }
-        
-        res.text_chunk = ctx->cb_text_buffer.empty() ? nullptr : ctx->cb_text_buffer.c_str();
-        res.bIsDone = 0; 
 
+        res.text_chunk = ctx->cb_text_buffer.empty()
+            ? nullptr : ctx->cb_text_buffer.c_str();
         callback(res, user_ptr);
     };
 
     LogDebug("LiteRtLm_RunInference: Calling SendMessageAsync...");
-    auto status = ctx->conversation->SendMessageAsync(msg_to_send, std::move(internal_cb), std::move(args));
+    auto status = ctx->conversation->SendMessageAsync(
+        msg_to_send, std::move(internal_cb), std::move(args));
     if (!status.ok()) {
-        LogDebug("LiteRtLm_RunInference: SendMessageAsync FAILED: " + std::string(status.message()));
+        ctx->cb_error_buffer = status.message();
+        ctx->inference_in_flight = false;
+        LogDebug("LiteRtLm_RunInference: SendMessageAsync FAILED: " + ctx->cb_error_buffer);
+        LiteRtLm_Result res = {nullptr, nullptr, ctx->cb_error_buffer.c_str(), 1, 0.0f};
+        callback(res, user_ptr);
     } else {
         LogDebug("LiteRtLm_RunInference: SendMessageAsync accepted.");
     }
+}
+
+DLL_EXPORT int LiteRtLm_ResetConversation(void* engine_ptr) {
+    std::lock_guard<std::mutex> global_lock(g_GlobalContextMutex);
+    if (!engine_ptr || engine_ptr != g_ActiveEnginePtr) {
+        LogDebug("LiteRtLm_ResetConversation: FAILED - Invalid or inactive engine handle.");
+        return -1;
+    }
+    if (!g_GlobalConversationContext ||
+        !g_GlobalConversationContext->conversation_config) {
+        LogDebug("LiteRtLm_ResetConversation: FAILED - Missing conversation context/config.");
+        return -2;
+    }
+
+    auto* ctx = g_GlobalConversationContext.get();
+    std::lock_guard<std::mutex> lock(ctx->mtx);
+    if (ctx->inference_in_flight) {
+        LogDebug("LiteRtLm_ResetConversation: FAILED - Inference is still active.");
+        return -3;
+    }
+
+    Engine& engine = *static_cast<Engine*>(engine_ptr);
+    ctx->conversation.reset();
+    auto conv_or = Conversation::Create(engine, *ctx->conversation_config);
+    if (!conv_or.ok()) {
+        LogDebug("LiteRtLm_ResetConversation: FAILED - Conversation::Create: " +
+                 std::string(conv_or.status().message()));
+        return -4;
+    }
+
+    ctx->conversation = std::move(*conv_or);
+    ctx->pending_json_msg.clear();
+    ctx->cb_text_buffer.clear();
+    ctx->cb_json_buffer.clear();
+    ctx->cb_error_buffer.clear();
+    ++ctx->conversation_generation;
+    LogDebug("LiteRtLm_ResetConversation: SUCCESS - generation=" +
+             std::to_string(ctx->conversation_generation) +
+             ", engine preserved, tools=" +
+             std::to_string(ctx->loaded_tools_count));
+    return 0;
+}
+
+DLL_EXPORT long long LiteRtLm_GetConversationHistorySize(void* engine_ptr) {
+    std::lock_guard<std::mutex> global_lock(g_GlobalContextMutex);
+    if (!engine_ptr || engine_ptr != g_ActiveEnginePtr ||
+        !g_GlobalConversationContext || !g_GlobalConversationContext->conversation) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(g_GlobalConversationContext->mtx);
+    return static_cast<long long>(
+        g_GlobalConversationContext->conversation->GetHistory().size());
+}
+
+DLL_EXPORT uint64_t LiteRtLm_GetConversationGeneration(void* engine_ptr) {
+    std::lock_guard<std::mutex> global_lock(g_GlobalContextMutex);
+    if (!engine_ptr || engine_ptr != g_ActiveEnginePtr ||
+        !g_GlobalConversationContext) {
+        return 0;
+    }
+    return g_GlobalConversationContext->conversation_generation;
+}
+
+DLL_EXPORT const char* LiteRtLm_GetResolvedBackend(void* engine_ptr) {
+    std::lock_guard<std::mutex> global_lock(g_GlobalContextMutex);
+    if (!engine_ptr || engine_ptr != g_ActiveEnginePtr ||
+        !g_GlobalConversationContext) {
+        return nullptr;
+    }
+    return g_GlobalConversationContext->resolved_backend.c_str();
+}
+
+DLL_EXPORT int LiteRtLm_GetLoadedToolsCount(void* engine_ptr) {
+    std::lock_guard<std::mutex> global_lock(g_GlobalContextMutex);
+    if (!engine_ptr || engine_ptr != g_ActiveEnginePtr ||
+        !g_GlobalConversationContext) {
+        return -1;
+    }
+    return g_GlobalConversationContext->loaded_tools_count;
 }
 
 DLL_EXPORT void LiteRtLm_StopMessage() {
@@ -612,26 +749,49 @@ DLL_EXPORT int LiteRtLm_SetKVCache(const void* data_ptr, size_t size) {
         return -3;
     }
 
-    // A. 擦除/重置逻辑
-    if (!data_ptr && size == 0) {
-        auto status = session->SetKVCache("");
+    // A. 物理恢复逻辑 (data_ptr != nullptr)
+    if (data_ptr) {
+        absl::string_view cache_data(static_cast<const char*>(data_ptr), size);
+        auto status = session->SetKVCache(cache_data);
         if (!status.ok()) {
-            LogDebug("LiteRtLm_SetKVCache: Reset active KV cache FAILED: " + std::string(status.message()));
-            return -5;
+            LogDebug("LiteRtLm_SetKVCache: FAILED - SetKVCache failed: " + std::string(status.message()));
+            return -6;
         }
-        LogDebug("LiteRtLm_SetKVCache: Successfully reset and cleared active KV cache.");
+        LogDebug("LiteRtLm_SetKVCache: Successfully restored physical KV cache into GPU memory.");
         return 0;
     }
 
-    // B. 灌入逻辑
-    absl::string_view cache_data(static_cast<const char*>(data_ptr), size);
-    auto status = session->SetKVCache(cache_data);
-    if (!status.ok()) {
-        LogDebug("LiteRtLm_SetKVCache: FAILED - SetKVCache failed: " + std::string(status.message()));
-        return -6;
+    // B. 批量预填充逻辑 (data_ptr == nullptr && size == 0)
+    // 当显存快照不存在时，通过此接口一键将之前所有 Append 的逻辑历史转化为物理 KV Cache
+    LogDebug("LiteRtLm_SetKVCache: data_ptr is NULL, initiating bulk prefill for logical history...");
+
+    auto history = g_GlobalConversationContext->conversation->GetHistory();
+    if (history.empty()) {
+        LogDebug("LiteRtLm_SetKVCache: History is empty, nothing to prefill.");
+        return 0;
     }
 
-    LogDebug("LiteRtLm_SetKVCache: Successfully restored physical KV cache into GPU memory.");
+    // 0.13.0 API: 获取所有历史消息对应的输入向量
+    // [CRITICAL] include_preface 必须与 config_.prefill_preface_on_init() 相反，以防双重 Prefill 导致 Position 偏移！
+    bool already_has_preface = g_GlobalConversationContext->conversation->GetConfig().prefill_preface_on_init();
+    LogDebug("LiteRtLm_SetKVCache: Building bulk prefill vector for " + std::to_string(history.size()) + " messages (include_preface=" + (already_has_preface ? "false" : "true") + ")");
+
+    auto input_data_or = g_GlobalConversationContext->conversation->GetInputDataVectorForMessages(
+        {}, history, {}, /*include_preface=*/!already_has_preface);
+
+    if (!input_data_or.ok()) {
+        LogDebug("LiteRtLm_SetKVCache: FAILED - GetInputDataVectorForMessages failed: " + std::string(input_data_or.status().message()));
+        return -8;
+    }
+
+    // 执行物理预填充
+    auto status = session->RunPrefill(input_data_or.value());
+    if (!status.ok()) {
+        LogDebug("LiteRtLm_SetKVCache: FAILED - RunPrefill failed: " + std::string(status.message()));
+        return -9;
+    }
+
+    LogDebug("LiteRtLm_SetKVCache: Bulk prefill completed successfully. KV Cache is now synchronized.");
     return 0;
 }
 

@@ -30,7 +30,7 @@ namespace litert::lm {
 namespace {
 
 TEST(SamplerFactoryFailedDlopenTest,
-     CreateSamplerForGpuFallsBackToCpuIfUnavailable) {
+     CreateSamplerForGpuNeverFallsBackToCpuIfUnavailable) {
   LITERT_ASSERT_OK_AND_ASSIGN(auto litert_env,
                                litert::Environment::Create({}));
 
@@ -45,11 +45,27 @@ TEST(SamplerFactoryFailedDlopenTest,
                     litert_env.Get(), /*sequence_size=*/1, /*vocab_size=*/201,
                     /*activation_data_type=*/std::nullopt);
 
-  // Should fall back to CPU sampler.
-  ASSERT_OK(result);
-  auto sampler = std::move(result.value());
-  TopPSampler* top_p_sampler = dynamic_cast<TopPSampler*>(sampler.get());
-  EXPECT_NE(top_p_sampler, nullptr);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.status().code(), absl::StatusCode::kUnavailable);
+  EXPECT_THAT(result.status().message(),
+              testing::HasSubstr("CPU fallback is disabled"));
+}
+
+TEST(SamplerFactoryFailedDlopenTest,
+     CreateSamplerForExplicitCpuStillWorksWhenGpuLibraryIsUnavailable) {
+  proto::SamplerParameters sampler_params;
+  sampler_params.set_k(1);
+  sampler_params.set_p(0.0);
+  sampler_params.set_temperature(1.0);
+  sampler_params.set_seed(12345);
+  sampler_params.set_type(proto::SamplerParameters::TOP_P);
+
+  LITERT_ASSERT_OK_AND_ASSIGN(
+      auto sampler,
+      CreateSampler(Backend::CPU, /*batch_size=*/1,
+                    std::move(sampler_params), /*env=*/nullptr,
+                    /*sequence_size=*/1));
+  EXPECT_NE(dynamic_cast<TopPSampler*>(sampler.get()), nullptr);
 }
 
 }  // namespace

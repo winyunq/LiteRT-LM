@@ -52,6 +52,8 @@ std::ostream& operator<<(std::ostream& os, const GpuArtisanConfig& config) {
 
 std::ostream& operator<<(std::ostream& os, const GpuConfig& config) {
   os << "max_top_k: " << config.max_top_k << "\n";
+  os << "require_full_acceleration: "
+     << config.require_full_acceleration << "\n";
   return os;
 }
 

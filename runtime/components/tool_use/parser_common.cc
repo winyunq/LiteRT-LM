@@ -18,6 +18,8 @@
 #include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "runtime/components/tool_use/rust/parsers.rs.h"
 
+#include <string>
+
 namespace litert::lm {
 
 nlohmann::ordered_json ConvertJsonValue(const JsonValue& json_value) {
@@ -39,7 +41,7 @@ nlohmann::ordered_json ConvertJsonValue(const JsonValue& json_value) {
     nlohmann::ordered_json object = nlohmann::ordered_json::object();
     for (const auto& key : json_value.object_keys()) {
       absl::string_view key_str(key.data(), key.size());
-      object[key_str] = ConvertJsonValue(*json_value.object_get(key));
+      object[std::string(key_str)] = ConvertJsonValue(*json_value.object_get(key));
     }
     return object;
   }

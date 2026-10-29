@@ -1,0 +1,3 @@
+LIBRARY litert_lm_native_bridge
+EXPORTS
+  LiteRtLm_GetApi

@@ -30,6 +30,14 @@ exports_files([
     "engine.h",
 ])
 
+# Declarations-only target for consumers that dynamically load the official C
+# API.  It deliberately does not pull the LiteRT-LM implementation into the
+# consumer, so a thin extension DLL can sit beside the official prebuilt core.
+cc_library(
+    name = "engine_api_headers",
+    hdrs = ["engine.h"],
+)
+
 ENGINE_COMMON_DEPS = [
     "@com_google_absl//absl/base:core_headers",
     "@com_google_absl//absl/base:log_severity",

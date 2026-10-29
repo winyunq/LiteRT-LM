@@ -45,8 +45,12 @@ cc_library(
         exclude = [
             "src/*_test.cc",
             "src/*_main.cc",
+            "src/*_model_trainer.cc",
+            "src/pretokenizer_for_training.cc",
             "src/sentencepiece_trainer.cc",
             "src/trainer_interface.cc",
+            "src/trainer_factory.cc",
+            "src/testharness.cc",
             "src/builder.cc",
             "src/error.cc",
         ],
@@ -55,12 +59,22 @@ cc_library(
     copts = [
         "-DENABLE_NFKC_COMPILE",
         "-DSENTENCEPIECE_PG3_BUILD",
-        "/I$(GENDIR)/external/com_google_absl",
-        "/Iexternal/com_google_absl",
-        "/Iexternal/com_google_protobuf/src",
-        "/I$(GENDIR)/external/com_google_protobuf/src",
-        "/Iexternal/darts_clone",
-    ],
+    ] + select({
+        "@platforms//os:windows": [
+            "/I$(GENDIR)/external/com_google_absl",
+            "/Iexternal/com_google_absl",
+            "/Iexternal/com_google_protobuf/src",
+            "/I$(GENDIR)/external/com_google_protobuf/src",
+            "/Iexternal/darts_clone",
+        ],
+        "//conditions:default": [
+            "-I$(GENDIR)/external/com_google_absl",
+            "-Iexternal/com_google_absl",
+            "-Iexternal/com_google_protobuf/src",
+            "-I$(GENDIR)/external/com_google_protobuf/src",
+            "-Iexternal/darts_clone",
+        ],
+    }),
     includes = ["src", "."],
     deps = [
         ":sentencepiece_cc_proto",

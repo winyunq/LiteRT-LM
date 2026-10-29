@@ -93,7 +93,7 @@ absl::StatusOr<std::string> FormatToolResponse(
     return FormatValueAsPython(tool_response);
   }
 
-  return FormatValueAsPython(tool_response[tool_response_key]);
+  return FormatValueAsPython(tool_response[std::string(tool_response_key)]);
 }
 
 }  // namespace

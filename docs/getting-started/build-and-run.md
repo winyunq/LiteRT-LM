@@ -119,7 +119,7 @@ Building on Windows requires several prerequisites to be installed first.
 5.  **Java** - Install from https://www.oracle.com/java/technologies/downloads/
     and set JAVA_HOME to point at the jdk directory.
 6.  **Enable long path** Make sure the LongPathsEnabled is true in the Registry.
-    If needed, use `bazelisk --output_base=C:\bzl` to shorten the output path
+    If needed, use `bazelisk --output_base=D:\bzl_a` to shorten the output path
     further. Otherwise, compilation errors related to file permission could
     happen.
 7.  Download the `.litertlm` model from the

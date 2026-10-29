@@ -318,6 +318,11 @@ crates_repository(
                 ],
             ),
         ],
+        "onig_sys": [
+            crate.annotation(
+                patches = ["@//:PATCH.onig_sys_static"],
+            ),
+        ],
         "toktrie": [
             crate.annotation(
                 patches = ["@//:PATCH.toktrie"],
@@ -394,6 +399,7 @@ http_archive(
         # Replace @stblib with @stb://stblib in support/*/BUILD files.
         "sed -i -e 's|\"@stblib\"|\"@stb//:stblib\"|g' support/*/BUILD",
     ],
+    patches = ["@//:PATCH.litert_wrapper_exports"],
     sha256 = LITERT_SHA256,
     strip_prefix = "LiteRT-" + LITERT_REF,
     url = "https://github.com/google-ai-edge/LiteRT/archive/" + LITERT_REF + ".tar.gz",
@@ -474,8 +480,6 @@ http_archive(
 load("@rules_android_ndk//:rules.bzl", "android_ndk_repository")
 
 android_ndk_repository(name = "androidndk")
-
-android_sdk_repository(name = "androidsdk")
 
 # Configure Android NDK only when ANDROID_NDK_HOME is set.
 # Creates current_android_ndk_env.bzl as a workaround since shell environment is available only

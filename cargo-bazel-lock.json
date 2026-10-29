@@ -1,5 +1,5 @@
 {
-  "checksum": "20049f10a79f00181a9539fea0856272132a35998d3a9b121911c98310f8fe8a",
+  "checksum": "3404088fcbe929605888c9202e7950f840dfcf9b651c7c74e7d0f502f98abe64",
   "crates": {
     "ahash 0.8.12": {
       "name": "ahash",
@@ -4573,7 +4573,10 @@
       "repository": {
         "Http": {
           "url": "https://static.crates.io/crates/onig_sys/69.9.1/download",
-          "sha256": "c7f86c6eef3d6df15f23bcfb6af487cbd2fed4e5581d58d5bf1f5f8b7f6727dc"
+          "sha256": "c7f86c6eef3d6df15f23bcfb6af487cbd2fed4e5581d58d5bf1f5f8b7f6727dc",
+          "patches": [
+            "@//:PATCH.onig_sys_static"
+          ]
         }
       },
       "targets": [

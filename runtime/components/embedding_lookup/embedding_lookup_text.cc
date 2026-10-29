@@ -61,9 +61,12 @@ absl::Status EmbeddingLookupText::LookupInternal(int token,
   }
 
   // The input tensor size was verified when the model was loaded.
-  input_buffers_[0].Write(absl::MakeSpan(const_cast<const int*>(&token), 1));
+  const int token_value = token;
+  LITERT_RETURN_IF_ERROR(
+      input_buffers_[0].Write(absl::MakeSpan(&token_value, 1)));
 
-  compiled_model_->Run(signature_key_.value(), input_buffers_, output_buffers_);
+  LITERT_RETURN_IF_ERROR(compiled_model_->Run(
+      signature_key_.value(), input_buffers_, output_buffers_));
 
   LITERT_ASSIGN_OR_RETURN(auto output_buffer_size, output_buffers_[0].Size());
 
@@ -75,7 +78,7 @@ absl::Status EmbeddingLookupText::LookupInternal(int token,
   }
 
   // Copy the output buffer to the requested buffer.
-  output_buffers_[0].Read(buffer);
+  LITERT_RETURN_IF_ERROR(output_buffers_[0].Read(buffer));
 
   return absl::OkStatus();
 }
@@ -249,37 +252,84 @@ EmbeddingLookupText::Create(
     std::optional<std::string> signature_key,
     std::optional<ScopedFile> external_weight_file,
     litert::Options::ScopedWeightSectionMap external_weight_sections) {
-  auto handler = std::unique_ptr<EmbeddingLookupText>(new EmbeddingLookupText(
-      env, model, std::move(signature_key), std::move(external_weight_file),
-      std::move(external_weight_sections)));
+#if defined(__ANDROID__)
+  litert::HwAcceleratorSet default_accelerators =
+      litert::HwAccelerators::kNpu | litert::HwAccelerators::kCpu;
+#else
+  litert::HwAcceleratorSet default_accelerators(
+      litert::HwAccelerators::kCpu);
+#endif
+  return Create(env, model, std::move(signature_key), default_accelerators,
+                /*require_full_acceleration=*/false,
+                std::move(external_weight_file),
+                std::move(external_weight_sections));
+}
+
+absl::StatusOr<std::unique_ptr<EmbeddingLookupText>>
+EmbeddingLookupText::Create(
+    litert::Environment& env, const litert::Model* absl_nonnull model,
+    std::optional<std::string> signature_key,
+    litert::HwAcceleratorSet hardware_accelerators,
+    bool require_full_acceleration,
+    std::optional<ScopedFile> external_weight_file,
+    litert::Options::ScopedWeightSectionMap external_weight_sections) {
+  auto handler = std::unique_ptr<EmbeddingLookupText>(
+      new EmbeddingLookupText(env, model, std::move(signature_key),
+                              hardware_accelerators,
+                              require_full_acceleration,
+                              std::move(external_weight_file),
+                              std::move(external_weight_sections)));
   RETURN_IF_ERROR(handler->Initialize());
   return handler;
 }
 
 absl::Status EmbeddingLookupText::Initialize() {
   LITERT_ASSIGN_OR_RETURN(auto options, Options::Create());
-#if defined(__ANDROID__)
-  options.SetHardwareAccelerators(litert::HwAccelerators::kNpu |
-                                  litert::HwAccelerators::kCpu);
-#else
-  options.SetHardwareAccelerators(litert::HwAccelerators::kCpu);
-#endif
+  LITERT_RETURN_IF_ERROR(
+      options.SetHardwareAccelerators(hardware_accelerators_));
   if (external_weight_file_.has_value() && !external_weight_sections_.empty()) {
     LITERT_RETURN_IF_ERROR(options.SetExternalWeightScopedFile(
         *external_weight_file_, std::move(external_weight_sections_)));
   }
 #if defined(__ANDROID__)
-  LITERT_ASSIGN_OR_RETURN(::litert::qualcomm::QualcommOptions & qnn_opts,
-                          options.GetQualcommOptions());
-  qnn_opts.SetLogLevel(::litert::qualcomm::QualcommOptions::LogLevel::kOff);
-  qnn_opts.SetHtpPerformanceMode(
-      ::litert::qualcomm::QualcommOptions::HtpPerformanceMode::
-          kSustainedHighPerformance);
+  if ((hardware_accelerators_ & litert::HwAccelerators::kNpu) != 0) {
+    LITERT_ASSIGN_OR_RETURN(::litert::qualcomm::QualcommOptions & qnn_opts,
+                            options.GetQualcommOptions());
+    qnn_opts.SetLogLevel(::litert::qualcomm::QualcommOptions::LogLevel::kOff);
+    qnn_opts.SetHtpPerformanceMode(
+        ::litert::qualcomm::QualcommOptions::HtpPerformanceMode::
+            kSustainedHighPerformance);
+  }
 #endif
 
-  LITERT_ASSIGN_OR_RETURN(compiled_model_, litert::CompiledModel::Create(
-                                               env_, model_.Get(), options));
+  auto compiled_model_result =
+      litert::CompiledModel::Create(env_, model_.Get(), options);
+  if (require_full_acceleration_ && !compiled_model_result.HasValue()) {
+    return absl::UnavailableError(absl::StrCat(
+        "Strict GPU compilation failed for the text embedding model: ",
+        compiled_model_result.Error().Message(),
+        ". CPU fallback is disabled."));
+  }
+  LITERT_ASSIGN_OR_RETURN(compiled_model_, std::move(compiled_model_result));
+  if (require_full_acceleration_) {
+    auto fully_accelerated = compiled_model_->IsFullyAccelerated();
+    if (!fully_accelerated.HasValue()) {
+      return absl::UnavailableError(absl::StrCat(
+          "Could not verify full acceleration for the text embedding model: ",
+          fully_accelerated.Error().Message()));
+    }
+    if (!fully_accelerated.Value()) {
+      return absl::UnavailableError(
+          "The text embedding model is not fully accelerated by the "
+          "requested backend; CPU fallback is disabled.");
+    }
+  }
   LITERT_ASSIGN_OR_RETURN(auto signatures, model_.GetSignatures());
+
+  if (signatures.empty()) {
+    return absl::InvalidArgumentError(
+        "The Embedding model must expose at least one signature.");
+  }
 
   if (signature_key_.has_value()) {
     bool found = false;
@@ -311,13 +361,13 @@ absl::Status EmbeddingLookupText::Initialize() {
   LITERT_ASSIGN_OR_RETURN(input_buffers_, compiled_model_->CreateInputBuffers(
                                               signature_key_.value()));
 
-  LITERT_ASSIGN_OR_RETURN(auto input_buffer_size, input_buffers_[0].Size());
-
   if (input_buffers_.size() != 1) {
     return absl::InvalidArgumentError(absl::StrCat(
         "The Embedding model must have exactly one input tensor but got ",
         input_buffers_.size()));
   }
+
+  LITERT_ASSIGN_OR_RETURN(auto input_buffer_size, input_buffers_[0].Size());
 
   if (input_buffer_size != 4) {
     return absl::InvalidArgumentError(absl::StrCat(
@@ -326,14 +376,15 @@ absl::Status EmbeddingLookupText::Initialize() {
 
   LITERT_ASSIGN_OR_RETURN(output_buffers_, compiled_model_->CreateOutputBuffers(
                                                signature_key_.value()));
-  LITERT_ASSIGN_OR_RETURN(output_buffer_type_, output_buffers_[0].TensorType());
-  const auto& output_buffer_layout = output_buffer_type_.value().Layout();
 
   if (output_buffers_.size() != 1) {
     return absl::InvalidArgumentError(absl::StrCat(
         "The Embedding model must have exactly one output tensor but got ",
         output_buffers_.size()));
   }
+
+  LITERT_ASSIGN_OR_RETURN(output_buffer_type_, output_buffers_[0].TensorType());
+  const auto& output_buffer_layout = output_buffer_type_.value().Layout();
 
   if (output_buffer_type_.value().ElementType() !=
       litert::ElementType::Float32) {

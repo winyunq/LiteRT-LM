@@ -422,6 +422,11 @@ struct OptionalArgs {
   //   {.has_pending_message = false}));
   bool has_pending_message = false;
 
+  // Winyunq: 是否跳过物理预填充 (Prefill) 阶段。
+  // 如果为 true，SendMessage 将仅更新逻辑历史记录 (history_)，而不触发任何 GPU/CPU 计算。
+  // 这对于在物理 KV 缓存恢复前同步逻辑状态非常有用。
+  bool skip_prefill = false;
+
   // The constraint to be used for constrained decoding.
   std::optional<ConstraintArg> decoding_constraint = std::nullopt;
 
@@ -640,6 +645,14 @@ class Conversation {
 
   // Internal compatibility escape hatch used by the legacy wrapper's KV
   // cache migration helpers. New callers should keep state in Conversation.
+
+  // Returns the input data vector for the given messages.
+  absl::StatusOr<std::vector<InputData>> GetInputDataVectorForMessages(
+      absl::Span<const Message> old_messages,
+      absl::Span<const Message> new_messages,
+      const OptionalArgs& optional_args = OptionalArgs(),
+      bool include_preface = true);
+
   Engine::Session* GetSession() const { return session_.get(); }
 
   // Renders the preface into a string for testing and logging purposes.
@@ -704,8 +717,6 @@ class Conversation {
       const OptionalArgs& optional_args = OptionalArgs(),
       bool include_preface = true);
 
-  // Returns the input data vector for the given messages.
-  //
   // Gets the prefill text for `new_messages` and converts it to an input data
   // vector for `Session::RunPrefill`.
   //
@@ -715,11 +726,6 @@ class Conversation {
   // - `optional_args`: The optional arguments for template rendering.
   // - `include_preface`: Include the preface in the returned input data vector
   //   when `old_messages` is empty.
-  absl::StatusOr<std::vector<InputData>> GetInputDataVectorForMessages(
-      absl::Span<const Message> old_messages,
-      absl::Span<const Message> new_messages,
-      const OptionalArgs& optional_args = OptionalArgs(),
-      bool include_preface = true);
 
   // Rewinds the session to the checkpoint after the most recent channel content
   // and return the input data vector for all messages from that point onward.

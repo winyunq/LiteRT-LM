@@ -29,12 +29,14 @@ extern "C" {
 // _WIN32 is defined as 1 when the compilation target is 32-bit ARM, 64-bit ARM,
 // x86, x64, or ARM64EC. Otherwise, undefined.
 // https://learn.microsoft.com/en-us/cpp/preprocessor/predefined-macros
+#ifndef LITERT_LM_C_API_EXPORT
 #if defined(_WIN32)
 #define LITERT_LM_C_API_EXPORT __declspec(dllexport)
 #else
 // Ensure symbols are exported when building the shared library with
 // -fvisibility=hidden.
 #define LITERT_LM_C_API_EXPORT __attribute__((visibility("default")))
+#endif
 #endif
 
 // Opaque pointer for the LiteRT LM Engine.
