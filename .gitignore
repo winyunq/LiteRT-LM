@@ -6,3 +6,6 @@
 /js/packages/core/wasm/
 /js/packages/core/spec_dist/
 node_modules/
+
+/LiteRT-576fe2d1143545253358d237c462dab5fc427de9/
+/sentencepiece-0.2.0/src/
