@@ -309,6 +309,7 @@ cc_binary(
         "litert_lm.hpp",
         "litert_lm_wrapper.cc",
         "litert_lm_wrapper.h",
+        "litert_lm_build_info.h",
     ],
     linkshared = 1,
     linkopts = select({

@@ -1,0 +1,33 @@
+name: Sync Google release tags
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Optional Google release tag to prepare explicitly'
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-google-releases
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GIT_LFS_SKIP_SMUDGE: '1'
+      UPSTREAM_TAG_INPUT: ${{ inputs.upstream_tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Mirror tags and prepare versioned fork sources
+        shell: pwsh
+        run: ./.github/scripts/Sync-UpstreamRelease.ps1 -UpstreamTag $env:UPSTREAM_TAG_INPUT

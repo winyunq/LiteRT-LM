@@ -121,8 +121,10 @@ DLL_EXPORT int LiteRtLm_GetApiVersion() {
     return 2;
 }
 
+#include "runtime/engine/litert_lm_build_info.h"
+
 DLL_EXPORT const char* LiteRtLm_GetBuildInfo() {
-    return "LiteRT-LM 0.19.0-dev.1; wrapper API 2; upstream 2c1c9a67; explicit-conversation-reset; "
+    return "LiteRT-LM " LITERT_LM_WRAPPER_VERSION "; wrapper API 2; upstream " LITERT_LM_UPSTREAM_REVISION "; explicit-conversation-reset; "
            "engine-backend-evidence; tools-preface-persistent; " __DATE__ " " __TIME__;
 }
 
