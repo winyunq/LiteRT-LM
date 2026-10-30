@@ -1,61 +1,72 @@
-# LiteRT-LM fork 与 pack 梳理
+# LiteRT-LM fork：哪些补丁已经可以退出
 
-对照 Google `2c1c9a67cbd3a12e20fdf1d750855e6afd5649c4`。该提交属于 0.19 开发主线；正式发布仍以 Google release tag 为基线。
+对照已同步的 Google 提交 `2c1c9a67cbd3a12e20fdf1d750855e6afd5649c4`（0.19 开发主线）。正式版本仍使用对应的 Google release tag；本次结论不能直接当成较早 tag 的能力清单。
 
-## 用户接口顺序
+## 结论
 
-1. FastStart One：最少节点完成单人对话，保持稳定。
-2. FastStart Multi：仅增加名字索引，保持稳定。
-4. Google 原生 C/C++ API：需要完整能力时直接使用官方接口，版本与官方 SDK 对齐。
-3. 扩展 pack：官方能力不能满足用户需求时增加补丁和封装，随上游版本调整，不承诺接口稳定。
-5. 全局设置：选择本地模型或在线 API，是独立的设置入口。
+目前所需的加载、释放、对话、多会话、克隆、回退、工具声明、分词，官方已经提供接口。这些功能不再构成修改上游核心文件的理由。
 
-## 当前 fork 的实际差异
+先前按“严格 GPU 补丁、KV 补丁”分类保留的方式不合适。应先使用官方能力删除重复实现，剩余确有需求的差异才进入 pack。补丁存在，本身不是保留它的理由。
 
-在 runtime、c、构建配置和上游文档范围内，直接修改了 33 个原有文件，其中 runtime 有 27 个。
-此外还有自定义源码、构建脚本、调试产物，以及 Python 原功能的删除。
+## 功能对照
 
-| 部分 | 当前内容 | 收拢方向 |
+| 原先自己补的能力 | 当前官方能力 | 处理结论 |
 | --- | --- | --- |
-| 官方原生功能 | `c/engine.h` 已提供 engine create/delete；conversation create/delete/cancel、tools 设置也已存在 | 加载、释放、会话生命周期、工具声明直接使用官方接口，不再各维护一套核心实现 |
-| 自研 API 层 | `litert_lm_api.cc/.h` 与 `litert_lm.hpp`，合计约 5,500 行 | 把直接转发官方能力的部分与真正扩展分开，扩展留在 pack |
-| 另一套原生桥 | `litert_lm_native_bridge.cc` 约 2,600 行；`litert_lm_native.hpp` 约 730 行 | 与上层自研 API 存在两条封装路线；这轮构建没有使用 native_bridge，保留它并不能减少维护成本 |
-| 旧 wrapper | `litert_lm_wrapper.cc/.h`，另有 Gemini 原始副本 | 迁移完成后移除旧路线及备份副本，保留历史版本用于回溯 |
-| 严格 GPU 行为 | 修改 embedding lookup、sampler、executor、settings 等多个上游文件 | 单独列为 GPU 核心补丁；与普通模型调用分开，不能仅搬目录便视作纯外挂 |
-| KV 导入导出 | `SessionAdvanced`、`SessionInterface`、Conversation 的 session 访问与 skip_prefill | 单独列为 KV 核心补丁，按真实需求维护，不扩散到所有用户入口 |
-| Windows 构建兼容 | JSON string_view 转换、onig 静态 CRT、LiteRT 导出/构建设置 | 集中到有版本记录的构建补丁 |
-| 无关漂移 | Python 示例、CLI 帮助/环境管理、eval 文件被删除；主 CLI 也被修改 | 恢复 Google 原文件，让用户仍能直接使用原功能 |
-| 调试与本机文件 | `WinyunqDebug` 中约 61,000 行日志、exe/obj、Gemini 测试脚本；`.bazelrc` 写死 `D:/bzl_u` | 退出发布源码主线；本机路径留在本机配置或构建参数 |
-| 自动同步 | 当前脚本把“整个 fork 对 Google 的 diff”应用到新 tag | 收拢后改为仅携带 pack 和明确列出的补丁，避免继续回放历史杂项 |
+| 模型加载、释放 | `litert_lm_engine_create` / `litert_lm_engine_delete` | 直接使用官方生命周期；UE 负责何时加载、释放，不改引擎内部 |
+| 对话创建、释放、流式生成、取消 | `litert_lm_conversation_create` / `delete` / `send_message_stream` / `cancel_process` | FastStart 建在这些接口上；官方取消后会话不可复用，重建逻辑放在插件管理层 |
+| 多个角色或命名对话 | 一个 engine 创建多个 conversation；官方维护各自会话状态 | 名字索引属于 UE 管理功能，不需要 KV 核心补丁 |
+| 对话分支、复用已有上下文 | `litert_lm_conversation_clone`、`litert_lm_session_clone` | 使用官方 clone，复制预填充状态，不另做一套会话复制 |
+| 会话回退 | Session 的 `save_checkpoint`、`rewind_to_checkpoint`、`rewind_to_step` | 使用官方 session 接口；这是 Session 能力，不能冒充 Conversation 的 JSON 历史回退接口 |
+| 分词、反分词 | `litert_lm_engine_tokenize` / `litert_lm_engine_detokenize` | 删除重复实现，只保留需要的 UE 参数转换 |
+| 工具声明和模型输出工具调用 | `litert_lm_conversation_config_set_tools` 与官方消息格式 | 原生工具能力直接复用；MCP 连接、服务选择和调用路由留在插件扩展层 |
+| 追加输入而暂不生成 | C++ `OptionalArgs.has_pending_message`：执行 prefill、跳过 decode | 已有官方路径；不需要为此修改 Conversation。它不等于旧补丁的“连 prefill 也跳过” |
+| 兼容旧 GPU sampler 缺少符号 | 当前 `top_k_webgpu_sampler.h/.cc` 已导出、实现 `UpdateConfig`、`CanHandleInput`、`HandlesInput`、`SetInferenceFuncAndInputTensors` | 同版本源码构建不需要这套旧 DLL 兼容逻辑；恢复官方加载行为 |
 
-MCP 服务切换和路由属于插件的扩展管理能力。工具声明已有官方入口。
-模型创建与释放也已有官方入口。它们需要用户接口和生命周期管理，不因此要求复制 Google 的整套实现。
+MCP 服务热切换不等于官方已经提供任意修改运行中会话工具表的接口。当前 C 接口的工具入口作用于 conversation config；服务连接与路由由 pack/插件管理，需要更换工具声明时使用官方配置和会话生命周期。
 
-当前 UE 运行层统一通过自研 `LiteRtLm_GetApi` 边界接入。收拢时应把“调用官方现成功能”与“需要修改核心才有的扩展”分开；不是把所有东西换个 pack 目录就完成了。
+## 两个不能混同的额外行为
 
-## 目标源码结构
+### KV 字节导入导出
 
-```text
-LiteRT-LM/
-  c/、runtime/、python/……      Google 原样源码
-  pack/
-    native/                   确有需要的扩展
-    patches/                  无法通过官方接口完成的最小核心补丁
-    build/                    DLL 打包与版本元数据
-    README.md                 扩展用途、适用上游版本、接口变动
-  .github/workflows/          同步、构建、发布
-```
+官方 clone 和 checkpoint 解决内存中的复制、分支和回退，不能直接等同于把完整状态导出为字节、跨进程保存并恢复。
 
-UE 插件继续在自己的仓库中维护 FastStart、蓝图和全局设置；不把插件源码复制进这个 fork。
-官方目录跟随 Google。构建时按明确清单应用 pack 补丁；已发布版本保留各自的 Google tag、pack 版本和构建结果。
+我们的 `GetKVCache` / `SetKVCache`、`GetSession`、`skip_prefill` 以及暴露内部 processed context 的修改，是旧 wrapper 为这条额外路径添加的。旧 `ClearCachedEnvironments` 现在也只是空操作；引擎拥有自己的环境生命周期。
 
-## 收拢顺序
+当前 `litert_lm_api.cc` 新接口没有调用这些 KV 钩子；调用仍在 `litert_lm_wrapper.cc` 的旧入口中。但是 `runtime/engine/BUILD` 的 `litert_lm_wrapper` 目标同时编译新、旧两个实现，所以旧入口仍把补丁带进当前 DLL。
 
-1. 先确定 pack 边界，停止同时扩张多套 wrapper。
-2. 把自研源码、必要补丁和构建脚本集中到 pack。
-3. 将官方目录恢复到选定的 Google tag，恢复无关的 Python/CLI 原功能。
-4. 现成的加载、释放、会话、工具接口直接接官方；只为真实缺口保留补丁。
-5. 删除已替换的旧 wrapper、源码副本和受跟踪的调试产物。
-6. 自动同步仅携带 pack，测试通过后产出 DLL/release；插件完成 UE 验证后提交 Fab。
+因此，普通单人和命名多人对话不应继续依赖这些修改。收拢时移除旧 KV 入口及其核心钩子；字节状态保存若成为独立需求，再作为第 3 类实验扩展处理。
 
-这份文件是当前差异与收拢边界的梳理；尚未执行目录迁移或删除原有实现。
+### 强制完全 GPU 执行
+
+选择 GPU 后端，与“所有相关子模型都必须证明完全加速，否则报错”是不同语义。
+
+后者是我们新增的 `require_full_acceleration`，涉及 embedding、executor、settings 和 sampler 的 CPU 回退行为。底层 LiteRT 已有 `CompiledModel::IsFullyAccelerated()` 查询，但这不等于 LiteRT-LM 官方已经提供同样的强制策略。
+
+新 wrapper 当前确实主动启用了该策略。它应按独立产品需求决定是否保留，不能作为 FastStart 或普通 GPU 调用的默认前提，也不能混进“官方缺少加载和会话管理”的理由。
+
+## 与功能无关的漂移
+
+此前统计的 runtime、c、构建配置和上游文档范围中，有 33 个原文件被修改，其中 runtime 有 27 个。不能把这些改动整体视作仍然必要的功能包。
+
+| 内容 | 收拢方向 |
+| --- | --- |
+| 自研 API、另一套 native bridge、旧 wrapper、Gemini 源码副本 | 对外需要的 UE 接口继续由插件维护；内部接入收敛到官方 API，删除被替代路线和源码副本 |
+| Python 示例、CLI、eval 等原功能删除或改写 | 恢复官方原功能，与扩展解耦 |
+| 调试日志、exe/obj、本机 `D:/bzl_u` 路径 | 从发布源码移除，本机配置留在本机 |
+| JSON 的 MSVC 字符串转换、静态 CRT、链接与 DLL 导出设置 | 属于 Windows 构建适配，不是模型功能缺口；单独记录最小构建差异 |
+| 自动同步回放整个 fork diff | 收拢后仅携带 pack 和明确列出的必要构建补丁，避免再次回放淘汰的旧实现 |
+
+## pack 的边界
+
+Google 原目录跟随上游。pack 只承载实际扩展、必要的 Windows 构建适配和发布脚本；UE 仓库维护蓝图、全局设置、多语言文档与 MCP 路由。
+
+用户接口按 `1 → 2 → 4 → 3` 使用：最简单对话、命名多会话、官方原生 API、实验扩展。第 5 类提供全局后端设置。第 1、2 类的稳定来自插件对用户保持接口契约，不来自冻结一份自改的 Google 核心。
+
+这次完成能力对照和退出清单，未执行源码删除、接入迁移或目录搬移；也未把接口存在当作新的 DLL 或模型运行测试通过。
+
+## 对照入口
+
+- [官方 C engine 接口](https://github.com/google-ai-edge/LiteRT-LM/blob/2c1c9a67cbd3a12e20fdf1d750855e6afd5649c4/c/engine.h)：生命周期、session clone、checkpoint、分词。
+- [官方 C conversation 接口](https://github.com/google-ai-edge/LiteRT-LM/blob/2c1c9a67cbd3a12e20fdf1d750855e6afd5649c4/c/conversation.h)：会话、工具配置、clone、流式消息。
+- [官方 C++ conversation 接口](https://github.com/google-ai-edge/LiteRT-LM/blob/2c1c9a67cbd3a12e20fdf1d750855e6afd5649c4/runtime/conversation/conversation.h)：history、has_pending_message、clone。
+- [官方 WebGPU sampler 接口](https://github.com/google-ai-edge/LiteRT-LM/blob/2c1c9a67cbd3a12e20fdf1d750855e6afd5649c4/runtime/components/top_k_webgpu_sampler.h)：当前 sampler 导出。
