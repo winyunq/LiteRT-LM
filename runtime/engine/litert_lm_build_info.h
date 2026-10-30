@@ -1,3 +1,3 @@
 #pragma once
-#define LITERT_LM_WRAPPER_VERSION "0.20.0"
-#define LITERT_LM_UPSTREAM_REVISION "upstream-sha"
+#define LITERT_LM_WRAPPER_VERSION "0.19.0-dev.1"
+#define LITERT_LM_UPSTREAM_REVISION "2c1c9a67cbd3a12e20fdf1d750855e6afd5649c4"

@@ -25,10 +25,12 @@ function gh {
     }
 }
 $oldLocation = $PWD
+$oldProcessDirectory = [Environment]::CurrentDirectory
 $savedEnvironment = @{}
 foreach ($name in @('GITHUB_REPOSITORY','RUNNER_TEMP','GITHUB_STEP_SUMMARY')) { $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name) }
 try {
     Set-Location $sandbox
+    [Environment]::CurrentDirectory = $sandbox
     $env:GITHUB_REPOSITORY = 'winyunq/LiteRT-LM'
     $env:RUNNER_TEMP = $sandbox
     $env:GITHUB_STEP_SUMMARY = Join-Path $sandbox 'summary.md'
@@ -43,5 +45,6 @@ try {
     Write-Host 'Release sync contract passed.'
 } finally {
     Set-Location $oldLocation
+    [Environment]::CurrentDirectory = $oldProcessDirectory
     foreach ($name in $savedEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name]) }
 }
