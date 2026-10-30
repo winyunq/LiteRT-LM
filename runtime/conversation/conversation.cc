@@ -113,12 +113,6 @@ bool IsEmptyPreface(const Preface& preface) {
           json_preface.extra_context.empty());
 }
 
-bool IsUserMessage(const nlohmann::ordered_json& json_msg) {
-  const std::string role_key("role");
-  return json_msg.contains(role_key) && json_msg[role_key].is_string() &&
-         json_msg[role_key].get<absl::string_view>() == "user";
-}
-
 std::optional<ThinkingConfig> ResolveThinkingConfig(
     const ConversationConfig& config, const OptionalArgs& optional_args) {
   if (optional_args.thinking_config.has_value()) {
@@ -730,14 +724,6 @@ absl::Status Conversation::SendMessageAsync(
     was_history_empty = history_.empty();
     history_.push_back(message);
     is_appending_message = is_appending_message_;
-  }
-
-  // Winyunq: 如果开启了逻辑追加模式，则在更新 history_ 向量后直接返回，不触发物理计算。
-  if (optional_args.skip_prefill) {
-    if (user_callback) {
-      user_callback(Message()); // 主动触发回调，通知逻辑层追加已完成
-    }
-    return absl::OkStatus();
   }
 
   // Removes the messages of this turn from the history, e.g. when the turn is

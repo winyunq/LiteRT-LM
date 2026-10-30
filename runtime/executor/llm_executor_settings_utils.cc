@@ -225,8 +225,8 @@ absl::StatusOr<litert::Options> CreateCompilationOptions(
         gpu_compilation_options.SetPriority(GpuOptions::Priority::kLow);
       }
       if (!advanced_settings.preferred_device_substr.empty()) {
-        LITERT_RETURN_IF_ERROR(gpu_compilation_options.SetPreferredDeviceSubstr(
-            advanced_settings.preferred_device_substr.c_str()));
+        gpu_compilation_options.SetPreferredDeviceSubstr(
+            advanced_settings.preferred_device_substr.c_str());
       }
       gpu_compilation_options.DisableShaderOptimization(
           !advanced_settings.optimize_shader_compilation);
@@ -249,8 +249,7 @@ absl::StatusOr<litert::Options> CreateCompilationOptions(
           advanced_settings.num_threads_to_compile >= 0
               ? advanced_settings.num_threads_to_compile
               : kDefaultNumThreadsToCompile);
-      LITERT_RETURN_IF_ERROR(
-          compilation_options.SetHardwareAccelerators(HwAccelerators::kGpu));
+      compilation_options.SetHardwareAccelerators(HwAccelerators::kGpu);
       break;
     }
     case Backend::NPU: {
@@ -295,8 +294,7 @@ absl::StatusOr<litert::Options> CreateCompilationOptions(
       }
       runtime_options.SetDisableDelegateClustering(
           advanced_settings.disable_delegate_clustering);
-      LITERT_RETURN_IF_ERROR(
-          compilation_options.SetHardwareAccelerators(HwAccelerators::kCpu));
+      compilation_options.SetHardwareAccelerators(HwAccelerators::kCpu);
       break;
     }
     default:

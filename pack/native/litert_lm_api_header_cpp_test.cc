@@ -1,5 +1,5 @@
 // Compile-only C++20 convenience-layer smoke test.
-#include "runtime/engine/litert_lm.hpp"
+#include "pack/native/litert_lm.hpp"
 
 #include <string_view>
 

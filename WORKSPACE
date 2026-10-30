@@ -405,11 +405,6 @@ crates_repository(
                 ],
             ),
         ],
-        "onig_sys": [
-            crate.annotation(
-                patches = ["@//:PATCH.onig_sys_static"],
-            ),
-        ],
         "toktrie": [
             crate.annotation(
                 patches = ["@//:PATCH.toktrie"],
@@ -515,7 +510,6 @@ http_archive(
         # Allow Windows targets to access libLiteRtWebGpuAccelerator and ml_drift_webgpu_accelerator_dll.
         "sed -i -e 's|visibility = \\[\"//visibility:private\"\\]|visibility = [\"//visibility:public\"]|g' litert/runtime/accelerators/gpu/BUILD",
     ],
-    patches = ["@//:PATCH.litert_wrapper_exports"],
     sha256 = LITERT_SHA256,
     strip_prefix = "LiteRT-" + LITERT_REF,
     url = "https://github.com/google-ai-edge/LiteRT/archive/" + LITERT_REF + ".tar.gz",

@@ -193,12 +193,6 @@ class ContextHandler::SharedProcessedContext {
     return std::move(processed_context_);
   }
 
-  // 增加 Winyunq 原生“物理 KV 缓存直接锁显存零拷贝上下文切换架构”的公有访问通道
-  ProcessedContext* processed_context() {
-    absl::MutexLock lock(&processed_context_mutex_);
-    return processed_context_.get();
-  }
-
  private:
   // Handlers can be removed outside of the runner lock, so lock them
   // separately.

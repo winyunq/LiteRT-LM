@@ -465,7 +465,6 @@ cc_library(
         "//runtime/engine:engine_settings",
         "//runtime/engine:io_types",
         "//runtime/executor:llm_executor_io_types",
-        "//runtime/executor:llm_processed_context",
         "//runtime/framework/resource_management:execution_manager",
         "//runtime/proto:sampler_params_cc_proto",
         "//runtime/util:litert_status_util",

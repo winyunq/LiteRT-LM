@@ -18,7 +18,6 @@ added recently and still under active development.
 Here you will find detailed information about the LiteRT-LM APIs.
 
 *   **C++ API**
-    *   [Stable wrapper and object API](./api/cpp/stable-wrapper.md)
     *   [Conversation API](./api/cpp/conversation.md)
     *   [Constrained Decoding](./api/cpp/constrained-decoding.md)
     *   [Tool Use](./api/cpp/tool-use.md)

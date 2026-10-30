@@ -5,7 +5,11 @@ param(
     [string]$BazelUserRoot = "C:/b/user"
 )
 $ErrorActionPreference = "Stop"
-Set-Location $PSScriptRoot
+$repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
+Set-Location -LiteralPath $repoRoot
+[Environment]::CurrentDirectory = $repoRoot
+& git apply --whitespace=nowarn (Join-Path $repoRoot 'pack/patches/windows-build.patch')
+if ($LASTEXITCODE -ne 0) { throw 'Windows build patch did not apply to this upstream version' }
 
 $programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
 $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio/Installer/vswhere.exe"
@@ -39,32 +43,31 @@ $options = @(
     "--repo_env=BAZEL_SH=$env:BAZEL_SH",
     "--repo_env=BAZEL_VC=$env:BAZEL_VC"
 )
-$targets = @("//c:litert-lm", "//runtime/engine:litert_lm_wrapper")
+$targets = @("//c:litert-lm", "//pack/native:litert_lm_wrapper")
 & bazel @startup build @options @targets
 if ($LASTEXITCODE -ne 0) { throw "DLL build failed: $LASTEXITCODE" }
 
 $execRoot = (& bazel @startup info execution_root | Select-Object -Last 1).Trim()
 if ($LASTEXITCODE -ne 0) { throw "Could not read Bazel execution root" }
-$dllDependencies = & bazel @startup cquery 'deps(set(//c:litert-lm //runtime/engine:litert_lm_wrapper))' @options --output=files
+$dllDependencies = & bazel @startup cquery 'deps(set(//c:litert-lm //pack/native:litert_lm_wrapper))' @options --output=files
 if ($LASTEXITCODE -ne 0) { throw "Could not enumerate runtime DLLs" }
 
 $bin = Join-Path $OutputDirectory "Binaries/Win64"
 $include = Join-Path $OutputDirectory "Include"
-New-Item -ItemType Directory -Path $bin, "$include/c", "$include/legacy/runtime/engine" -Force | Out-Null
+New-Item -ItemType Directory -Path $bin, "$include/c" -Force | Out-Null
 foreach ($dll in @($dllDependencies | Where-Object { $_ -match '\.dll$' } | Sort-Object -Unique)) {
     Copy-Item -LiteralPath (Join-Path $execRoot $dll) -Destination $bin -Force
 }
-Copy-Item -LiteralPath "bazel-bin/c/litert-lm.dll", "bazel-bin/runtime/engine/litert_lm_wrapper.dll" -Destination $bin -Force
+Copy-Item -LiteralPath "bazel-bin/c/litert-lm.dll", "bazel-bin/pack/native/litert_lm_wrapper.dll" -Destination $bin -Force
 $coreImport = Get-ChildItem bazel-bin/c -Filter "litert-lm*.lib" | Select-Object -First 1
-$wrapImport = Get-ChildItem bazel-bin/runtime/engine -Filter "litert_lm_wrapper*.lib" | Select-Object -First 1
+$wrapImport = Get-ChildItem bazel-bin/pack/native -Filter "litert_lm_wrapper*.lib" | Select-Object -First 1
 Copy-Item -LiteralPath $coreImport.FullName -Destination "$bin/LiteRtLm_Native.lib" -Force
 Copy-Item -LiteralPath $wrapImport.FullName -Destination "$bin/LiteRtLm_Extension.lib" -Force
 
 foreach ($header in @("api_export.h", "engine.h", "conversation.h", "embedding_engine.h", "error_reporter.h", "experimental.h", "model_info.h")) {
     Copy-Item -LiteralPath "c/$header" -Destination "$include/c/$header" -Force
 }
-Copy-Item -LiteralPath "runtime/engine/litert_lm_api.h", "runtime/engine/litert_lm.hpp" -Destination $include -Force
-Copy-Item -LiteralPath "runtime/engine/litert_lm_wrapper.h" -Destination "$include/legacy/runtime/engine/litert_lm_wrapper.h" -Force
+Copy-Item -LiteralPath "pack/native/litert_lm_api.h", "pack/native/litert_lm.hpp" -Destination $include -Force
 Copy-Item -LiteralPath LICENSE -Destination $OutputDirectory -Force
 
 $dumpbin = Join-Path $toolDir "dumpbin.exe"

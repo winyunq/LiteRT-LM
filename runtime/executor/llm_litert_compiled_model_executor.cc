@@ -98,40 +98,6 @@ constexpr absl::string_view kPrefillSignatureRunner = "prefill";
 constexpr absl::string_view kDecodeSignatureRunner = "decode";
 constexpr int kDynamicDimValue = -1;
 
-absl::StatusOr<bool> RequiresFullGpuAcceleration(
-    const LlmExecutorSettings& executor_settings) {
-  if (executor_settings.GetBackend() != Backend::GPU) {
-    return false;
-  }
-  ABSL_ASSIGN_OR_RETURN(const auto gpu_config,
-                   executor_settings.GetBackendConfig<GpuConfig>());
-  return gpu_config.require_full_acceleration;
-}
-
-absl::Status VerifyRequiredFullAcceleration(
-    CompiledModel& compiled_model,
-    const LlmExecutorSettings& executor_settings,
-    absl::string_view model_description) {
-  ABSL_ASSIGN_OR_RETURN(const bool require_full_acceleration,
-                   RequiresFullGpuAcceleration(executor_settings));
-  if (!require_full_acceleration) {
-    return absl::OkStatus();
-  }
-
-  auto fully_accelerated = compiled_model.IsFullyAccelerated();
-  if (!fully_accelerated.HasValue()) {
-    return absl::UnavailableError(absl::StrCat(
-        "Could not verify full GPU acceleration for ", model_description,
-        ": ", fully_accelerated.Error().Message()));
-  }
-  if (!fully_accelerated.Value()) {
-    return absl::UnavailableError(absl::StrCat(
-        model_description,
-        " is not fully GPU accelerated; CPU fallback is disabled."));
-  }
-  return absl::OkStatus();
-}
-
 void ClampMaxNumTokens(LlmExecutorSettings& executor_settings,
                        int model_max_num_tokens) {
   if (model_max_num_tokens > 0 &&
@@ -382,10 +348,6 @@ absl::Status InitializeAuxiliaryExecutorComponents(
     std::unique_ptr<CompiledModel> compiled_mtp_drafter_model,
     std::unique_ptr<LlmLiteRtMtpDrafter>& mtp_drafter,
     const proto::ExecutorMetadata*& executor_metadata) {
-  ABSL_RETURN_IF_ERROR(VerifyRequiredFullAcceleration(
-      compiled_model, executor_settings, "the main prefill/decode model"));
-  ABSL_ASSIGN_OR_RETURN(const bool require_full_acceleration,
-                        RequiresFullGpuAcceleration(executor_settings));
   if (resources != nullptr) {
     auto executor_metadata_or = resources->GetExecutorMetadata();
     if (executor_metadata_or.ok()) {
@@ -394,7 +356,7 @@ absl::Status InitializeAuxiliaryExecutorComponents(
   }
   if (embedding_lookup == nullptr && resources != nullptr) {
     ABSL_RETURN_IF_ERROR(InitializeEmbeddingLookups(
-        lrt_env, *resources, embedding_lookup, per_layer_embedding_lookup, require_full_acceleration));
+        lrt_env, *resources, embedding_lookup, per_layer_embedding_lookup));
   }
   if (mtp_drafter == nullptr && resources != nullptr) {
     if (executor_settings.GetEffectiveSpeculativeDecodingMode() !=

@@ -57,18 +57,6 @@ extern "C" {
 // Returns the version of the *library*, which may differ from the
 // LITERT_LM_C_API_VERSION_* macros the caller was compiled against.
 //
-// _WIN32 is defined as 1 when the compilation target is 32-bit ARM, 64-bit ARM,
-// x86, x64, or ARM64EC. Otherwise, undefined.
-// https://learn.microsoft.com/en-us/cpp/preprocessor/predefined-macros
-#ifndef LITERT_LM_C_API_EXPORT
-#if defined(_WIN32)
-#define LITERT_LM_C_API_EXPORT __declspec(dllexport)
-#else
-// Ensure symbols are exported when building the shared library with
-// -fvisibility=hidden.
-#define LITERT_LM_C_API_EXPORT __attribute__((visibility("default")))
-#endif
-#endif
 // The two can differ whenever the library is loaded or replaced independently
 // of the application, for example when it is loaded at run time with
 // dlopen/LoadLibrary. Compare them before calling any other function:

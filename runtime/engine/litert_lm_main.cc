@@ -12,6 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// ODML pipeline to execute or benchmark LLM graph on device.
+//
+// The pipeline does the following
+// 1) Read the corresponding parameters, weight and model file paths.
+// 2) Construct a graph model with the setting.
+// 3) Execute model inference and generate the output.
+
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -45,8 +52,12 @@
 #include "runtime/util/status_macros.h"
 #include "runtime/engine/shared_flags.h"
 
-ABSL_FLAG(std::string, backend, "gpu", "Executor backend to use (cpu, gpu).");
-ABSL_FLAG(std::string, model_path, "", "Model path.");
+ABSL_FLAG(std::string, backend, "gpu",
+          "Executor backend to use for LLM execution (cpu, gpu, etc.)");
+ABSL_FLAG(std::string, model_path, "", "Model path to use for LLM execution.");
+ABSL_FLAG(std::string, input_prompt, "",
+          "Input prompt to use for testing LLM execution.");
+ABSL_FLAG(std::string, input_prompt_file, "", "File path to the input prompt.");
 
 namespace {
 
@@ -54,6 +65,7 @@ using ::litert::lm::Backend;
 using ::litert::lm::Conversation;
 using ::litert::lm::ConversationConfig;
 using ::litert::lm::EngineSettings;
+using ::litert::lm::InputData;
 using ::litert::lm::Message;
 using ::litert::lm::ModelAssets;
 using ::nlohmann::json;
@@ -75,9 +87,37 @@ absl::AnyInvocable<void(absl::StatusOr<Message>)> CreateMessageCallback() {
   };
 }
 
+// Gets the input prompt from the command line flag or file.
+std::string GetInputPrompt() {
+  const std::string input_prompt = absl::GetFlag(FLAGS_input_prompt);
+  const std::string input_prompt_file = absl::GetFlag(FLAGS_input_prompt_file);
+  if (!input_prompt.empty() && !input_prompt_file.empty()) {
+    ABSL_LOG(FATAL) << "Only one of --input_prompt and --input_prompt_file can "
+                       "be specified.";
+  }
+  if (!input_prompt.empty()) {
+    return input_prompt;
+  }
+  if (!input_prompt_file.empty()) {
+    std::ifstream file(input_prompt_file);
+    if (!file.is_open()) {
+      std::cerr << "Error: Could not open file " << input_prompt_file
+                << std::endl;
+      return "";
+    }
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
+  }
+  // If no input prompt is provided, use the default prompt.
+  return "What is the tallest building in the world?";
+}
+
 absl::Status MainHelper(int argc, char** argv) {
   absl::ParseCommandLine(argc, argv);
+  // Overrides the default for FLAGS_minloglevel to error.
   absl::SetMinLogLevel(absl::LogSeverityAtLeast::kError);
+  absl::SetStderrThreshold(absl::LogSeverityAtLeast::kFatal);
 
   const std::string model_path = absl::GetFlag(FLAGS_model_path);
   if (model_path.empty()) {
@@ -120,34 +160,36 @@ absl::Status MainHelper(int argc, char** argv) {
   ABSL_ASSIGN_OR_RETURN(auto engine, litert::lm::EngineFactory::CreateDefault(
                                          std::move(engine_settings)));
 
+  // Create the conversation.
+  std::unique_ptr<Conversation> conversation;
   auto session_config = litert::lm::SessionConfig::CreateDefault();
   ABSL_ASSIGN_OR_RETURN(auto conversation_config,
                         ConversationConfig::Builder()
                             .SetSessionConfig(session_config)
                             .Build(*engine));
-  ABSL_ASSIGN_OR_RETURN(auto conversation,
+  ABSL_ASSIGN_OR_RETURN(conversation,
                         Conversation::Create(*engine, conversation_config));
 
-  std::cout << "=======================================================" << std::endl;
-  std::cout << " LiteRT-LM Interactive Chat (" << backend_str << " Mode)" << std::endl;
-  std::cout << " Type 'exit' to quit." << std::endl;
-  std::cout << "=======================================================" << std::endl;
+  // Prepare the message to send.
+  json content_list = json::array();
+  const std::string input_prompt = GetInputPrompt();
+  std::cout << "input_prompt: " << input_prompt << std::endl;
+  content_list.push_back({{"type", "text"}, {"text", input_prompt}});
 
-  while (true) {
-    std::cout << "\nUser >> " << std::flush;
-    std::string input;
-    if (!std::getline(std::cin, input) || input == "exit") break;
-    if (input.empty()) continue;
-    std::cout << "\nModel >> " << std::flush;
-    ABSL_RETURN_IF_ERROR(conversation->SendMessageAsync(
-        json::object({{"role", "user"}, {"content", {{{"type", "text"}, {"text", input}}}}}),
-        CreateMessageCallback()));
-    ABSL_RETURN_IF_ERROR(engine->WaitUntilDone(absl::Hours(1)));
-    std::cout << std::endl;
-  }
+  // Send the message and wait for the response, asynchronously log the
+  // response.
+  ABSL_RETURN_IF_ERROR(conversation->SendMessageAsync(
+      json::object({{"role", "user"}, {"content", content_list}}),
+      CreateMessageCallback()));
+  ABSL_RETURN_IF_ERROR(engine->WaitUntilDone(absl::Minutes(10)));
+
+  // Print the benchmark info.
+  auto benchmark_info = conversation->GetBenchmarkInfo();
+  std::cout << std::endl << *benchmark_info << std::endl;
   return absl::OkStatus();
 }
-}
+
+}  // namespace
 
 int main(int argc, char** argv) {
   ABSL_CHECK_OK(MainHelper(argc, argv));

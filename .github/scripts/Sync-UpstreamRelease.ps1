@@ -48,8 +48,8 @@ if ($UpstreamTag) {
 
 $forkHead = (Invoke-Git rev-parse HEAD).Trim()
 $base = [IO.File]::ReadAllText('UPSTREAM_REVISION').Trim()
-$patch = Join-Path $env:RUNNER_TEMP 'litert-lm-fork.patch'
-Invoke-Git diff --binary "--output=$patch" $base $forkHead
+$patch = Join-Path $env:RUNNER_TEMP 'litert-lm-pack.patch'
+Invoke-Git diff --binary "--output=$patch" $base $forkHead -- pack .github/scripts .github/workflows/build-wrap-windows.yml .github/workflows/sync-upstream-releases.yml .github/upstream-release-baseline.txt .lfsconfig UPSTREAM_REVISION WRAPPER_VERSION WRAPPER_RELEASES.md
 
 foreach ($release in $pending) {
     $tag = $release.tag_name
@@ -66,12 +66,10 @@ foreach ($release in $pending) {
         [IO.File]::WriteAllText('WRAPPER_VERSION', "$version`n")
         [IO.File]::WriteAllText('UPSTREAM_REVISION', "$upstreamRevision`n")
         [IO.File]::WriteAllText('UPSTREAM_TAG', "$tag`n")
-        $buildInfo = "#pragma once`n#define LITERT_LM_WRAPPER_VERSION `"$version`"`n#define LITERT_LM_UPSTREAM_REVISION `"$upstreamRevision`"`n"
-        [IO.File]::WriteAllText('runtime/engine/litert_lm_build_info.h', $buildInfo)
         $notes = "# Google LiteRT-LM $tag`n`nSource: $($release.html_url)`n`n$($release.body)`n"
         [IO.File]::WriteAllText('UPSTREAM_RELEASE_NOTES.md', $notes)
-        Invoke-Git add -f WRAPPER_VERSION UPSTREAM_REVISION UPSTREAM_TAG UPSTREAM_RELEASE_NOTES.md runtime/engine/litert_lm_build_info.h
-        Invoke-Git commit -m "Prepare wrapper from Google $tag with fork changes"
+        Invoke-Git add -f WRAPPER_VERSION UPSTREAM_REVISION UPSTREAM_TAG UPSTREAM_RELEASE_NOTES.md
+        Invoke-Git commit -m "Prepare wrapper from Google $tag with extension pack"
         Invoke-Git switch -c $branch
 
         # Import only the Windows files used by the DLL build, from Google to the fork.

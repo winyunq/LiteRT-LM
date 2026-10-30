@@ -40,8 +40,7 @@
 
 namespace litert::lm {
 
-// Class used for looking up text embeddings with an explicitly selected
-// LiteRT accelerator set.
+// Class used for looking up text embeddings on the CPU.
 //
 // Ideally text embedding lookups should be a part of the main model but there
 // are cases where the embedding lookup needs to be done separately for now. For
@@ -67,20 +66,6 @@ class EmbeddingLookupText : public EmbeddingLookup {
   static absl::StatusOr<std::unique_ptr<EmbeddingLookupText>> Create(
       litert::Environment& env, litert::CompiledModel compiled_model,
       std::optional<std::string> signature_key = std::nullopt);
-
-  // Creates an embedding lookup with explicit accelerator requirements.
-  // When require_full_acceleration is true, initialization fails unless LiteRT
-  // proves that the complete embedding model is assigned to the requested
-  // accelerator.
-  static absl::StatusOr<std::unique_ptr<EmbeddingLookupText>> Create(
-      litert::Environment& env, const litert::Model* absl_nonnull model,
-      std::optional<std::string> signature_key,
-      litert::HwAcceleratorSet hardware_accelerators,
-      bool require_full_acceleration,
-      std::optional<ScopedFile> external_weight_file = std::nullopt,
-      litert::Options::ScopedWeightSectionMap external_weight_sections = {},
-      const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
-          weight_in_memory_map = nullptr);
 
   // For a given token, looks up the embedding and stores it in the
   // provided vector. The caller is responsible for ensuring that the vector is
@@ -142,8 +127,6 @@ class EmbeddingLookupText : public EmbeddingLookup {
   EmbeddingLookupText(
       litert::Environment& env, const litert::Model* model,
       std::optional<std::string> signature_key,
-      litert::HwAcceleratorSet hardware_accelerators,
-      bool require_full_acceleration,
       std::optional<ScopedFile> external_weight_file,
       litert::Options::ScopedWeightSectionMap external_weight_sections,
       const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
@@ -151,8 +134,6 @@ class EmbeddingLookupText : public EmbeddingLookup {
       : env_(env),
         model_(model),
         signature_key_(std::move(signature_key)),
-        hardware_accelerators_(hardware_accelerators),
-        require_full_acceleration_(require_full_acceleration),
         external_weight_file_(std::move(external_weight_file)),
         external_weight_sections_(std::move(external_weight_sections)),
         weight_in_memory_map_(weight_in_memory_map) {}
@@ -205,8 +186,6 @@ class EmbeddingLookupText : public EmbeddingLookup {
   // constants have been moved into the LiteRT-LM container.
   std::optional<ScopedFile> external_weight_file_;
   litert::Options::ScopedWeightSectionMap external_weight_sections_;
-  litert::HwAcceleratorSet hardware_accelerators_{litert::HwAccelerators::kCpu};
-  bool require_full_acceleration_ = false;
   const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
       weight_in_memory_map_ = nullptr;
 };

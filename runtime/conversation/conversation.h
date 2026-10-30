@@ -441,10 +441,6 @@ struct OptionalArgs {
   //   {.has_pending_message = false}));
   bool has_pending_message = false;
 
-  // Winyunq: 是否跳过物理预填充 (Prefill) 阶段。
-  // 如果为 true，SendMessage 将仅更新逻辑历史记录 (history_)，而不触发任何 GPU/CPU 计算。
-  // 这对于在物理 KV 缓存恢复前同步逻辑状态非常有用。
-  bool skip_prefill = false;
   // The repetition penalty config to be used during decode.
   std::optional<RepetitionPenaltyConfig> repetition_penalty_config =
       std::nullopt;
@@ -699,18 +695,6 @@ class Conversation {
   absl::StatusOr<std::string> RenderMessageIntoString(
       const Message& message, OptionalArgs optional_args);
 
-  // Internal compatibility escape hatch used by the legacy wrapper's KV
-  // cache migration helpers. New callers should keep state in Conversation.
-
-  // Returns the input data vector for the given messages.
-  absl::StatusOr<std::vector<InputData>> GetInputDataVectorForMessages(
-      absl::Span<const Message> old_messages,
-      absl::Span<const Message> new_messages,
-      const OptionalArgs& optional_args = OptionalArgs(),
-      bool include_preface = true);
-
-  Engine::Session* GetSession() const { return session_.get(); }
-
   // Renders the preface into a string for testing and logging purposes.
   absl::StatusOr<std::string> RenderPrefaceIntoString(
       OptionalArgs optional_args);
@@ -805,6 +789,8 @@ class Conversation {
       const OptionalArgs& optional_args = OptionalArgs(),
       bool include_preface = true, bool add_generation_prompt_to_old = false);
 
+  // Returns the input data vector for the given messages.
+  //
   // Gets the prefill text for `new_messages` and converts it to an input data
   // vector for `Session::RunPrefill`.
   //

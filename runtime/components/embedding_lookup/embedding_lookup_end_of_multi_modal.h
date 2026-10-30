@@ -49,11 +49,6 @@ class EndOfMultiModalEmbedding : public EmbeddingLookup {
       litert::Environment& env, const litert::Model* absl_nonnull model,
       int special_token);
 
-  static absl::StatusOr<std::unique_ptr<EndOfMultiModalEmbedding>> Create(
-      litert::Environment& env, const litert::Model* absl_nonnull model,
-      int special_token, litert::HwAcceleratorSet hardware_accelerators,
-      bool require_full_acceleration);
-
   // Multimodal embeddings are not supported during decode.
   absl::Status LookupDecode(int token,
                             std::vector<float>& output_vector) override {
@@ -82,14 +77,8 @@ class EndOfMultiModalEmbedding : public EmbeddingLookup {
  protected:
   EndOfMultiModalEmbedding(litert::Environment& env,
                            const litert::Model* absl_nonnull model,
-                           int special_token,
-                           litert::HwAcceleratorSet hardware_accelerators,
-                           bool require_full_acceleration)
-      : env_(env),
-        model_(*model),
-        special_token_(special_token),
-        hardware_accelerators_(hardware_accelerators),
-        require_full_acceleration_(require_full_acceleration) {}
+                           int special_token)
+      : env_(env), model_(*model), special_token_(special_token) {}
 
   // Loads the provided model. This must be called before Lookup functions.
   absl::Status Initialize();
@@ -110,9 +99,6 @@ class EndOfMultiModalEmbedding : public EmbeddingLookup {
   // Contains the end of multi-modal embedding that was looked up from the
   // model.
   std::vector<float> end_of_multi_modal_embedding_;
-
-  litert::HwAcceleratorSet hardware_accelerators_;
-  bool require_full_acceleration_ = false;
 };
 
 }  // namespace litert::lm

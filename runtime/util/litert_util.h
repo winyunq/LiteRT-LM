@@ -37,7 +37,6 @@ struct OwnedEnvironment {
 absl::StatusOr<OwnedEnvironment> CreateEnvironment(
     EngineSettings& engine_settings, ModelResources* model_resources);
 
-void ClearCachedEnvironments();
 absl::StatusOr<OwnedEnvironment> CreateEnvironment(
     EmbeddingEngineSettings& settings, ModelResources* model_resources);
 

@@ -1,7 +1,7 @@
 // Copyright (c) 2025-2026 Winyunq. All rights reserved.
 
 #define LITERT_LM_IMPLEMENTATION
-#include "runtime/engine/litert_lm_api.h"
+#include "pack/native/litert_lm_api.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1857,7 +1857,6 @@ LiteRtLm_Status ApiCreateEngine(const LiteRtLm_EngineConfig* config,
       }
       GpuConfig value = *gpu_config;
       value.max_top_k = static_cast<uint32_t>(applied_sampling.top_k);
-      value.require_full_acceleration = true;
       main_settings.SetBackendConfig(value);
 
 #if defined(_WIN32) || defined(__ANDROID__)

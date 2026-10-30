@@ -1,0 +1,59 @@
+diff --git a/WORKSPACE b/WORKSPACE
+index dd8b020e..1ba80db6 100644
+--- a/WORKSPACE
++++ b/WORKSPACE
+@@ -405,6 +405,11 @@ crates_repository(
+                 ],
+             ),
+         ],
++        "onig_sys": [
++            crate.annotation(
++                patches = ["@//pack/patches:PATCH.onig_sys_static"],
++            ),
++        ],
+         "toktrie": [
+             crate.annotation(
+                 patches = ["@//:PATCH.toktrie"],
+@@ -510,6 +515,7 @@ http_archive(
+         # Allow Windows targets to access libLiteRtWebGpuAccelerator and ml_drift_webgpu_accelerator_dll.
+         "sed -i -e 's|visibility = \\[\"//visibility:private\"\\]|visibility = [\"//visibility:public\"]|g' litert/runtime/accelerators/gpu/BUILD",
+     ],
++    patches = ["@//pack/patches:PATCH.litert_wrapper_exports"],
+     sha256 = LITERT_SHA256,
+     strip_prefix = "LiteRT-" + LITERT_REF,
+     url = "https://github.com/google-ai-edge/LiteRT/archive/" + LITERT_REF + ".tar.gz",
+diff --git a/runtime/components/tool_use/parser_common.cc b/runtime/components/tool_use/parser_common.cc
+index 0f193d4c..d5b613f2 100644
+--- a/runtime/components/tool_use/parser_common.cc
++++ b/runtime/components/tool_use/parser_common.cc
+@@ -18,6 +18,8 @@
+ #include "nlohmann/json.hpp"  // from @nlohmann_json
+ #include "runtime/components/tool_use/rust/parsers.rs.h"
+ 
++#include <string>
++
+ namespace litert::lm {
+ 
+ nlohmann::ordered_json ConvertJsonValue(const JsonValue& json_value) {
+@@ -45,7 +47,7 @@ nlohmann::ordered_json ConvertJsonValue(const JsonValue& json_value) {
+     nlohmann::ordered_json object = nlohmann::ordered_json::object();
+     for (const auto& key : json_value.object_keys()) {
+       absl::string_view key_str(key.data(), key.size());
+-      object[key_str] = ConvertJsonValue(*json_value.object_get(key));
++      object[std::string(key_str)] = ConvertJsonValue(*json_value.object_get(key));
+     }
+     return object;
+   }
+diff --git a/runtime/conversation/model_data_processor/gemma3_data_processor.cc b/runtime/conversation/model_data_processor/gemma3_data_processor.cc
+index 1d2f1332..dacfb450 100644
+--- a/runtime/conversation/model_data_processor/gemma3_data_processor.cc
++++ b/runtime/conversation/model_data_processor/gemma3_data_processor.cc
+@@ -99,7 +99,7 @@ absl::StatusOr<std::string> FormatToolResponse(
+     return FormatValueAsPython(tool_response);
+   }
+ 
+-  return FormatValueAsPython(tool_response[tool_response_key]);
++  return FormatValueAsPython(tool_response[std::string(tool_response_key)]);
+ }
+ 
+ }  // namespace

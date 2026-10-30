@@ -241,10 +241,6 @@ class SessionAdvanced : public SessionInterface {
       absl::AnyInvocable<void(absl::StatusOr<Responses>)> callback) override
       ABSL_LOCKS_EXCLUDED(mutex_);
 
-  absl::StatusOr<std::string> GetKVCache() const override ABSL_LOCKS_EXCLUDED(mutex_);
-  absl::Status SetKVCache(absl::string_view cache_data) override ABSL_LOCKS_EXCLUDED(mutex_);
-
-
  protected:
   // The state of the session.
   // * `kFresh` means the session is just created and

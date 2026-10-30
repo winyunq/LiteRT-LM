@@ -44,9 +44,6 @@
 #include "runtime/framework/resource_management/execution_manager.h"
 #include "runtime/proto/sampler_params.pb.h"
 #include "runtime/util/status_macros.h"  // IWYU pragma: keep
-#include "runtime/executor/llm_processed_context.h"
-#include "litert/cc/litert_tensor_buffer.h"
-#include "runtime/executor/llm_executor_io_types.h"
 #include "support/tokenizer/tokenizer.h"
 
 #if defined(LITERT_LM_DEBUGGER_ENABLED)
@@ -637,69 +634,6 @@ absl::StatusOr<int> SessionAdvanced::GetCurrentStep() const {
   return execution_manager_lock->GetCurrentStep(*session_info_);
 }
 
-absl::StatusOr<std::string> SessionAdvanced::GetKVCache() const {
-  absl::MutexLock lock(const_cast<absl::Mutex*>(&mutex_));
-  auto execution_manager = execution_manager_.lock();
-  if (!execution_manager || !session_info_ || !session_info_->context_handler) {
-    return absl::FailedPreconditionError("No active session context.");
-  }
-  auto shared = session_info_->context_handler->shared_processed_context();
-  if (!shared || !shared->processed_context()) {
-    return absl::FailedPreconditionError("No processed context.");
-  }
-  auto* context = static_cast<LlmProcessedContext*>(shared->processed_context());
-  if (!context->state()) {
-    return absl::FailedPreconditionError("No KV cache state.");
-  }
-  ABSL_ASSIGN_OR_RETURN(int step, execution_manager->GetCurrentStep(*session_info_));
-  ABSL_ASSIGN_OR_RETURN(std::string state, context->state()->Serialize());
-  const uint32_t header[] = {0x594E515F, 2, static_cast<uint32_t>(step),
-                             static_cast<uint32_t>(session_state_)};
-  std::string data(reinterpret_cast<const char*>(header), sizeof(header));
-  data.append(state);
-  return data;
-}
-
-absl::Status SessionAdvanced::SetKVCache(absl::string_view data) {
-  absl::MutexLock lock(&mutex_);
-  auto execution_manager = execution_manager_.lock();
-  if (!execution_manager || !session_info_ || !session_info_->context_handler) {
-    return absl::FailedPreconditionError("No active session context.");
-  }
-  int step = 0;
-  if (data.empty()) {
-    session_state_ = SessionState::kFresh;
-  } else {
-    uint32_t header[4];
-    if (data.size() < sizeof(header)) {
-      return absl::InvalidArgumentError("Truncated KV cache packet.");
-    }
-    std::memcpy(header, data.data(), sizeof(header));
-    if (header[0] != 0x594E515F || header[1] != 2) {
-      return absl::InvalidArgumentError("Unsupported KV cache packet version.");
-    }
-    auto shared = session_info_->context_handler->shared_processed_context();
-    if (!shared || !shared->processed_context()) {
-      return absl::FailedPreconditionError("No processed context.");
-    }
-    auto* context = static_cast<LlmProcessedContext*>(shared->processed_context());
-    if (!context->state()) {
-      return absl::FailedPreconditionError("No KV cache state.");
-    }
-    ABSL_RETURN_IF_ERROR(context->state()->Load(data.substr(sizeof(header))));
-    step = static_cast<int>(header[2]);
-    session_state_ = static_cast<SessionState>(header[3]);
-  }
-  if (session_info_->context_handler->HasRuntimeState()) {
-    ABSL_ASSIGN_OR_RETURN(auto runtime_state,
-                          session_info_->context_handler->GetRuntimeState());
-    runtime_state.current_step = step;
-    runtime_state.ran_decode = step > 0;
-    ABSL_RETURN_IF_ERROR(session_info_->context_handler->SetRuntimeState(
-        std::make_unique<RuntimeState>(runtime_state)));
-  }
-  return execution_manager->SetCurrentStep(*session_info_, step);
-}
 std::optional<SessionDebugInfo> SessionAdvanced::GetSessionDebugInfo() const {
 #if defined(LITERT_LM_DEBUGGER_ENABLED)
   SessionDebugInfo debug_info;

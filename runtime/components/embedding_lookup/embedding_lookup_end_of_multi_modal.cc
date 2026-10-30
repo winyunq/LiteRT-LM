@@ -156,71 +156,33 @@ absl::StatusOr<std::unique_ptr<EndOfMultiModalEmbedding>>
 EndOfMultiModalEmbedding::Create(litert::Environment& env,
                                  const litert::Model* absl_nonnull model,
                                  int special_token) {
-#if defined(__ANDROID__)
-  litert::HwAcceleratorSet default_accelerators =
-      litert::HwAccelerators::kNpu | litert::HwAccelerators::kCpu;
-#else
-  litert::HwAcceleratorSet default_accelerators(
-      litert::HwAccelerators::kCpu);
-#endif
-  return Create(env, model, special_token, default_accelerators,
-                /*require_full_acceleration=*/false);
-}
-
-absl::StatusOr<std::unique_ptr<EndOfMultiModalEmbedding>>
-EndOfMultiModalEmbedding::Create(
-    litert::Environment& env, const litert::Model* absl_nonnull model,
-    int special_token, litert::HwAcceleratorSet hardware_accelerators,
-    bool require_full_acceleration) {
   auto handler = std::unique_ptr<EndOfMultiModalEmbedding>(
-      new EndOfMultiModalEmbedding(env, model, special_token,
-                                   hardware_accelerators, require_full_acceleration));
+      new EndOfMultiModalEmbedding(env, model, special_token));
   ABSL_RETURN_IF_ERROR(handler->Initialize());
   return handler;
 }
 
 absl::Status EndOfMultiModalEmbedding::Initialize() {
   LITERT_ASSIGN_OR_RETURN(auto options, Options::Create());
-  LITERT_RETURN_IF_ERROR(
-      options.SetHardwareAccelerators(hardware_accelerators_));
-
+#if defined(__ANDROID__)
+  options.SetHardwareAccelerators(litert::HwAccelerators::kNpu |
+                                  litert::HwAccelerators::kCpu);
+#else
+  options.SetHardwareAccelerators(litert::HwAccelerators::kCpu);
+#endif
 #if defined(__ANDROID__)
   LITERT_ASSIGN_OR_RETURN(
       ::litert::qualcomm::QualcommOptions & qnn_opts,
       options.GetOptions<::litert::qualcomm::QualcommOptions>());
-  if ((hardware_accelerators_ & litert::HwAccelerators::kNpu) != 0) {
   qnn_opts.SetLogLevel(::litert::qualcomm::QualcommOptions::LogLevel::kOff);
   qnn_opts.SetHtpPerformanceMode(
       ::litert::qualcomm::QualcommOptions::HtpPerformanceMode::
           kSustainedHighPerformance);
-  }
 #endif
 
-  auto compiled_model_result =
-      litert::CompiledModel::Create(env_, model_.Get(), options);
-  if (require_full_acceleration_ && !compiled_model_result.HasValue()) {
-    return absl::UnavailableError(absl::StrCat(
-        "Strict GPU compilation failed for an end-of-multimodal embedding "
-        "model: ",
-        compiled_model_result.Error().Message(),
-        ". CPU fallback is disabled."));
-  }
-  LITERT_ASSIGN_OR_RETURN(litert::CompiledModel compiled_model,
-                          std::move(compiled_model_result));
-  if (require_full_acceleration_) {
-    auto fully_accelerated = compiled_model.IsFullyAccelerated();
-    if (!fully_accelerated.HasValue()) {
-      return absl::UnavailableError(absl::StrCat(
-          "Could not verify full acceleration for an end-of-multimodal "
-          "embedding model: ",
-          fully_accelerated.Error().Message()));
-    }
-    if (!fully_accelerated.Value()) {
-      return absl::UnavailableError(
-          "An end-of-multimodal embedding model is not fully accelerated by "
-          "the requested backend; CPU fallback is disabled.");
-    }
-  }
+  LITERT_ASSIGN_OR_RETURN(
+      litert::CompiledModel compiled_model,
+      litert::CompiledModel::Create(env_, model_.Get(), options));
   if (auto num_signatures = model_.GetNumSignatures(); num_signatures != 1) {
     return absl::InvalidArgumentError(absl::StrCat(
         "The Embedding model must have exactly one signature but got ",
@@ -239,16 +201,15 @@ absl::Status EndOfMultiModalEmbedding::Initialize() {
   LITERT_ASSIGN_OR_RETURN(std::vector<litert::TensorBuffer> output_buffers,
                           compiled_model.CreateOutputBuffers(
                               /*signature_index=*/0));
+  LITERT_ASSIGN_OR_RETURN(auto output_buffer_type,
+                          output_buffers[0].TensorType());
+  output_buffer_layout_ = output_buffer_type.Layout();
 
   if (output_buffers.size() != 1) {
     return absl::InvalidArgumentError(absl::StrCat(
         "The Embedding model must have exactly one output tensor but got ",
-                     output_buffers.size()));
+        output_buffers.size()));
   }
-
-  LITERT_ASSIGN_OR_RETURN(auto output_buffer_type,
-                          output_buffers[0].TensorType());
-  output_buffer_layout_ = output_buffer_type.Layout();
 
   if (output_buffer_type.ElementType() != litert::ElementType::Float32) {
     return absl::InvalidArgumentError(
@@ -277,8 +238,7 @@ absl::Status EndOfMultiModalEmbedding::Initialize() {
   uint8_t* data_ptr =
       reinterpret_cast<uint8_t*>(end_of_multi_modal_embedding_.data());
   size_t bytes = end_of_multi_modal_embedding_.size() * sizeof(float);
-  LITERT_RETURN_IF_ERROR(
-      output_buffers[0].Read(absl::MakeSpan(data_ptr, bytes)));
+  output_buffers[0].Read(absl::MakeSpan(data_ptr, bytes));
 
   return absl::OkStatus();
 }

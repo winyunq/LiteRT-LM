@@ -6,7 +6,7 @@
 #ifndef LITERT_LM_RUNTIME_ENGINE_LITERT_LM_HPP_
 #define LITERT_LM_RUNTIME_ENGINE_LITERT_LM_HPP_
 
-#include "runtime/engine/litert_lm_api.h"
+#include "litert_lm_api.h"
 
 #include <atomic>
 #include <chrono>

@@ -26,33 +26,6 @@ package(
 licenses(["notice"])
 
 cc_library(
-    name = "litert_lm_api_headers",
-    hdrs = [
-        "litert_lm_api.h",
-        "litert_lm.hpp",
-    ],
-)
-
-cc_library(
-    name = "litert_lm_api_header_compile_test",
-    testonly = 1,
-    srcs = [
-        "litert_lm_api_header_c_test.c",
-        "litert_lm_api_header_cpp_test.cc",
-    ],
-    deps = [":litert_lm_api_headers"],
-)
-
-cc_test(
-    name = "litert_lm_cpp_facade_test",
-    srcs = ["litert_lm_cpp_facade_test.cc"],
-    deps = [
-        ":litert_lm_api_headers",
-        "@com_google_googletest//:gtest_main",
-    ],
-)
-
-cc_library(
     name = "engine_interface",
     hdrs = ["engine.h"],
     deps = [
@@ -291,76 +264,6 @@ cc_test(
         "@com_google_absl//absl/status",
         "//runtime/executor:speculative_decoding_mode",
         "//runtime/util:test_utils",
-    ],
-)
-
-cc_binary(
-    name = "litert_lm_wrapper",
-    additional_linker_inputs = select({
-        "@platforms//os:android": [
-            ":litert_lm_wrapper.lds",
-            "@litert//litert/c:libLiteRt.so",
-        ],
-        "//conditions:default": [],
-    }),
-    srcs = [
-        "litert_lm_api.cc",
-        "litert_lm_api.h",
-        "litert_lm.hpp",
-        "litert_lm_wrapper.cc",
-        "litert_lm_wrapper.h",
-        "litert_lm_build_info.h",
-    ],
-    linkshared = 1,
-    linkopts = select({
-        "@platforms//os:android": [
-            "-Wl,--version-script=$(location :litert_lm_wrapper.lds)",
-            "-Wl,--no-as-needed",
-            "$(location @litert//litert/c:libLiteRt.so)",
-            "-Wl,--as-needed",
-        ],
-        "//conditions:default": [],
-    }),
-    win_def_file = "litert_lm_wrapper.def",
-    deps = [
-        ":engine_factory",
-        ":engine_impl_selected",
-        ":engine_interface",
-        ":engine_settings",
-        ":io_types",
-        "@com_google_absl//absl/status",
-        "@com_google_absl//absl/status:statusor",
-        "@com_google_absl//absl/time",
-        "@nlohmann_json//:json",
-        "//runtime/components/constrained_decoding:llg_constraint_config",
-        "//runtime/conversation",
-        "//runtime/executor:llm_executor_settings",
-        "//runtime/proto:sampler_params_cc_proto",
-        "//runtime/util:logging",
-        "//runtime/util:scoped_file",
-        "//runtime/util:litert_status_util",
-    ],
-)
-
-# Production extension layer for the official prebuilt C core.  Unlike the
-# source-linked compatibility wrapper above, this target contains no LiteRT,
-# Abseil, Protobuf, or model implementation.  Native consumers retain direct
-# access to every symbol in c/engine.h through the sibling official library.
-cc_binary(
-    name = "litert_lm_native_bridge",
-    srcs = [
-        "litert_lm_api.h",
-        "litert_lm_native_bridge.cc",
-    ],
-    linkshared = 1,
-    linkopts = select({
-        "@platforms//os:linux": ["-ldl"],
-        "//conditions:default": [],
-    }),
-    win_def_file = "litert_lm_native_bridge.def",
-    deps = [
-        "@nlohmann_json//:json",
-        "//c:engine_api_headers",
     ],
 )
 

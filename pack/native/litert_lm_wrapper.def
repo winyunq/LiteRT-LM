@@ -1,0 +1,3 @@
+LIBRARY litert_lm_wrapper
+EXPORTS
+  LiteRtLm_GetApi

@@ -1,5 +1,5 @@
 // Compile-only C11 ABI smoke test.
-#include "runtime/engine/litert_lm_api.h"
+#include "pack/native/litert_lm_api.h"
 
 int LiteRtLm_CHeaderSmokeTest(void) {
   LiteRtLm_EngineConfig engine = LiteRtLm_DefaultEngineConfig();

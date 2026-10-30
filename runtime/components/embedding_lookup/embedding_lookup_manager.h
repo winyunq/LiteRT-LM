@@ -76,20 +76,6 @@ class EmbeddingLookupManager {
   static absl::StatusOr<std::unique_ptr<EmbeddingLookupManager>> Create(
       litert::Environment& env,
       const litert::Model* absl_nonnull text_embedding_model,
-      absl::flat_hash_map<int, const litert::Model*>&
-          end_of_multi_modal_embedding_models,
-      bool fully_supports_multi_modal,
-      std::optional<std::string> signature_key,
-      litert::HwAcceleratorSet hardware_accelerators,
-      bool require_full_acceleration,
-      std::optional<ScopedFile> external_weight_file = std::nullopt,
-      litert::Options::ScopedWeightSectionMap external_weight_sections = {},
-      const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
-          weight_in_memory_map = nullptr);
-
-  static absl::StatusOr<std::unique_ptr<EmbeddingLookupManager>> Create(
-      litert::Environment& env,
-      const litert::Model* absl_nonnull text_embedding_model,
       bool fully_supports_multi_modal = true,
       std::optional<std::string> signature_key = std::nullopt,
       std::optional<ScopedFile> external_weight_file = std::nullopt,
@@ -108,18 +94,6 @@ class EmbeddingLookupManager {
       litert::Environment& env,
       std::unique_ptr<EmbeddingLookupText> text_embedding_lookup,
       bool fully_supports_multi_modal = true);
-
-  static absl::StatusOr<std::unique_ptr<EmbeddingLookupManager>> Create(
-      litert::Environment& env,
-      const litert::Model* absl_nonnull text_embedding_model,
-      bool fully_supports_multi_modal,
-      std::optional<std::string> signature_key,
-      litert::HwAcceleratorSet hardware_accelerators,
-      bool require_full_acceleration,
-      std::optional<ScopedFile> external_weight_file = std::nullopt,
-      litert::Options::ScopedWeightSectionMap external_weight_sections = {},
-      const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
-          weight_in_memory_map = nullptr);
 
   // Updates the multimodal embeddings for the given ExecutorInputs.
   // Intended to be called at the beginning of the prefill pass.
@@ -178,8 +152,6 @@ class EmbeddingLookupManager {
       absl::flat_hash_map<int, const litert::Model*>&
           end_of_multi_modal_embedding_models,
       bool fully_supports_multi_modal, std::optional<std::string> signature_key,
-      litert::HwAcceleratorSet hardware_accelerators,
-      bool require_full_acceleration,
       std::optional<ScopedFile> external_weight_file,
       litert::Options::ScopedWeightSectionMap external_weight_sections,
       const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*

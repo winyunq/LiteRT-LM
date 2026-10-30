@@ -42,15 +42,6 @@ exports_files([
     "model_info.h",
 ])
 
-# Declarations-only target for consumers that dynamically load the official C
-# API.  It deliberately does not pull the LiteRT-LM implementation into the
-# consumer, so a thin extension DLL can sit beside the official prebuilt core.
-cc_library(
-    name = "engine_api_headers",
-    hdrs = ["engine.h"],
-)
-
-
 ENGINE_LITE_COMMON_DEPS = [
     ":engine_internal",
     ":error_reporter_headers",

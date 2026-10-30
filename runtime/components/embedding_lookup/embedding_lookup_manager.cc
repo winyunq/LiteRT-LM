@@ -55,35 +55,10 @@ EmbeddingLookupManager::Create(
     litert::Options::ScopedWeightSectionMap external_weight_sections,
     const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
         weight_in_memory_map) {
-#if defined(__ANDROID__)
-  litert::HwAcceleratorSet accelerators =
-      litert::HwAccelerators::kNpu | litert::HwAccelerators::kCpu;
-#else
-  litert::HwAcceleratorSet accelerators(litert::HwAccelerators::kCpu);
-#endif
-  return Create(env, text_embedding_model, end_of_multi_modal_embedding_models,
-                fully_supports_multi_modal, std::move(signature_key),
-                accelerators, false, std::move(external_weight_file),
-                std::move(external_weight_sections), weight_in_memory_map);
-}
-absl::StatusOr<std::unique_ptr<EmbeddingLookupManager>>
-EmbeddingLookupManager::Create(
-    litert::Environment& env,
-    const litert::Model* absl_nonnull text_embedding_model,
-    absl::flat_hash_map<int, const litert::Model*>&
-        end_of_multi_modal_embedding_models,
-    bool fully_supports_multi_modal, std::optional<std::string> signature_key,
-    litert::HwAcceleratorSet hardware_accelerators,
-    bool require_full_acceleration,
-    std::optional<ScopedFile> external_weight_file,
-    litert::Options::ScopedWeightSectionMap external_weight_sections,
-    const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
-        weight_in_memory_map) {
   auto embedding_lookup_manager = std::make_unique<EmbeddingLookupManager>();
   ABSL_RETURN_IF_ERROR(embedding_lookup_manager->Initialize(
       env, text_embedding_model, end_of_multi_modal_embedding_models,
       fully_supports_multi_modal, std::move(signature_key),
-      hardware_accelerators, require_full_acceleration,
       std::move(external_weight_file), std::move(external_weight_sections),
       weight_in_memory_map));
   return std::move(embedding_lookup_manager);
@@ -130,26 +105,6 @@ EmbeddingLookupManager::Create(
   return Create(env, std::move(text_embedding_lookup),
                 end_of_multi_modal_embedding_models,
                 fully_supports_multi_modal);
-}
-
-absl::StatusOr<std::unique_ptr<EmbeddingLookupManager>>
-EmbeddingLookupManager::Create(
-    litert::Environment& env,
-    const litert::Model* absl_nonnull text_embedding_model,
-    bool fully_supports_multi_modal, std::optional<std::string> signature_key,
-    litert::HwAcceleratorSet hardware_accelerators,
-    bool require_full_acceleration,
-    std::optional<ScopedFile> external_weight_file,
-    litert::Options::ScopedWeightSectionMap external_weight_sections,
-    const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
-        weight_in_memory_map) {
-  absl::flat_hash_map<int, const litert::Model*>
-      end_of_multi_modal_embedding_models;
-  return Create(env, text_embedding_model, end_of_multi_modal_embedding_models,
-                fully_supports_multi_modal, std::move(signature_key),
-                hardware_accelerators, require_full_acceleration,
-                std::move(external_weight_file),
-                std::move(external_weight_sections), weight_in_memory_map);
 }
 
 absl::Status EmbeddingLookupManager::UpdateMultiModalEmbeddings(
@@ -334,8 +289,6 @@ absl::Status EmbeddingLookupManager::Initialize(
     absl::flat_hash_map<int, const litert::Model*>&
         end_of_multi_modal_embedding_models,
     bool fully_supports_multi_modal, std::optional<std::string> signature_key,
-    litert::HwAcceleratorSet hardware_accelerators,
-    bool require_full_acceleration,
     std::optional<ScopedFile> external_weight_file,
     litert::Options::ScopedWeightSectionMap external_weight_sections,
     const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
@@ -350,16 +303,14 @@ absl::Status EmbeddingLookupManager::Initialize(
   ABSL_ASSIGN_OR_RETURN(
       text_embedding_lookup_,
       EmbeddingLookupText::Create(
-          env, text_embedding_model, std::move(signature_key),
-          hardware_accelerators, require_full_acceleration,
+          env, std::move(text_embedding_model), std::move(signature_key),
           std::move(external_weight_file), std::move(external_weight_sections),
           weight_in_memory_map));
   for (const auto& [special_token, embedding_model] :
        end_of_multi_modal_embedding_models) {
     ABSL_ASSIGN_OR_RETURN(auto end_of_multi_modal_embedding_lookup,
                           EndOfMultiModalEmbedding::Create(
-                              env, embedding_model, special_token,
-                              hardware_accelerators, require_full_acceleration));
+                              env, std::move(embedding_model), special_token));
     end_of_multi_modal_embedding_lookups_.push_back(
         std::move(end_of_multi_modal_embedding_lookup));
   }

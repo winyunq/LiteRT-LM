@@ -44,13 +44,6 @@
 
 namespace litert::lm {
 
-void ClearCachedEnvironments() {
-  // v0.14 environments are owned by each Engine. Retain this legacy wrapper
-  // hook as a no-op so old callers continue to link while Engine destruction
-  // performs the actual release.
-  ABSL_LOG(INFO) << "LiteRT environments are Engine-owned; no global cache to clear.";
-}
-
 namespace {
 
 bool UsesNpu(Backend backend,

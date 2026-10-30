@@ -70,9 +70,7 @@ absl::Status EmbeddingLookupText::LookupInternal(int token,
   }
 
   // The input tensor size was verified when the model was loaded.
-  const int token_value = token;
-  LITERT_RETURN_IF_ERROR(
-      input_buffers_[0].Write(absl::MakeSpan(&token_value, 1)));
+  input_buffers_[0].Write(absl::MakeSpan(const_cast<const int*>(&token), 1));
 
   LITERT_RETURN_IF_ERROR(compiled_model_->Run(signature_key_.value(),
                                               input_buffers_, output_buffers_));
@@ -87,7 +85,7 @@ absl::Status EmbeddingLookupText::LookupInternal(int token,
   }
 
   // Copy the output buffer to the requested buffer.
-  LITERT_RETURN_IF_ERROR(output_buffers_[0].Read(buffer));
+  output_buffers_[0].Read(buffer);
 
   return absl::OkStatus();
 }
@@ -267,29 +265,8 @@ EmbeddingLookupText::Create(
     litert::Options::ScopedWeightSectionMap external_weight_sections,
     const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
         weight_in_memory_map) {
-#if defined(__ANDROID__)
-  litert::HwAcceleratorSet accelerators =
-      litert::HwAccelerators::kNpu | litert::HwAccelerators::kCpu;
-#else
-  litert::HwAcceleratorSet accelerators(litert::HwAccelerators::kCpu);
-#endif
-  return Create(env, model, std::move(signature_key), accelerators, false,
-                std::move(external_weight_file),
-                std::move(external_weight_sections), weight_in_memory_map);
-}
-absl::StatusOr<std::unique_ptr<EmbeddingLookupText>>
-EmbeddingLookupText::Create(
-    litert::Environment& env, const litert::Model* absl_nonnull model,
-    std::optional<std::string> signature_key,
-    litert::HwAcceleratorSet hardware_accelerators,
-    bool require_full_acceleration,
-    std::optional<ScopedFile> external_weight_file,
-    litert::Options::ScopedWeightSectionMap external_weight_sections,
-    const absl::flat_hash_map<std::string, absl::Span<const std::byte>>*
-        weight_in_memory_map) {
   auto handler = std::unique_ptr<EmbeddingLookupText>(new EmbeddingLookupText(
-      env, model, std::move(signature_key), hardware_accelerators,
-      require_full_acceleration, std::move(external_weight_file),
+      env, model, std::move(signature_key), std::move(external_weight_file),
       std::move(external_weight_sections), weight_in_memory_map));
   ABSL_RETURN_IF_ERROR(handler->Initialize());
   return handler;
@@ -313,7 +290,12 @@ absl::Status EmbeddingLookupText::Initialize() {
           "Model is null but compiled_model_ is not provided.");
     }
     LITERT_ASSIGN_OR_RETURN(auto options, Options::Create());
-LITERT_RETURN_IF_ERROR(options.SetHardwareAccelerators(hardware_accelerators_));
+#if defined(__ANDROID__)
+    options.SetHardwareAccelerators(litert::HwAccelerators::kNpu |
+                                    litert::HwAccelerators::kCpu);
+#else
+    options.SetHardwareAccelerators(litert::HwAccelerators::kCpu);
+#endif
     if (external_weight_file_.has_value() &&
         !external_weight_sections_.empty()) {
       auto res = options.SetExternalWeightScopedFile(
@@ -336,12 +318,10 @@ LITERT_RETURN_IF_ERROR(options.SetHardwareAccelerators(hardware_accelerators_));
     LITERT_ASSIGN_OR_RETURN(
         ::litert::qualcomm::QualcommOptions & qnn_opts,
         options.GetOptions<::litert::qualcomm::QualcommOptions>());
-    if ((hardware_accelerators_ & litert::HwAccelerators::kNpu) != 0) {
     qnn_opts.SetLogLevel(::litert::qualcomm::QualcommOptions::LogLevel::kOff);
     qnn_opts.SetHtpPerformanceMode(
         ::litert::qualcomm::QualcommOptions::HtpPerformanceMode::
             kSustainedHighPerformance);
-    }
 #endif
 
     LITERT_ASSIGN_OR_RETURN(compiled_model_, litert::CompiledModel::Create(
@@ -352,19 +332,6 @@ LITERT_RETURN_IF_ERROR(options.SetHardwareAccelerators(hardware_accelerators_));
     LITERT_ASSIGN_OR_RETURN(auto temp_signatures,
                             compiled_model_->GetSignatures());
     signatures = std::move(temp_signatures);
-  }
-
-  if (require_full_acceleration_) {
-    LITERT_ASSIGN_OR_RETURN(bool fully_accelerated,
-                            compiled_model_->IsFullyAccelerated());
-    if (!fully_accelerated) {
-      return absl::UnavailableError(
-          "The text embedding model is not fully accelerated; CPU fallback is disabled.");
-    }
-  }
-  if (signatures.empty()) {
-    return absl::InvalidArgumentError(
-        "The Embedding model must expose at least one signature.");
   }
 
   if (signature_key_.has_value()) {
@@ -397,13 +364,13 @@ LITERT_RETURN_IF_ERROR(options.SetHardwareAccelerators(hardware_accelerators_));
   LITERT_ASSIGN_OR_RETURN(input_buffers_, compiled_model_->CreateInputBuffers(
                                               signature_key_.value()));
 
+  LITERT_ASSIGN_OR_RETURN(auto input_buffer_size, input_buffers_[0].Size());
+
   if (input_buffers_.size() != 1) {
     return absl::InvalidArgumentError(absl::StrCat(
         "The Embedding model must have exactly one input tensor but got ",
         input_buffers_.size()));
   }
-
-  LITERT_ASSIGN_OR_RETURN(auto input_buffer_size, input_buffers_[0].Size());
 
   if (input_buffer_size != 4) {
     return absl::InvalidArgumentError(absl::StrCat(
@@ -412,15 +379,14 @@ LITERT_RETURN_IF_ERROR(options.SetHardwareAccelerators(hardware_accelerators_));
 
   LITERT_ASSIGN_OR_RETURN(output_buffers_, compiled_model_->CreateOutputBuffers(
                                                signature_key_.value()));
+  LITERT_ASSIGN_OR_RETURN(output_buffer_type_, output_buffers_[0].TensorType());
+  const auto& output_buffer_layout = output_buffer_type_.value().Layout();
 
   if (output_buffers_.empty()) {
     return absl::InvalidArgumentError(absl::StrCat(
         "The Embedding model must have exactly one output tensor but got ",
         output_buffers_.size()));
   }
-
-  LITERT_ASSIGN_OR_RETURN(output_buffer_type_, output_buffers_[0].TensorType());
-  const auto& output_buffer_layout = output_buffer_type_.value().Layout();
 
   if (output_buffer_type_.value().ElementType() !=
       litert::ElementType::Float32) {

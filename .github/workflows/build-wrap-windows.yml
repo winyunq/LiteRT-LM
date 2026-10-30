@@ -39,9 +39,9 @@ jobs:
           path: |
             C:/b/repository-cache
             C:/b/disk-cache
-          key: wrap-windows-${{ hashFiles('.bazelversion', 'WORKSPACE', 'Cargo.lock', 'PATCH.*') }}-${{ github.sha }}
+          key: wrap-windows-${{ hashFiles('.bazelversion', 'WORKSPACE', 'Cargo.lock', 'PATCH.*', 'pack/patches/**') }}-${{ github.sha }}
           restore-keys: |
-            wrap-windows-${{ hashFiles('.bazelversion', 'WORKSPACE', 'Cargo.lock', 'PATCH.*') }}-
+            wrap-windows-${{ hashFiles('.bazelversion', 'WORKSPACE', 'Cargo.lock', 'PATCH.*', 'pack/patches/**') }}-
             wrap-windows-
 
       - name: Install Bazelisk
@@ -52,7 +52,7 @@ jobs:
           'C:/b/tools' >> $env:GITHUB_PATH
 
       - name: Build DLLs and package SDK
-        run: ./Gemini_build_wrapper.ps1 -OutputDirectory out/LiteRtLm -BazelOutputBase C:/b/output -BazelUserRoot C:/b/user
+        run: ./pack/build/Build-Windows.ps1 -OutputDirectory out/LiteRtLm -BazelOutputBase C:/b/output -BazelUserRoot C:/b/user
 
       - name: Upload SDK artifact
         uses: actions/upload-artifact@v7

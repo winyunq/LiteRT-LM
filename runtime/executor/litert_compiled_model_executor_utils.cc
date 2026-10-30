@@ -1320,15 +1320,7 @@ absl::Status SetExternalWeightOptions(ModelResources& resources,
 absl::Status InitializeEmbeddingLookups(
     ::litert::Environment& env, ModelResources& resources,
     std::unique_ptr<EmbeddingLookupManager>& embedding_lookup,
-    std::unique_ptr<EmbeddingLookupManager>& per_layer_embedding_lookup, bool require_full_acceleration) {
-#if defined(__ANDROID__)
-  litert::HwAcceleratorSet accelerators = litert::HwAccelerators::kNpu | litert::HwAccelerators::kCpu;
-#else
-  litert::HwAcceleratorSet accelerators(litert::HwAccelerators::kCpu);
-#endif
-  if (require_full_acceleration) {
-    accelerators = litert::HwAcceleratorSet(litert::HwAccelerators::kGpu);
-  }
+    std::unique_ptr<EmbeddingLookupManager>& per_layer_embedding_lookup) {
   absl::flat_hash_map<int, const Model*> end_of_multi_modal_embedding_models;
   if (resources.HasTFLiteModel(proto::LlmMetadata::TF_LITE_END_OF_AUDIO)) {
     ABSL_ASSIGN_OR_RETURN(
@@ -1366,8 +1358,7 @@ absl::Status InitializeEmbeddingLookups(
     auto status_or_embedding_lookup = EmbeddingLookupManager::Create(
         env, text_embedder_model, end_of_multi_modal_embedding_models,
         /*fully_supports_multi_modal=*/true,
-        /*signature_key=*/std::nullopt, accelerators, require_full_acceleration,
-        std::move(external_weights.scoped_file),
+        /*signature_key=*/std::nullopt, std::move(external_weights.scoped_file),
         std::move(external_weights.sections),
         resources.GetWeightInMemoryMap(proto::LlmMetadata::TF_LITE_EMBEDDER));
 #ifdef __EMSCRIPTEN__
@@ -1398,8 +1389,7 @@ absl::Status InitializeEmbeddingLookups(
     auto status_or_per_layer_embedding_lookup = EmbeddingLookupManager::Create(
         env, per_layer_embedder_model,
         /*fully_supports_multi_modal=*/false,
-        /*signature_key=*/std::nullopt, accelerators, require_full_acceleration,
-        std::move(external_weights.scoped_file),
+        /*signature_key=*/std::nullopt, std::move(external_weights.scoped_file),
         std::move(external_weights.sections),
         resources.GetWeightInMemoryMap(
             proto::LlmMetadata::TF_LITE_PER_LAYER_EMBEDDER));

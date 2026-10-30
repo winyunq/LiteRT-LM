@@ -405,7 +405,7 @@ absl::Status SetExternalWeightOptions(ModelResources& resources,
 absl::Status InitializeEmbeddingLookups(
     ::litert::Environment& env, ModelResources& resources,
     std::unique_ptr<EmbeddingLookupManager>& embedding_lookup,
-    std::unique_ptr<EmbeddingLookupManager>& per_layer_embedding_lookup, bool require_full_acceleration = false);
+    std::unique_ptr<EmbeddingLookupManager>& per_layer_embedding_lookup);
 
 // Starts hardware-specific metrics collection on a compiled model.
 void StartCompiledModelMetricsCollection(LiteRtCompiledModel compiled_model,

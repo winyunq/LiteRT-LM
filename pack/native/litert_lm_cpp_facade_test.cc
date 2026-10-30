@@ -1,6 +1,6 @@
 // Copyright (c) 2025-2026 Winyunq. All rights reserved.
 
-#include "runtime/engine/litert_lm.hpp"
+#include "pack/native/litert_lm.hpp"
 
 #include <algorithm>
 #include <cstring>
