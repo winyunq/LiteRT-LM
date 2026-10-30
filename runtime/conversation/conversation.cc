@@ -114,9 +114,9 @@ bool IsEmptyPreface(const Preface& preface) {
 }
 
 bool IsUserMessage(const nlohmann::ordered_json& json_msg) {
-  const std::string role_key(kRoleKey);
+  const std::string role_key("role");
   return json_msg.contains(role_key) && json_msg[role_key].is_string() &&
-         json_msg[role_key].get<absl::string_view>() == kUser;
+         json_msg[role_key].get<absl::string_view>() == "user";
 }
 
 std::optional<ThinkingConfig> ResolveThinkingConfig(
