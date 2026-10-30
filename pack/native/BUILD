@@ -48,6 +48,7 @@ cc_binary(
         "@nlohmann_json//:json",
         "//runtime/components/constrained_decoding:llg_constraint_config",
         "//runtime/conversation",
+        "//runtime/conversation:thinking_config",
         "//runtime/executor:llm_executor_settings",
         "//runtime/proto:sampler_params_cc_proto",
         "//runtime/util:logging",

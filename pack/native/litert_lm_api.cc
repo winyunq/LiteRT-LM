@@ -41,6 +41,7 @@
 #include "nlohmann/json.hpp"  // from @nlohmann_json
 #include "runtime/components/constrained_decoding/llg_constraint_config.h"
 #include "runtime/conversation/conversation.h"
+#include "runtime/conversation/thinking_config.h"
 #include "runtime/engine/engine_factory.h"
 #include "runtime/engine/engine_settings.h"
 #include "runtime/executor/llm_executor_settings.h"
@@ -1187,8 +1188,9 @@ absl::StatusOr<std::unique_ptr<Conversation>> BuildConversation(
       .SetReturnErrorOnMaxTokensReached(
           (definition.flags &
            LITERT_LM_CONVERSATION_RETURN_ERROR_ON_MAX_TOKENS) != 0)
-      .SetEnableThinking(
-          (definition.flags & LITERT_LM_CONVERSATION_ENABLE_THINKING) != 0)
+      .SetThinkingConfig(litert::lm::ThinkingConfig(
+          (definition.flags & LITERT_LM_CONVERSATION_ENABLE_THINKING) != 0,
+          -1))
       .SetStreamToolCalls(
           (definition.flags &
            LITERT_LM_CONVERSATION_STREAM_TOOL_CALLS) != 0,
