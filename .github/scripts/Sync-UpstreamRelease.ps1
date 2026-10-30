@@ -15,6 +15,7 @@ function Api([string]$Path) {
 
 Invoke-Git config user.name 'github-actions[bot]'
 Invoke-Git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+Invoke-Git config credential.helper '!gh auth git-credential'
 Invoke-Git remote add google "https://github.com/$upstream.git"
 Invoke-Git fetch google --filter=blob:none '+refs/tags/*:refs/google/tags/*'
 $forkTags = @{}

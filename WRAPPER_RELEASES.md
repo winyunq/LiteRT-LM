@@ -20,5 +20,7 @@ Google tag preserves Google's source. `UPSTREAM_TAG`, `UPSTREAM_REVISION` and
 Unreal plugin release process. A native DLL build verifies the native SDK. The
 plugin's Unreal tests, package and Fab review belong to the plugin release.
 
-The workflows use the repository's built-in GitHub token and standard hosted
-runners. No personal access token or local DLL compilation is required.
+The sync workflow uses a repository write deploy key in the Actions secret
+`UPSTREAM_SYNC_SSH_KEY`, so it can preserve workflow files in Google's tags.
+Release uploads and build dispatch use the built-in GitHub token. Builds use
+standard hosted runners; no personal access token or local DLL compilation is required.

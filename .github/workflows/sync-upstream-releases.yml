@@ -28,6 +28,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ssh-key: ${{ secrets.UPSTREAM_SYNC_SSH_KEY }}
       - name: Mirror tags and prepare versioned fork sources
         shell: pwsh
         run: ./.github/scripts/Sync-UpstreamRelease.ps1 -UpstreamTag $env:UPSTREAM_TAG_INPUT
