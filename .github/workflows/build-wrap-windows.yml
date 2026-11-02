@@ -7,9 +7,6 @@ on:
       publish:
         type: boolean
         default: true
-  push:
-    tags:
-      - 'wrap-v*'
 
 permissions:
   contents: write
