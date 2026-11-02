@@ -49,7 +49,8 @@ if ($LASTEXITCODE -ne 0) { throw "DLL build failed: $LASTEXITCODE" }
 
 $execRoot = (& bazel @startup info execution_root | Select-Object -Last 1).Trim()
 if ($LASTEXITCODE -ne 0) { throw "Could not read Bazel execution root" }
-$dllDependencies = & bazel @startup cquery 'deps(set(//c:litert-lm //pack/native:litert_lm_wrapper))' @options --notool_deps --output=files
+# The Dawn stub supplies only the link-time import library; package the prebuilt runtime DLL.
+$dllDependencies = & bazel @startup cquery 'deps(set(//c:litert-lm //pack/native:litert_lm_wrapper)) except //runtime/components:stub/webgpu_dawn.dll' @options --notool_deps --output=files
 if ($LASTEXITCODE -ne 0) { throw "Could not enumerate runtime DLLs" }
 
 $bin = Join-Path $OutputDirectory "Binaries/Win64"
