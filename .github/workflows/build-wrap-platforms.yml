@@ -1,0 +1,127 @@
+name: Build and release native SDKs
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [WRAPPER_VERSION]
+    tags: ['wrap-v*']
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: wrap-platforms-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    uses: ./.github/workflows/build-wrap-windows.yml
+    with:
+      publish: false
+
+  native:
+    name: SDK / ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Linux-x86_64
+            runner: ubuntu-24.04
+            config: linux_x86_64
+          - platform: Linux-arm64
+            runner: ubuntu-24.04-arm
+            config: linux_arm64
+          - platform: Mac-arm64
+            runner: macos-latest
+            config: macos_arm64
+          - platform: Android-arm64-v8a
+            runner: ubuntu-24.04
+            config: android_arm64
+          - platform: Android-x86_64
+            runner: ubuntu-24.04
+            config: android_x86_64
+          - platform: IOS-arm64
+            runner: macos-latest
+            config: ios_arm64
+          - platform: IOS-sim-arm64
+            runner: macos-latest
+            config: ios_sim_arm64
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      CARGO_BAZEL_REPIN: 'true'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch platform runtime files
+        run: git lfs pull --include='prebuilt/${{ matrix.config }}/**'
+
+      - name: Restore Bazel caches
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/litert-lm
+          key: native-${{ matrix.platform }}-${{ hashFiles('.bazelversion', 'MODULE.bazel', 'WORKSPACE', 'Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            native-${{ matrix.platform }}-${{ hashFiles('.bazelversion', 'MODULE.bazel', 'WORKSPACE', 'Cargo.lock') }}-
+            native-${{ matrix.platform }}-
+
+      - name: Install Bazelisk
+        run: |
+          case "$RUNNER_OS" in Linux) os=linux ;; macOS) os=darwin ;; esac
+          case "$RUNNER_ARCH" in X64) arch=amd64 ;; ARM64) arch=arm64 ;; esac
+          gh release download --repo bazelbuild/bazelisk --pattern "bazelisk-$os-$arch" --output "$RUNNER_TEMP/bazel"
+          chmod +x "$RUNNER_TEMP/bazel"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Set up Rust
+        run: rustup default stable
+
+      - name: Set up Android NDK
+        if: startsWith(matrix.platform, 'Android-')
+        id: ndk
+        uses: nttld/setup-ndk@afb4c9964b521afb97c864b7d40b11e6911bd410
+        with:
+          ndk-version: r28b
+          add-to-path: false
+
+      - name: Build libraries and package SDK
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: bash pack/build/Build-Unix.sh '${{ matrix.platform }}' '${{ matrix.config }}'
+
+      - name: Upload SDK artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: LiteRtLm-${{ matrix.platform }}-${{ github.sha }}
+          path: out/*.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish SDK release
+    needs: [windows, native]
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      WRAPPER_PLATFORMS: Win64, Linux-x86_64, Linux-arm64, Mac-arm64, Android-arm64-v8a, Android-x86_64, IOS-arm64, IOS-sim-arm64
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download platform SDKs
+        shell: bash
+        run: |
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'LiteRtLm-*' --dir downloads
+          mkdir -p out
+          find downloads -type f -name '*.zip' -exec cp '{}' out/ ';'
+      - name: Archive version branch and publish release
+        shell: pwsh
+        run: ./.github/scripts/Publish-Wrapper.ps1
