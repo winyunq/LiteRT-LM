@@ -2,6 +2,11 @@ name: Build and release Windows wrapper DLL
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a Windows-only release
+        type: boolean
+        default: true
   workflow_call:
     inputs:
       publish:
@@ -64,7 +69,7 @@ jobs:
           if-no-files-found: error
 
       - name: Archive version branch and publish release
-        if: github.event_name != 'workflow_call' || inputs.publish
+        if: inputs.publish
         run: ./.github/scripts/Publish-Wrapper.ps1
 
       - name: Save Bazel caches
