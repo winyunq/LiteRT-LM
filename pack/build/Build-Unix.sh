@@ -17,14 +17,13 @@ bazel build "${options[@]}" //c:litert-lm //pack/native:litert_lm_wrapper
 exec_root="$(bazel info execution_root)"
 core="$(bazel cquery //c:litert-lm "${options[@]}" --output=files)"
 wrapper="$(bazel cquery //pack/native:litert_lm_wrapper "${options[@]}" --output=files)"
-cp -L "$exec_root/$core" "$exec_root/$wrapper" "$bin/"
 
 bazel cquery 'deps(set(//c:litert-lm //pack/native:litert_lm_wrapper))' "${options[@]}" --notool_deps --output=files > "$RUNNER_TEMP/runtime-files.txt"
 while IFS= read -r file; do
   case "$file" in
     runtime/components/stub/*) continue ;;
     *.so|*.so.*|*.dylib)
-      if [[ -f "$exec_root/$file" ]]; then cp -L "$exec_root/$file" "$bin/"; fi ;;
+      if [[ -f "$exec_root/$file" ]]; then cp -fL "$exec_root/$file" "$bin/"; fi ;;
   esac
 done < "$RUNNER_TEMP/runtime-files.txt"
 
