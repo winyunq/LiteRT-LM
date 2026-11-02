@@ -49,7 +49,7 @@ if ($UpstreamTag) {
 $forkHead = (Invoke-Git rev-parse HEAD).Trim()
 $base = [IO.File]::ReadAllText('UPSTREAM_REVISION').Trim()
 $patch = Join-Path $env:RUNNER_TEMP 'litert-lm-pack.patch'
-Invoke-Git diff --binary "--output=$patch" $base $forkHead -- pack .github/scripts .github/workflows/build-wrap-windows.yml .github/workflows/sync-upstream-releases.yml .github/upstream-release-baseline.txt .lfsconfig UPSTREAM_REVISION WRAPPER_VERSION WRAPPER_RELEASES.md
+Invoke-Git diff --binary "--output=$patch" $base $forkHead -- pack .github/scripts .github/workflows/build-wrap-windows.yml .github/workflows/build-wrap-platforms.yml .github/workflows/sync-upstream-releases.yml .github/upstream-release-baseline.txt .lfsconfig UPSTREAM_REVISION WRAPPER_VERSION WRAPPER_RELEASES.md
 
 foreach ($release in $pending) {
     $tag = $release.tag_name
@@ -78,7 +78,7 @@ foreach ($release in $pending) {
         if ($oids.Count) { Invoke-Git lfs push --object-id origin @oids }
         Invoke-Git push --no-verify origin "HEAD:refs/heads/$branch"
     }
-    & gh workflow run build-wrap-windows.yml --repo $repo --ref $branch
-    if ($LASTEXITCODE -ne 0) { throw "Could not start DLL build for $tag" }
+    & gh workflow run build-wrap-platforms.yml --repo $repo --ref $branch
+    if ($LASTEXITCODE -ne 0) { throw "Could not start native SDK builds for $tag" }
     "Prepared $branch from $tag" >> $env:GITHUB_STEP_SUMMARY
 }
