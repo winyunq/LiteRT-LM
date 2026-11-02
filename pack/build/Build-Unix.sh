@@ -42,8 +42,10 @@ case "$platform" in
     nm -D --defined-only "$bin/$(basename "$wrapper")" > "$RUNNER_TEMP/wrapper-exports.txt"
     ;;
 esac
-grep -Eq '[[:space:]]_?litert_lm_get_api_version([[:space:]]|$)' "$RUNNER_TEMP/core-exports.txt"
-grep -Eq '[[:space:]]_?LiteRtLm_GetApi([[:space:]]|$)' "$RUNNER_TEMP/wrapper-exports.txt"
+echo 'Checking core C API exports'
+grep -E '[[:space:]]_?litert_lm_get_api_version(@|[[:space:]]|$)' "$RUNNER_TEMP/core-exports.txt"
+echo 'Checking wrapper API exports'
+grep -E '[[:space:]]_?LiteRtLm_GetApi(@|[[:space:]]|$)' "$RUNNER_TEMP/wrapper-exports.txt"
 
 for header in api_export.h conversation.h embedding_engine.h engine.h error_reporter.h experimental.h model_info.h; do
   cp "c/$header" "$out/Include/c/"
