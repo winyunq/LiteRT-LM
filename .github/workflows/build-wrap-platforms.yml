@@ -65,7 +65,8 @@ jobs:
         run: git lfs pull --include='prebuilt/${{ matrix.config }}/**'
 
       - name: Restore Bazel caches
-        uses: actions/cache@v6
+        id: bazel-cache
+        uses: actions/cache/restore@v6
         with:
           path: ~/.cache/litert-lm
           key: native-${{ matrix.platform }}-${{ hashFiles('.bazelversion', 'MODULE.bazel', 'WORKSPACE', 'Cargo.lock') }}-${{ github.sha }}
@@ -103,6 +104,13 @@ jobs:
           name: LiteRtLm-${{ matrix.platform }}-${{ github.sha }}
           path: out/*.zip
           if-no-files-found: error
+
+      - name: Save Bazel caches
+        if: always() && steps.bazel-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ~/.cache/litert-lm
+          key: ${{ steps.bazel-cache.outputs.cache-primary-key }}
 
   publish:
     name: Publish SDK release
