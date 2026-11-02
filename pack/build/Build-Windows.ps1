@@ -44,7 +44,7 @@ $options = @(
     "--repo_env=BAZEL_VC=$env:BAZEL_VC"
 )
 $targets = @("//c:litert-lm", "//pack/native:litert_lm_wrapper")
-& bazel @startup build @options @targets
+& bazel @startup build @options --output_groups=+interface_library @targets
 if ($LASTEXITCODE -ne 0) { throw "DLL build failed: $LASTEXITCODE" }
 
 $execRoot = (& bazel @startup info execution_root | Select-Object -Last 1).Trim()
@@ -60,10 +60,12 @@ foreach ($dll in @($dllDependencies | Where-Object { $_ -match '\.dll$' } | Sort
     Copy-Item -LiteralPath (Join-Path $execRoot $dll) -Destination $bin -Force
 }
 Copy-Item -LiteralPath "bazel-bin/c/litert-lm.dll", "bazel-bin/pack/native/litert_lm_wrapper.dll" -Destination $bin -Force
-$coreImport = Get-ChildItem bazel-bin/c -Filter "litert-lm*.lib" | Select-Object -First 1
-$wrapImport = Get-ChildItem bazel-bin/pack/native -Filter "litert_lm_wrapper*.lib" | Select-Object -First 1
-Copy-Item -LiteralPath $coreImport.FullName -Destination "$bin/LiteRtLm_Native.lib" -Force
-Copy-Item -LiteralPath $wrapImport.FullName -Destination "$bin/LiteRtLm_Extension.lib" -Force
+$coreImport = & bazel @startup cquery '//c:litert-lm' @options --output=files --output_groups=interface_library
+if ($LASTEXITCODE -ne 0) { throw "Could not locate the core import library" }
+$wrapImport = & bazel @startup cquery '//pack/native:litert_lm_wrapper' @options --output=files --output_groups=interface_library
+if ($LASTEXITCODE -ne 0) { throw "Could not locate the wrapper import library" }
+Copy-Item -LiteralPath (Join-Path $execRoot $coreImport) -Destination "$bin/LiteRtLm_Native.lib" -Force
+Copy-Item -LiteralPath (Join-Path $execRoot $wrapImport) -Destination "$bin/LiteRtLm_Extension.lib" -Force
 
 foreach ($header in @("api_export.h", "engine.h", "conversation.h", "embedding_engine.h", "error_reporter.h", "experimental.h", "model_info.h")) {
     Copy-Item -LiteralPath "c/$header" -Destination "$include/c/$header" -Force
