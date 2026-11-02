@@ -22,16 +22,13 @@ cc_binary(
     name = "litert_lm_wrapper",
     srcs = ["litert_lm_api.cc", "litert_lm_api.h", "litert_lm.hpp"],
     additional_linker_inputs = select({
-        "@platforms//os:android": [":litert_lm_wrapper.lds", "@litert//litert/c:libLiteRt.so"],
+        "@platforms//os:android": [":litert_lm_wrapper.lds"],
         "//conditions:default": [],
     }),
     linkshared = 1,
     linkopts = select({
         "@platforms//os:android": [
             "-Wl,--version-script=$(location :litert_lm_wrapper.lds)",
-            "-Wl,--no-as-needed",
-            "$(location @litert//litert/c:libLiteRt.so)",
-            "-Wl,--as-needed",
         ],
         "//conditions:default": [],
     }),
