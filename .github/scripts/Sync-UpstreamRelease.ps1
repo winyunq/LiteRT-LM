@@ -13,37 +13,37 @@ function Api([string]$Path) {
     return ($json | ConvertFrom-Json)
 }
 
+$releases = @(Api "repos/$upstream/releases?per_page=100")
+$currentVersion = [semver]([IO.File]::ReadAllText('WRAPPER_VERSION').Trim())
+if ($UpstreamTag) {
+    $releases = @($releases | Where-Object tag_name -eq $UpstreamTag)
+    if (!$releases.Count) { throw "Google release not found: $UpstreamTag" }
+}
+$pending = @($releases |
+    Where-Object { !$_.draft -and !$_.prerelease -and $_.immutable -eq $true } |
+    Where-Object { [semver]($_.tag_name -replace '^v', '') -gt $currentVersion } |
+    Sort-Object { [semver]($_.tag_name -replace '^v', '') })
+
+if (!$UpstreamTag -and $pending.Count) {
+    $prepared = @(Api "repos/$repo/git/matching-refs/heads/codex/version/wrap-v")
+    $pending = @($pending | Where-Object {
+        $branch = 'refs/heads/codex/version/wrap-v' + ($_.tag_name -replace '^v', '')
+        $branch -notin $prepared.ref
+    })
+}
+if (!$pending.Count) {
+    'No new immutable Google release to synchronize.' >> $env:GITHUB_STEP_SUMMARY
+    return
+}
+
 Invoke-Git config user.name 'github-actions[bot]'
 Invoke-Git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
 Invoke-Git config credential.helper '!gh auth git-credential'
 Invoke-Git remote add google "https://github.com/$upstream.git"
-Invoke-Git fetch google --filter=blob:none '+refs/tags/*:refs/google/tags/*'
-$forkTags = @{}
-foreach ($line in @(Invoke-Git ls-remote --tags origin)) {
-    $fields = $line -split '\s+'
-    $forkTags[$fields[1]] = $fields[0]
-}
-foreach ($line in @(Invoke-Git for-each-ref '--format=%(objectname) %(refname)' refs/google/tags/)) {
-    $oid, $sourceRef = $line -split ' ', 2
-    $tag = $sourceRef.Substring('refs/google/tags/'.Length)
-    $destination = "refs/tags/$tag"
-    if ($forkTags.ContainsKey($destination)) {
-        if ($forkTags[$destination] -ne $oid) { throw "Tag differs from Google: $tag" }
-        continue
-    }
-    # Original tags retain Google's LFS endpoint; there are no fork LFS uploads.
-    Invoke-Git push --no-verify origin "${sourceRef}:$destination"
-}
-
-$releases = @(Api "repos/$upstream/releases?per_page=100")
-$baseline = [IO.File]::ReadAllText('.github/upstream-release-baseline.txt').Trim()
-$baselineRelease = $releases | Where-Object tag_name -eq $baseline | Select-Object -First 1
-if (!$baselineRelease) { throw "Release baseline not found: $baseline" }
-if ($UpstreamTag) {
-    $pending = @($releases | Where-Object tag_name -eq $UpstreamTag)
-    if (!$pending.Count) { throw "Google release not found: $UpstreamTag" }
-} else {
-    $pending = @($releases | Where-Object { !$_.draft -and $_.published_at -gt $baselineRelease.published_at } | Sort-Object published_at)
+foreach ($release in $pending) {
+    $tag = $release.tag_name
+    Invoke-Git fetch google --filter=blob:none "+refs/tags/${tag}:refs/google/tags/$tag"
+    Invoke-Git push --no-verify origin "refs/google/tags/${tag}:refs/tags/$tag"
 }
 
 $forkHead = (Invoke-Git rev-parse HEAD).Trim()
